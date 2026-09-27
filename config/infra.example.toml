@@ -1,0 +1,20 @@
+[controller]
+expect_omp = true
+github_url = "https://github.com"
+# mlflow_url = "https://dagshub.com/<owner>/<repository>.mlflow"
+
+[paths]
+wavcse = "~/projects/wavCSE"
+
+[runpod]
+api_url = "https://rest.runpod.io/v1"
+request_timeout_seconds = 10.0
+max_read_attempts = 3
+retry_backoff_seconds = 0.5
+
+[storage]
+# bucket = "private-wavcse-artifacts"
+prefix = "wavcse"
+
+[ssh]
+# private_key = "~/.ssh/wavcse_workers_ed25519"

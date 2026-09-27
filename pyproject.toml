@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wavcse-infra"
+version = "0.1.0"
+description = "Infrastructure control plane for reproducible wavCSE research workloads"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Kevin Sanjula" }]
+dependencies = [
+  "boto3>=1.40,<2",
+  "httpx>=0.28,<1",
+  "pydantic>=2.12,<3",
+  "typer>=0.20,<1",
+]
+
+[project.scripts]
+infra = "wavcse_infra.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<10",
+  "ruff>=0.13,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wavcse_infra"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
