@@ -27,7 +27,7 @@ jobs:
       - name: Install shell tooling
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends shellcheck shfmt
+          sudo apt-get install --yes --no-install-recommends cloud-init shellcheck shfmt
 
       - name: Install locked dependencies
         run: uv sync --locked --all-groups

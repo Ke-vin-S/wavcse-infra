@@ -11,15 +11,17 @@ repository.
 
 ## Delivery status
 
-The repository currently implements Phase 0 of the v1 specification:
+The repository currently implements Phases 0–1 of the v1 specification:
 
 - a typed `infra` CLI and layered TOML/environment configuration;
 - Ruff, pytest, ShellCheck, and shfmt validation;
 - a locked `uv` environment and credential-free CI;
+- idempotent Ubuntu controller bootstrap and thin cloud-init;
+- `infra doctor` controller, credential-source, configuration, and connectivity checks;
 - initial architecture, security, operations, provider, and decision documentation.
 
-Controller bootstrap, `infra doctor`, and RunPod reads are the next phases. No
-implemented command contacts a cloud API or can provision a paid resource.
+Read-only RunPod worker inspection is the next phase. No implemented command can
+provision a paid resource.
 
 ## Architecture
 
@@ -40,7 +42,7 @@ Requirements:
 
 - Python 3.12 or newer;
 - [uv](https://docs.astral.sh/uv/);
-- ShellCheck and shfmt for the complete validation suite.
+- ShellCheck, shfmt, and cloud-init for the complete validation suite.
 
 Install locked dependencies and verify the CLI:
 
@@ -50,7 +52,7 @@ uv run infra --help
 make check
 ```
 
-On a supported Ubuntu EC2 controller, Phase 1 will provide:
+On a supported Ubuntu EC2 controller:
 
 ```bash
 ./controller/bootstrap.sh
@@ -91,6 +93,7 @@ uv run infra config validate
 ```bash
 infra --help
 infra config validate
+infra doctor
 ```
 
 Global `--config`, `--runpod-api-url`, `--runpod-timeout`, and `--verbose` options must
@@ -100,8 +103,8 @@ appear before the command name.
 
 The planned lifecycle is create, wait for provider readiness, discover SSH, bootstrap,
 health-check, execute an exact committed wavCSE revision, persist requested outputs,
-and explicitly stop or destroy. Phase 0 implements none of this lifecycle. Creation and
-destruction remain intentionally unavailable pending review.
+and explicitly stop or destroy. Phases 0–1 implement none of this lifecycle. Creation
+and destruction remain intentionally unavailable pending review.
 
 ## Storage model
 

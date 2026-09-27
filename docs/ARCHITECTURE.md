@@ -34,14 +34,21 @@ Controller IAM role
   -> controller verifies durable object
 ```
 
-Phase 0 does not perform any provider or artifact-transfer portion of this flow.
+Phases 0–1 do not perform any worker-lifecycle or artifact-transfer portion of this flow.
 
 ## Implemented modules
 
 - `config.py` validates and merges built-in, TOML, environment, and CLI settings.
 - `cli.py` defines the stable `infra` interface and global configuration options.
-Controller diagnostics, worker models, and the RunPod read client are the next vertical
-slices. No generic provider base class exists.
+- `doctor.py` runs independent read-only controller and connectivity probes.
+- `redaction.py` removes authorization values, known secret assignments, and URL
+  query strings from user-facing external errors.
+- `controller/bootstrap.sh` converges supported Ubuntu controllers on required tools
+  and the locked project environment.
+- `controller/cloud-init.yaml` performs only initial public clone and bootstrap dispatch.
+
+Worker models and the RunPod read client are the next vertical slice. No generic
+provider base class exists.
 
 ## Configuration flow
 
@@ -58,8 +65,8 @@ process environment and stored as a Pydantic secret value.
 
 ## Reliability stance
 
-Phase 2 read-only HTTP operations will use explicit timeouts and bounded exponential backoff for
-transport failures, HTTP 429, and HTTP 5xx responses. Other 4xx responses fail
+Phase 2 read-only HTTP operations will use explicit timeouts and bounded exponential
+backoff for transport failures, HTTP 429, and HTTP 5xx responses. Other 4xx responses fail
 immediately with a redacted, actionable provider error. This retry behavior must not be
 copied to resource creation: a lost create response can otherwise duplicate paid
 infrastructure.
@@ -69,6 +76,6 @@ Missing optional provider fields remain `None`; the parser does not invent metad
 
 ## Deferred architecture
 
-Local worker/job state, SSH, bootstrap, S3 transfer, exact-commit jobs, and destructive
-lifecycle commands are future vertical slices. Directories and interfaces for those
-features will be added only with working responsibilities.
+Local worker/job state, SSH, worker bootstrap, S3 transfer, exact-commit jobs, and
+destructive lifecycle commands are future vertical slices. Directories and interfaces
+for those features will be added only with working responsibilities.

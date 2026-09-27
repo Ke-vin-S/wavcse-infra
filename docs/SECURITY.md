@@ -12,7 +12,9 @@ not trusted with durable credentials or the only copy of important data.
 
 The controller uses an attached EC2 instance profile. Boto3 discovers and refreshes the
 temporary role credentials through its standard credential chain; the project does not
-accept or install static AWS access keys.
+accept or install static AWS access keys. `infra doctor` requires Boto3's resolved
+credential method to be `iam-role` before making STS or S3 calls, so an accidentally
+exported static key is reported rather than used for the diagnostic.
 
 The role should grant only required actions for the configured bucket and `wavcse/`
 prefix. Phase 1 diagnostics use STS `GetCallerIdentity` and, when a bucket is configured,

@@ -9,7 +9,8 @@ from typing import Annotated
 import typer
 
 from wavcse_infra import __version__
-from wavcse_infra.config import load_settings, resolved_config_path
+from wavcse_infra.config import Settings, load_settings, resolved_config_path
+from wavcse_infra.doctor import CheckStatus, DoctorReport, run_doctor
 from wavcse_infra.errors import ConfigurationError
 
 app = typer.Typer(
@@ -88,17 +89,21 @@ def validate_config(context: typer.Context) -> None:
     """Parse and validate configuration without contacting external services."""
 
     cli_context = _context(context)
-    try:
-        load_settings(
-            config_path=cli_context.config_path,
-            cli_overrides=cli_context.cli_overrides,
-        )
-    except ConfigurationError as exc:
-        typer.echo(f"Configuration error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+    _load_cli_settings(cli_context)
     path = resolved_config_path(cli_context.config_path)
     source = str(path) if path.exists() else "defaults and environment"
     typer.echo(f"Configuration valid ({source}).")
+
+
+@app.command("doctor")
+def doctor_command(context: typer.Context) -> None:
+    """Check controller prerequisites and configured external connectivity."""
+
+    settings = _load_cli_settings(_context(context))
+    report = run_doctor(settings)
+    _print_doctor_report(report)
+    if not report.successful:
+        raise typer.Exit(code=1)
 
 
 def _context(context: typer.Context) -> CliContext:
@@ -106,6 +111,33 @@ def _context(context: typer.Context) -> CliContext:
     if not isinstance(root_context, CliContext):
         raise RuntimeError("CLI context was not initialized")
     return root_context
+
+
+def _load_cli_settings(cli_context: CliContext) -> Settings:
+    try:
+        return load_settings(
+            config_path=cli_context.config_path,
+            cli_overrides=cli_context.cli_overrides,
+        )
+    except ConfigurationError as exc:
+        typer.echo(f"Configuration error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+
+def _print_doctor_report(report: DoctorReport) -> None:
+    colors = {
+        CheckStatus.PASS: typer.colors.GREEN,
+        CheckStatus.WARN: typer.colors.YELLOW,
+        CheckStatus.FAIL: typer.colors.RED,
+        CheckStatus.SKIP: typer.colors.BLUE,
+    }
+    for check in report.checks:
+        typer.secho(f"{check.status.value:4} ", fg=colors[check.status], bold=True, nl=False)
+        typer.echo(f"{check.name}: {check.detail}")
+    if report.successful:
+        typer.echo("Controller checks passed.")
+    else:
+        typer.echo(f"Controller checks failed ({report.failed_count} required check(s)).")
 
 
 def main() -> None:

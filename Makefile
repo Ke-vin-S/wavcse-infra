@@ -1,7 +1,13 @@
 SHELL := /usr/bin/env bash
 SHELL_FILES := $(shell find controller scripts worker -type f -name '*.sh' 2>/dev/null)
 
-.PHONY: check format format-check lint test
+.PHONY: bootstrap-controller check cloud-init-check doctor format format-check lint test
+
+bootstrap-controller:
+	./controller/bootstrap.sh
+
+doctor:
+	uv run --locked infra doctor
 
 format:
 	uv run --locked ruff check --fix .
@@ -19,8 +25,12 @@ lint:
 test:
 	uv run --locked pytest
 
+cloud-init-check:
+	cloud-init schema --config-file controller/cloud-init.yaml
+
 check:
 	uv lock --check
 	$(MAKE) format-check
 	$(MAKE) lint
 	$(MAKE) test
+	$(MAKE) cloud-init-check

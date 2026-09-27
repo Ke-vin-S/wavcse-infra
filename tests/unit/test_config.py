@@ -72,3 +72,10 @@ def test_unknown_configuration_field_is_an_error(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigurationError, match=r"runpod\.unknown"):
         load_settings(config_path=config_file, environ={})
+
+
+def test_urls_cannot_embed_credentials_or_query_secrets() -> None:
+    with pytest.raises(ConfigurationError, match="query strings are not allowed"):
+        load_settings(
+            environ={"WAVCSE_INFRA_RUNPOD_API_URL": "https://example.test/v1?token=secret"}
+        )

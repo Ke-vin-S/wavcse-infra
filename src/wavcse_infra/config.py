@@ -9,7 +9,15 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+)
 
 from wavcse_infra.errors import ConfigurationError
 
@@ -30,11 +38,26 @@ class ControllerConfig(FrozenModel):
     github_url: AnyHttpUrl = AnyHttpUrl("https://github.com")
     mlflow_url: AnyHttpUrl | None = None
 
+    @field_validator("github_url", "mlflow_url")
+    @classmethod
+    def reject_url_secrets(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
+        """Keep endpoint credentials and query tokens out of configuration."""
+
+        if value is not None and (value.username or value.password or value.query):
+            raise ValueError("URL credentials and query strings are not allowed")
+        return value
+
 
 class PathsConfig(FrozenModel):
     """Local repository paths on the controller."""
 
     wavcse: Path = Path("~/projects/wavCSE")
+
+
+class AwsConfig(FrozenModel):
+    """Non-secret AWS client configuration."""
+
+    region: str | None = Field(default=None, min_length=1)
 
 
 class RunPodConfig(FrozenModel):
@@ -45,6 +68,15 @@ class RunPodConfig(FrozenModel):
     request_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     max_read_attempts: int = Field(default=3, ge=1, le=10)
     retry_backoff_seconds: float = Field(default=0.5, ge=0, le=30)
+
+    @field_validator("api_url")
+    @classmethod
+    def reject_api_url_secrets(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        """Prevent bearer-like values from being persisted inside endpoint URLs."""
+
+        if value.username or value.password or value.query:
+            raise ValueError("URL credentials and query strings are not allowed")
+        return value
 
 
 class StorageConfig(FrozenModel):
@@ -63,6 +95,7 @@ class SshConfig(FrozenModel):
 class Settings(FrozenModel):
     """Complete non-secret and runtime-secret application configuration."""
 
+    aws: AwsConfig = AwsConfig()
     controller: ControllerConfig = ControllerConfig()
     paths: PathsConfig = PathsConfig()
     runpod: RunPodConfig = RunPodConfig()
@@ -72,6 +105,7 @@ class Settings(FrozenModel):
 
 ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "RUNPOD_API_KEY": ("runpod", "api_key"),
+    "WAVCSE_INFRA_AWS_REGION": ("aws", "region"),
     "WAVCSE_INFRA_EXPECT_OMP": ("controller", "expect_omp"),
     "WAVCSE_INFRA_MLFLOW_URL": ("controller", "mlflow_url"),
     "WAVCSE_INFRA_RUNPOD_API_URL": ("runpod", "api_url"),

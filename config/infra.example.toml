@@ -1,3 +1,6 @@
+[aws]
+region = "ap-south-1"
+
 [controller]
 expect_omp = true
 github_url = "https://github.com"

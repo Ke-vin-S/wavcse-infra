@@ -1,0 +1,13 @@
+#cloud-config
+
+# This intentionally contains no credentials. Adjust the public repository URL and
+# default Ubuntu user only when constructing the EC2 launch template.
+package_update: true
+packages:
+  - ca-certificates
+  - git
+
+runcmd:
+  - [install, -d, -o, ubuntu, -g, ubuntu, /home/ubuntu/projects]
+  - [bash, -c, 'if [[ ! -d /home/ubuntu/projects/wavcse-infra/.git ]]; then runuser --user ubuntu -- git clone --branch main --single-branch https://github.com/Ke-vin-S/wavcse-infra.git /home/ubuntu/projects/wavcse-infra; fi']
+  - [env, WAVCSE_INFRA_CONTROLLER_USER=ubuntu, /home/ubuntu/projects/wavcse-infra/controller/bootstrap.sh]
