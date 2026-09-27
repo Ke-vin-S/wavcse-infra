@@ -13,8 +13,9 @@ not trusted with durable credentials or the only copy of important data.
 `config/infra.example.toml` and `~/.config/wavcse-infra/config.toml` contain only
 non-secret configuration. Bootstrap copies the example once with user-only permissions
 and refuses to replace an existing file. `.env.example` lists supported variables but
-contains no values and is not loaded automatically. Real tokens remain in the process
-environment or an explicitly managed external secret facility and are never committed.
+contains no values and is not loaded automatically. `runpod.api_key_parameter` is an
+SSM parameter name, not a credential. Real tokens remain in the process environment or
+SSM Parameter Store and are never committed.
 
 ### AWS
 
@@ -29,13 +30,37 @@ prefix. Phase 1 diagnostics use STS `GetCallerIdentity` and, when a bucket is co
 a bounded S3 prefix listing. Later storage phases will require narrowly scoped
 `GetObject`, `PutObject`, and `HeadObject` permissions.
 
+For RunPod credential resolution, grant `ssm:GetParameter` only on the configured
+parameter ARN:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:<region>:<account-id>:parameter/wavcse-infra/runpod/api-key"
+    }
+  ]
+}
+```
+
+If the `SecureString` uses a customer-managed KMS key, the controller role also needs
+`kms:Decrypt` on that key ARN. Do not grant account-wide SSM, KMS, or administrator
+access. The application relies on Boto3's normal credential chain; on EC2 the attached
+instance profile supplies and refreshes temporary AWS credentials.
+
 ### RunPod
 
-Set `RUNPOD_API_KEY` in the controller environment or an external secret facility. The
-key is rejected from the TOML configuration and never accepted as a CLI option, avoiding
-committed secrets and process-list exposure. HTTP authorization headers are never
-rendered. Provider failures expose only the operation and safe status context;
-user-facing errors pass through redaction before display.
+Store the persistent controller key as an SSM Parameter Store `SecureString` and put
+only its name in `runpod.api_key_parameter`. The resolver calls `GetParameter` with
+`WithDecryption=True` once when constructing a RunPod client. A non-empty
+`RUNPOD_API_KEY` environment variable takes precedence for local or temporary use. The
+key is rejected from TOML and never accepted as a CLI option, avoiding committed secrets
+and process-list exposure. Resolved values are not persisted in configuration or local
+state. HTTP authorization headers are never rendered. Provider and SSM failures expose
+only safe operation/status context; user-facing errors pass through redaction.
 
 ### SSH
 
@@ -77,6 +102,7 @@ Never log:
 - private SSH keys;
 - OMP or Codex authentication stores and tokens;
 - full presigned URLs or query strings;
+- SSM `SecureString` values;
 - complete environment dumps.
 
 RunPod errors expose the operation, status code, and a sanitized response summary. Debug

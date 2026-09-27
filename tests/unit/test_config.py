@@ -16,6 +16,7 @@ def test_defaults_are_safe_and_do_not_require_secrets(
 
     assert str(settings.runpod.api_url).rstrip("/") == DEFAULT_RUNPOD_API_URL
     assert settings.runpod.api_key is None
+    assert settings.runpod.api_key_parameter is None
     assert settings.storage.bucket is None
     assert settings.paths.wavcse == Path("~/projects/wavCSE").expanduser()
 
@@ -52,6 +53,7 @@ def test_committed_example_is_valid_and_contains_no_secret_fields() -> None:
 
     assert settings.aws.region == "us-east-1"
     assert str(settings.runpod.api_url).rstrip("/") == DEFAULT_RUNPOD_API_URL
+    assert settings.runpod.api_key_parameter == "/wavcse-infra/runpod/api-key"
     assert settings.storage.bucket is None
     assert settings.storage.prefix == "wavcse"
     assert settings.ssh.private_key is not None
@@ -72,6 +74,7 @@ def test_precedence_is_cli_then_environment_then_file_then_defaults(tmp_path: Pa
 [runpod]
 request_timeout_seconds = 20
 max_read_attempts = 2
+api_key_parameter = "/from-file"
 
 [storage]
 prefix = "from-file"
@@ -83,6 +86,7 @@ prefix = "from-file"
         config_path=config_file,
         environ={
             "WAVCSE_INFRA_RUNPOD_TIMEOUT_SECONDS": "30",
+            "WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER": "/from-environment",
             "WAVCSE_INFRA_S3_PREFIX": "from-environment",
         },
         cli_overrides={"runpod.request_timeout_seconds": 40},
@@ -90,6 +94,7 @@ prefix = "from-file"
 
     assert settings.runpod.request_timeout_seconds == 40
     assert settings.runpod.max_read_attempts == 2
+    assert settings.runpod.api_key_parameter == "/from-environment"
     assert settings.storage.prefix == "from-environment"
 
 

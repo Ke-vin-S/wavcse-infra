@@ -53,12 +53,12 @@ def test_doctor_uses_nonzero_exit_for_failed_required_check(monkeypatch) -> None
     assert "1 required check" in result.stdout
 
 
-def test_worker_list_requires_environment_credential() -> None:
+def test_worker_list_requires_resolvable_credential() -> None:
     result = runner.invoke(app, ["worker", "list"], env={"RUNPOD_API_KEY": ""})
 
     assert result.exit_code == 2
     assert "Configuration error" in result.stderr
-    assert "RUNPOD_API_KEY is required" in result.stderr
+    assert "RunPod credential unavailable" in result.stderr
 
 
 def test_worker_list_renders_normalized_workers(monkeypatch) -> None:
@@ -82,7 +82,7 @@ def test_worker_list_renders_normalized_workers(monkeypatch) -> None:
         def list_workers(self) -> list[Worker]:
             return [worker]
 
-    monkeypatch.setattr(cli, "RunPodClient", lambda config: FakeClient())
+    monkeypatch.setattr(cli.RunPodClient, "from_settings", lambda settings: FakeClient())
 
     result = runner.invoke(
         app,
@@ -115,7 +115,7 @@ def test_worker_show_renders_normalized_worker(monkeypatch) -> None:
             assert worker_id == "pod-123"
             return worker
 
-    monkeypatch.setattr(cli, "RunPodClient", lambda config: FakeClient())
+    monkeypatch.setattr(cli.RunPodClient, "from_settings", lambda settings: FakeClient())
 
     result = runner.invoke(
         app,

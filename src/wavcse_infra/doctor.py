@@ -16,6 +16,12 @@ import httpx
 from botocore.config import Config as BotocoreConfig
 
 from wavcse_infra.config import Settings
+from wavcse_infra.credentials import (
+    CredentialSource,
+    ResolvedRunPodCredential,
+    resolve_runpod_api_key,
+)
+from wavcse_infra.errors import CredentialError
 from wavcse_infra.redaction import redact
 
 
@@ -80,6 +86,9 @@ class SystemProbes:
     def path_is_file(self, path: Path) -> bool:
         return path.is_file()
 
+    def runpod_credential(self, settings: Settings) -> ResolvedRunPodCredential:
+        return resolve_runpod_api_key(settings)
+
     def http_status(self, url: str, timeout_seconds: float) -> int:
         timeout = httpx.Timeout(timeout_seconds)
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
@@ -140,7 +149,7 @@ def run_doctor(
         _agent_tool_check(active_probes, "Codex", "codex"),
         _agent_tool_check(active_probes, "AGF", "agf"),
         _wavcse_directory_check(active_probes, settings.paths.wavcse, expanded_config_path),
-        _runpod_credential_check(settings),
+        _runpod_credential_check(active_probes, settings),
         _http_check(
             active_probes,
             "GitHub connectivity",
@@ -254,14 +263,17 @@ def _ssh_key_check(probes: SystemProbes, path: Path | None, config_path: Path) -
     )
 
 
-def _runpod_credential_check(settings: Settings) -> DoctorCheck:
-    if settings.runpod.api_key is None:
-        return DoctorCheck(
-            "RunPod credential",
-            CheckStatus.FAIL,
-            "RUNPOD_API_KEY is not set",
-        )
-    return DoctorCheck("RunPod credential", CheckStatus.PASS, "configured in environment")
+def _runpod_credential_check(probes: SystemProbes, settings: Settings) -> DoctorCheck:
+    try:
+        credential = probes.runpod_credential(settings)
+    except CredentialError as exc:
+        return DoctorCheck("RunPod credential", CheckStatus.FAIL, redact(exc))
+
+    if credential.source is CredentialSource.ENVIRONMENT:
+        detail = "RUNPOD_API_KEY environment variable"
+    else:
+        detail = f"resolved from AWS SSM Parameter Store parameter {credential.parameter_name}"
+    return DoctorCheck("RunPod credential", CheckStatus.PASS, detail)
 
 
 def _http_check(

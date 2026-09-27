@@ -9,6 +9,10 @@ class ConfigurationError(InfraError):
     """Raised when configuration cannot be loaded or validated safely."""
 
 
+class CredentialError(ConfigurationError):
+    """Raised when a configured runtime credential cannot be resolved safely."""
+
+
 class ProviderError(InfraError):
     """Base class for sanitized provider failures."""
 

@@ -122,7 +122,7 @@ def list_workers(context: typer.Context) -> None:
 
     settings = _load_cli_settings(_context(context))
     try:
-        with RunPodClient(settings.runpod) as client:
+        with RunPodClient.from_settings(settings) as client:
             workers = client.list_workers()
     except ConfigurationError as exc:
         _configuration_failure(exc)
@@ -157,7 +157,7 @@ def show_worker(
 
     settings = _load_cli_settings(_context(context))
     try:
-        with RunPodClient(settings.runpod) as client:
+        with RunPodClient.from_settings(settings) as client:
             worker = client.get_worker(worker_id)
     except ConfigurationError as exc:
         _configuration_failure(exc)

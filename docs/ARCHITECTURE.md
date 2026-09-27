@@ -41,6 +41,8 @@ artifact-transfer portion of this flow.
 ## Implemented modules
 
 - `config.py` validates and merges built-in, TOML, environment, and CLI settings.
+- `credentials.py` resolves the RunPod key once per client from the environment or an
+  SSM `SecureString` through Boto3's normal AWS credential chain.
 - `cli.py` defines the stable `infra` interface and global configuration options.
 - `doctor.py` runs independent read-only controller and connectivity probes.
 - `models.py` defines the provider-neutral worker view used by CLI presentation.
@@ -75,8 +77,20 @@ config/infra.example.toml
 
 The example is committed; the controller-specific user TOML is not. Bootstrap never
 overwrites an existing user file. Secrets are absent from both TOML roles.
-`RUNPOD_API_KEY` is read only from the process environment and stored as a Pydantic
-secret value.
+`runpod.api_key_parameter` is a non-secret SSM reference. At RunPod client construction,
+the credential resolver prefers a non-empty `RUNPOD_API_KEY`, otherwise calls SSM
+`GetParameter` with decryption. The resolved value remains in memory and is reused by
+that client; it is not copied into configuration, local state, or files.
+
+```text
+RUNPOD_API_KEY (if non-empty)
+  -> in-memory RunPod client credential
+
+otherwise:
+config runpod.api_key_parameter
+  -> SSM GetParameter(WithDecryption=True) via EC2 instance profile
+  -> in-memory RunPod client credential
+```
 
 ## Reliability stance
 

@@ -5,13 +5,14 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from decimal import Decimal
-from typing import Any
+from typing import Any, Self
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, ValidationError
 
-from wavcse_infra.config import RunPodConfig
+from wavcse_infra.config import RunPodConfig, Settings
+from wavcse_infra.credentials import SsmClient, resolve_runpod_api_key
 from wavcse_infra.errors import (
     ConfigurationError,
     ProviderAuthenticationError,
@@ -72,14 +73,35 @@ _POD_LIST_ADAPTER = TypeAdapter(list[_Pod])
 class RunPodClient:
     """Bounded-retry client for safe RunPod Pod reads."""
 
+    @classmethod
+    def from_settings(
+        cls,
+        settings: Settings,
+        *,
+        ssm_client: SsmClient | None = None,
+        transport: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> Self:
+        """Resolve one runtime credential and construct a client that reuses it."""
+
+        credential = resolve_runpod_api_key(settings, ssm_client=ssm_client)
+        return cls(
+            settings.runpod,
+            api_key=credential.api_key,
+            transport=transport,
+            sleep=sleep,
+        )
+
     def __init__(
         self,
         config: RunPodConfig,
         *,
+        api_key: SecretStr | None = None,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        if config.api_key is None:
+        resolved_api_key = api_key if api_key is not None else config.api_key
+        if resolved_api_key is None or not resolved_api_key.get_secret_value():
             raise ConfigurationError("RUNPOD_API_KEY is required for RunPod commands")
 
         self._config = config
@@ -88,7 +110,7 @@ class RunPodClient:
         self._client = httpx.Client(
             base_url=base_url,
             headers={
-                "Authorization": f"Bearer {config.api_key.get_secret_value()}",
+                "Authorization": f"Bearer {resolved_api_key.get_secret_value()}",
                 "Accept": "application/json",
                 "User-Agent": "wavcse-infra/0.1",
             },

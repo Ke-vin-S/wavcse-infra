@@ -15,8 +15,10 @@ GET /pods
 GET /pods/{podId}
 ```
 
-Authentication is an `Authorization: Bearer <token>` header sourced from
-`RUNPOD_API_KEY`. The value must never be logged.
+Authentication is an `Authorization: Bearer <token>` header. At client construction,
+the credential resolver prefers a non-empty `RUNPOD_API_KEY`; otherwise it decrypts the
+SSM `SecureString` named by `runpod.api_key_parameter`. SSM is read only once for that
+client lifetime. The value must never be logged or persisted.
 
 RunPod also publishes REST API v2 under `https://api.runpod.io/v2`. As of
 2026-09-27 the provider labels v2 public beta and warns that its endpoints and behavior

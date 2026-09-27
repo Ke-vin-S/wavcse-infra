@@ -1,10 +1,13 @@
+import logging
 from decimal import Decimal
 
 import httpx
 import pytest
+from botocore.session import Session as BotocoreSession
+from botocore.stub import Stubber
 from pydantic import SecretStr
 
-from wavcse_infra.config import RunPodConfig
+from wavcse_infra.config import RunPodConfig, Settings
 from wavcse_infra.errors import (
     ProviderAuthenticationError,
     ProviderError,
@@ -14,6 +17,8 @@ from wavcse_infra.errors import (
 )
 from wavcse_infra.models import WorkerState
 from wavcse_infra.providers.runpod import RunPodClient
+
+PARAMETER_NAME = "/wavcse-infra/runpod/api-key"
 
 
 def _config(
@@ -53,6 +58,73 @@ def _pod_payload(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def test_client_resolves_ssm_credential_once_for_multiple_reads() -> None:
+    secret = "ssm-resolved-runpod-token"
+    settings = Settings.model_validate(
+        {
+            "aws": {"region": "us-east-1"},
+            "runpod": {
+                "api_url": "https://rest.runpod.test/v1",
+                "api_key_parameter": PARAMETER_NAME,
+            },
+        }
+    )
+    aws_session = BotocoreSession()
+    aws_session.set_credentials("unit-test-access", "unit-test-secret", "unit-test-session")
+    ssm_client = aws_session.create_client("ssm", region_name="us-east-1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == f"Bearer {secret}"
+        if request.url.path.endswith("/pods"):
+            return httpx.Response(200, json=[_pod_payload()], request=request)
+        return httpx.Response(200, json=_pod_payload(), request=request)
+
+    with Stubber(ssm_client) as stubber:
+        stubber.add_response(
+            "get_parameter",
+            {
+                "Parameter": {
+                    "Name": PARAMETER_NAME,
+                    "Type": "SecureString",
+                    "Value": secret,
+                }
+            },
+            {"Name": PARAMETER_NAME, "WithDecryption": True},
+        )
+        with RunPodClient.from_settings(
+            settings,
+            ssm_client=ssm_client,
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            assert len(client.list_workers()) == 1
+            assert client.get_worker("pod-123").id == "pod-123"
+
+        stubber.assert_no_pending_responses()
+
+
+def test_client_from_settings_keeps_environment_authentication_compatible() -> None:
+    secret = "environment-runpod-token"
+    settings = Settings.model_validate(
+        {
+            "runpod": {
+                "api_url": "https://rest.runpod.test/v1",
+                "api_key": SecretStr(secret),
+                "api_key_parameter": PARAMETER_NAME,
+            }
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == f"Bearer {secret}"
+        return httpx.Response(200, json=[_pod_payload()], request=request)
+
+    with RunPodClient.from_settings(
+        settings,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        assert len(client.list_workers()) == 1
 
 
 def test_list_workers_uses_documented_endpoint_and_normalizes_response() -> None:
@@ -185,6 +257,21 @@ def test_authentication_failure_is_not_retried_or_leaked() -> None:
 
     assert calls == 1
     assert secret not in str(captured.value)
+
+
+def test_http_debug_logging_does_not_expose_authorization(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "authorization-value-that-must-not-appear"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json=[_pod_payload()], request=request)
+    )
+    caplog.set_level(logging.DEBUG)
+
+    with RunPodClient(_config(token=secret), transport=transport) as client:
+        client.list_workers()
+
+    assert secret not in caplog.text
 
 
 def test_retry_exhaustion_is_bounded() -> None:

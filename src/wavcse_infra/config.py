@@ -79,9 +79,20 @@ class RunPodConfig(FrozenModel):
 
     api_url: AnyHttpUrl = AnyHttpUrl(DEFAULT_RUNPOD_API_URL)
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+    api_key_parameter: str | None = Field(default=None, min_length=1, max_length=2048)
     request_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     max_read_attempts: int = Field(default=3, ge=1, le=10)
     retry_backoff_seconds: float = Field(default=0.5, ge=0, le=30)
+
+    @field_validator("api_key_parameter", mode="before")
+    @classmethod
+    def normalize_api_key_parameter(cls, value: object) -> object:
+        """Normalize the non-secret SSM reference without accepting a secret value."""
+
+        value = _placeholder_as_none(value)
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
 
     @field_validator("api_url")
     @classmethod
@@ -136,6 +147,7 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "WAVCSE_INFRA_AWS_REGION": ("aws", "region"),
     "WAVCSE_INFRA_EXPECT_OMP": ("controller", "expect_omp"),
     "WAVCSE_INFRA_MLFLOW_URL": ("controller", "mlflow_url"),
+    "WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER": ("runpod", "api_key_parameter"),
     "WAVCSE_INFRA_RUNPOD_API_URL": ("runpod", "api_url"),
     "WAVCSE_INFRA_RUNPOD_READ_ATTEMPTS": ("runpod", "max_read_attempts"),
     "WAVCSE_INFRA_RUNPOD_RETRY_BACKOFF_SECONDS": ("runpod", "retry_backoff_seconds"),

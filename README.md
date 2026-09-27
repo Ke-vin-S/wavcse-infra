@@ -31,7 +31,8 @@ lifecycle operations remain unavailable pending a separate review.
 The persistent/stoppable EC2 controller is the writable development environment. It
 contains OMP, Codex CLI, AGF, the `wavCSE` checkout, this repository, and the `infra`
 CLI. AWS access comes from an EC2 instance profile. The RunPod API key comes from the
-environment.
+`RUNPOD_API_KEY` environment variable for local/temporary use or, on the controller,
+from an AWS Systems Manager Parameter Store `SecureString` resolved at runtime.
 
 Disposable GPU workers execute immutable wavCSE commits. GitHub distributes code, a
 private S3 bucket is the canonical store for large artifacts, and wavCSE retains
@@ -63,7 +64,7 @@ git clone https://github.com/Ke-vin-S/wavcse-infra.git
 cd wavcse-infra
 ./controller/bootstrap.sh
 nano ~/.config/wavcse-infra/config.toml
-# Authenticate OMP and Codex, provision RUNPOD_API_KEY, and clone wavCSE, then:
+# Configure runpod.api_key_parameter, authenticate OMP/Codex, and clone wavCSE, then:
 infra doctor
 ```
 
@@ -107,14 +108,15 @@ in [ADR-011](docs/DECISIONS.md#adr-011-install-controller-agents-from-pinned-off
 
 ## Configuration
 
-Configuration has four distinct roles:
+Configuration and credential storage have five distinct roles:
 
 | Location | Role |
 | --- | --- |
 | `config/infra.example.toml` | Committed example containing all supported non-secret settings |
 | `~/.config/wavcse-infra/config.toml` | Controller-specific runtime configuration; never overwritten by bootstrap |
 | `.env.example` | Committed reference for supported environment variables, including secret variables |
-| Process environment or external secret facility | Real secrets; never committed |
+| AWS SSM Parameter Store `SecureString` | Persistent controller storage for the RunPod key |
+| Process environment | Optional temporary/local `RUNPOD_API_KEY` override |
 
 The default runtime user configuration is:
 
@@ -131,10 +133,18 @@ Precedence remains:
 3. user configuration file
 4. built-in defaults
 
-`RUNPOD_API_KEY` is accepted only from the environment. AWS authentication comes from
-the controller's EC2 instance profile. Do not put credentials in TOML or commit a
-populated `.env` file. [`.env.example`](.env.example) documents variables but is not
-automatically loaded.
+The TOML contains only the non-secret SSM parameter name:
+
+```toml
+[runpod]
+api_key_parameter = "/wavcse-infra/runpod/api-key"
+```
+
+The key itself remains in an SSM `SecureString`. Boto3 reads it with decryption through
+the controller's EC2 instance profile; no permanent AWS access keys are installed.
+`RUNPOD_API_KEY`, when non-empty, takes precedence for local development, CI, and
+temporary testing. Do not put the key in TOML or commit a populated `.env` file.
+[`.env.example`](.env.example) documents variables but is not automatically loaded.
 
 Validate without making network calls:
 
@@ -178,7 +188,8 @@ AWS credentials. Git stores code and small metadata, not generated tensors or ar
 
 - The controller is trusted and uses its EC2 IAM role through the normal AWS SDK
   credential chain.
-- RunPod credentials are environment-only and authorization values are redacted.
+- RunPod credentials resolve in memory from an environment override or SSM
+  `SecureString`; authorization values are redacted and never persisted.
 - GPU workers are temporary and less trusted than the controller.
 - S3 buckets remain private; presigned URLs are bearer secrets until expiry.
 - SSH uses keys and explicit host-key policy. Global host verification bypass is not

@@ -9,7 +9,8 @@ Configuration files have separate responsibilities:
 | `config/infra.example.toml` | Complete non-secret configuration template | Yes |
 | `~/.config/wavcse-infra/config.toml` | Controller-specific runtime configuration | No |
 | `.env.example` | Reference for supported environment variables | Yes |
-| Real environment/secrets facility | Runtime secrets such as `RUNPOD_API_KEY` | No |
+| AWS SSM Parameter Store `SecureString` | Persistent RunPod API key | No |
+| Process environment | Optional temporary/local `RUNPOD_API_KEY` override | No |
 
 `controller/bootstrap.sh` creates the runtime file from the template when it is absent.
 It prints the path that needs editing and never overwrites an existing file. To create it
@@ -24,9 +25,10 @@ Supported environment variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `RUNPOD_API_KEY` | RunPod bearer token; environment only |
+| `RUNPOD_API_KEY` | Optional RunPod bearer token override; takes precedence over SSM |
 | `WAVCSE_INFRA_AWS_REGION` | Region for STS and S3 diagnostics |
 | `WAVCSE_INFRA_CONFIG` | Alternate user TOML path |
+| `WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER` | Non-secret SSM parameter-name override |
 | `WAVCSE_INFRA_RUNPOD_API_URL` | RunPod REST base URL |
 | `WAVCSE_INFRA_RUNPOD_TIMEOUT_SECONDS` | Per-request timeout |
 | `WAVCSE_INFRA_RUNPOD_READ_ATTEMPTS` | Total safe read attempts |
@@ -63,13 +65,82 @@ then application defaults. `CHANGE_ME` is a template marker and is treated as mi
 configuration. `.env.example` is documentation only; this project does not automatically
 load `.env` files.
 
+## RunPod credential setup and rotation
+
+The three credential concerns are deliberately separate:
+
+| Concern | Location |
+| --- | --- |
+| Non-secret configuration | `~/.config/wavcse-infra/config.toml` |
+| Secret storage | AWS SSM Parameter Store `SecureString` |
+| AWS authentication | Attached EC2 instance profile using temporary role credentials |
+
+Add the non-secret reference to the controller configuration. Bootstrap includes this
+entry for newly created configurations but preserves existing files, so existing
+controllers must add it manually:
+
+```toml
+[runpod]
+api_key_parameter = "/wavcse-infra/runpod/api-key"
+```
+
+The controller instance-profile role needs only `ssm:GetParameter` on the exact
+parameter ARN:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:<region>:<account-id>:parameter/wavcse-infra/runpod/api-key"
+    }
+  ]
+}
+```
+
+When a customer-managed KMS key protects the `SecureString`, add a separate
+`kms:Decrypt` permission scoped to that key ARN. The default controller role does not
+need `ssm:PutParameter`, broad SSM/KMS permissions, or administrator access.
+
+From a trusted Bash shell whose AWS identity is separately authorized to create or
+update the parameter, use this prompt-based command. The secret is sent on standard
+input through `file:///dev/stdin`; its literal value is not placed in shell history or
+the AWS CLI argument list:
+
+```bash
+IFS= read -r -p 'AWS region: ' AWS_REGION
+IFS= read -r -s -p 'RunPod API key: ' RUNPOD_SECRET
+printf '\n'
+printf '%s' "${RUNPOD_SECRET}" | aws ssm put-parameter \
+  --region "${AWS_REGION}" \
+  --name '/wavcse-infra/runpod/api-key' \
+  --type SecureString \
+  --value file:///dev/stdin \
+  --overwrite
+unset RUNPOD_SECRET AWS_REGION
+```
+
+For a customer-managed KMS key, add `--key-id <key-id-or-arn>` to that command. Use the
+same command with `--overwrite` to rotate the RunPod key. Each new `infra` process reads
+the current value when it constructs its RunPod client; it does not cache the value in
+a file or local state.
+
+Credential precedence is:
+
+1. non-empty `RUNPOD_API_KEY` environment variable;
+2. decrypted SSM parameter named by `runpod.api_key_parameter`;
+3. credential unavailable.
+
 ## Initial controller setup
 
 Prerequisites outside this repository:
 
 1. Launch a supported Ubuntu EC2 instance.
 2. Attach an instance profile with least-privilege access to the private artifact
-   bucket/prefix. Do not create local static AWS credentials.
+   bucket/prefix and the configured RunPod SSM parameter. Do not create local static
+   AWS credentials.
 3. Configure controller SSH access and host security through normal AWS operations.
 4. Apply `controller/cloud-init.yaml` as user data, or run:
 
@@ -83,8 +154,10 @@ Prerequisites outside this repository:
    Bootstrap creates the user configuration if missing and preserves it on every later
    run. It installs controller agent tools by default; use `--skip-agents` only when
    they are managed separately.
-5. Complete user-specific GitHub, RunPod, and DagsHub/MLflow authentication. Agent
-   authentication remains manual:
+5. Create the RunPod SSM `SecureString`, add its non-secret parameter name to the TOML,
+   and grant the instance profile the scoped read permission described above. Complete
+   other user-specific GitHub and DagsHub/MLflow authentication. Agent authentication
+   remains manual:
 
    ```text
    OMP:   start omp, then run /login (or /login <provider>)
@@ -166,7 +239,7 @@ infra worker show <worker-id>
 
 `infra doctor` reports the loaded configuration path, AWS region, S3 bucket, and worker
 SSH key as separate checks before checking local tools, Python, OMP, Codex, AGF, the
-wavCSE path, RunPod credential presence, network endpoints, EC2 instance-profile
+wavCSE path, RunPod credential resolution, network endpoints, EC2 instance-profile
 identity, and S3 access. Missing agent commands point to `controller/install-agents.sh`;
 doctor remains read-only. Missing configuration values identify the TOML key and
 environment override that can fix them. Required failures produce exit 1; invalid TOML
@@ -181,15 +254,28 @@ PASS S3 bucket: wavcse-research-artifacts
 PASS Worker SSH key: /home/ubuntu/.ssh/wavcse_worker
 ```
 
-`worker list` and `worker show` call only documented GET endpoints. The API token must
-be present as `RUNPOD_API_KEY`; it is never read from TOML or a CLI option. These
-commands do not change provider state.
+`worker list` and `worker show` call only documented GET endpoints. The API token is
+resolved once per command from `RUNPOD_API_KEY` or the configured SSM parameter. The
+secret is never read from TOML or a CLI option. These commands do not change provider
+state.
+
+Validate SSM resolution after a fresh SSH login without an environment override:
+
+```bash
+unset RUNPOD_API_KEY
+infra doctor
+infra worker list
+```
+
+Doctor reports the source and may display the non-secret parameter name, but never the
+value, length, prefix, suffix, hash, or fingerprint.
 
 ## Controller reconstruction
 
 1. Recreate an Ubuntu EC2 instance and attach the existing scoped instance profile.
 2. Apply the thin cloud-init or clone `wavcse-infra` and run bootstrap.
-3. Restore user-managed authentication from its authoritative secret systems.
+3. Restore the non-secret SSM reference and verify the instance profile can decrypt the
+   existing `SecureString`; do not copy the key onto the controller filesystem.
 4. Clone `wavCSE` and check out the required development branch.
 5. Restore non-secret user configuration.
 6. Run `infra doctor`, then reconcile RunPod state with `infra worker list`.
@@ -199,7 +285,15 @@ artifacts from S3, and experiment metadata from MLflow/DagsHub.
 
 ## Failure handling
 
-- RunPod 401/403: verify `RUNPOD_API_KEY` in the current process; do not print it.
+- RunPod credential not configured: set `runpod.api_key_parameter` or temporarily export
+  `RUNPOD_API_KEY`; do not put the key in TOML.
+- SSM parameter not found: verify the configured parameter name and region.
+- SSM access denied: grant the controller instance profile `ssm:GetParameter` on the
+  exact parameter ARN. For a customer-managed KMS key, also verify `kms:Decrypt`.
+- SSM AWS/network failure: verify the configured region, instance profile, IMDS access,
+  and controller connectivity; do not create permanent AWS access keys.
+- RunPod 401/403 after successful resolution: rotate or correct the stored RunPod key;
+  do not print it.
 - RunPod 404 on `worker show`: verify the immutable provider worker ID and account.
 - RunPod 429/5xx or transport failure: safe reads retry within the configured bound.
 - AWS identity failure: verify an instance profile is attached and IMDS access is not
@@ -224,8 +318,9 @@ No automated cleanup is present in Phases 0–2, and no paid resource is created
   explicit bootstrap opt-out.
 - The configuration directory is created with mode `0700` and a new `config.toml` with
   mode `0600`; an existing file is preserved byte-for-byte.
-- Credentials and user-specific external authentication remain explicit post-bootstrap
-  steps.
+- Bootstrap copies only the non-secret parameter reference for a new configuration.
+  Credentials and user-specific external authentication remain explicit post-bootstrap
+  steps, and existing configuration is never overwritten.
 
 The cloud-init file assumes the default Ubuntu account and the public canonical
 repository URL. Customize those two non-secret values in an EC2 launch template when
@@ -236,6 +331,9 @@ automation from overwriting controller work.
 
 - [AWS: IAM roles for Amazon EC2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html)
 - [Boto3 credential provider chain](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html)
+- [SSM GetParameter API](https://docs.aws.amazon.com/systems-manager/latest/APIReference/API_GetParameter.html)
+- [AWS CLI put-parameter](https://docs.aws.amazon.com/cli/latest/reference/ssm/put-parameter.html)
+- [Parameter Store IAM access](https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-paramstore-access.html)
 - [cloud-init boot stages](https://cloudinit.readthedocs.io/en/latest/explanation/boot.html)
 - [cloud-init module reference](https://cloudinit.readthedocs.io/en/latest/reference/modules.html)
 - [uv installation](https://docs.astral.sh/uv/getting-started/installation/)

@@ -4,6 +4,7 @@ import pytest
 from pydantic import SecretStr
 
 from wavcse_infra.config import Settings
+from wavcse_infra.credentials import CredentialSource, ResolvedRunPodCredential
 from wavcse_infra.doctor import (
     AwsIdentity,
     CheckStatus,
@@ -12,6 +13,9 @@ from wavcse_infra.doctor import (
     _require_instance_profile,
     run_doctor,
 )
+from wavcse_infra.errors import CredentialError
+
+PARAMETER_NAME = "/wavcse-infra/runpod/api-key"
 
 
 class HealthyProbes(SystemProbes):
@@ -95,6 +99,80 @@ def test_doctor_passes_with_expected_controller_dependencies(tmp_path: Path) -> 
     assert checks["OMP"] == DoctorCheck("OMP", CheckStatus.PASS, "/usr/bin/omp")
     assert checks["Codex"] == DoctorCheck("Codex", CheckStatus.PASS, "/usr/bin/codex")
     assert checks["AGF"] == DoctorCheck("AGF", CheckStatus.PASS, "/usr/bin/agf")
+    assert checks["RunPod credential"] == DoctorCheck(
+        "RunPod credential",
+        CheckStatus.PASS,
+        "RUNPOD_API_KEY environment variable",
+    )
+
+
+def test_doctor_reports_ssm_credential_source(tmp_path: Path) -> None:
+    configured = _configured_settings(tmp_path)
+    settings = configured.model_copy(
+        update={
+            "runpod": configured.runpod.model_copy(
+                update={"api_key": None, "api_key_parameter": PARAMETER_NAME}
+            )
+        }
+    )
+    config_path = _config_file(tmp_path)
+    existing_paths = {settings.paths.wavcse, settings.ssh.private_key, config_path}
+
+    class SsmCredentialProbes(HealthyProbes):
+        def runpod_credential(self, settings: Settings) -> ResolvedRunPodCredential:
+            del settings
+            return ResolvedRunPodCredential(
+                api_key=SecretStr("fake-ssm-token"),
+                source=CredentialSource.SSM,
+                parameter_name=PARAMETER_NAME,
+            )
+
+    report = run_doctor(
+        settings,
+        SsmCredentialProbes(existing_paths),
+        config_path=config_path,
+    )
+
+    check = next(check for check in report.checks if check.name == "RunPod credential")
+    assert check == DoctorCheck(
+        "RunPod credential",
+        CheckStatus.PASS,
+        f"resolved from AWS SSM Parameter Store parameter {PARAMETER_NAME}",
+    )
+
+
+def test_doctor_reports_inaccessible_ssm_parameter_cleanly(tmp_path: Path) -> None:
+    configured = _configured_settings(tmp_path)
+    settings = configured.model_copy(
+        update={
+            "runpod": configured.runpod.model_copy(
+                update={"api_key": None, "api_key_parameter": PARAMETER_NAME}
+            )
+        }
+    )
+    config_path = _config_file(tmp_path)
+    existing_paths = {settings.paths.wavcse, settings.ssh.private_key, config_path}
+
+    class InaccessibleSsmProbes(HealthyProbes):
+        def runpod_credential(self, settings: Settings) -> ResolvedRunPodCredential:
+            del settings
+            raise CredentialError(
+                "RunPod credential unavailable: access denied reading SSM parameter "
+                f"{PARAMETER_NAME}"
+            )
+
+    report = run_doctor(
+        settings,
+        InaccessibleSsmProbes(existing_paths),
+        config_path=config_path,
+    )
+
+    check = next(check for check in report.checks if check.name == "RunPod credential")
+    assert check == DoctorCheck(
+        "RunPod credential",
+        CheckStatus.FAIL,
+        f"RunPod credential unavailable: access denied reading SSM parameter {PARAMETER_NAME}",
+    )
 
 
 @pytest.mark.parametrize(

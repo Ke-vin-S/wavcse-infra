@@ -515,7 +515,10 @@ Example concepts:
 
 Do not put secrets in this file.
 
-Secrets come from environment or external credential mechanisms.
+Secrets come from environment or external credential mechanisms. The RunPod key may be
+referenced by a non-secret `runpod.api_key_parameter` and resolved at runtime from an AWS
+SSM Parameter Store `SecureString`; a non-empty `RUNPOD_API_KEY` environment variable
+takes precedence.
 
 # 22. IAM
 
@@ -533,6 +536,10 @@ Expected classes of access:
 Avoid account-wide S3 permissions.
 
 The RunPod API token is unrelated to AWS IAM and must be stored separately.
+
+When the RunPod token is stored in SSM, the controller instance profile requires only
+`ssm:GetParameter` on that parameter. A customer-managed KMS key may additionally
+require `kms:Decrypt` on the key.
 
 # 23. Controller reconstruction
 
@@ -576,7 +583,7 @@ Controller:
     Codex CLI
     AGF
     AWS identity availability
-    RunPod credential presence
+    RunPod credential resolution and source (environment or SSM)
     wavCSE path
 
 Connectivity:
