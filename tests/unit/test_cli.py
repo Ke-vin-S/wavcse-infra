@@ -1,3 +1,4 @@
+from decimal import Decimal
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -5,6 +6,7 @@ from typer.testing import CliRunner
 from wavcse_infra import cli
 from wavcse_infra.cli import app
 from wavcse_infra.doctor import CheckStatus, DoctorCheck, DoctorReport
+from wavcse_infra.models import Worker, WorkerState
 
 runner = CliRunner()
 
@@ -45,3 +47,80 @@ def test_doctor_uses_nonzero_exit_for_failed_required_check(monkeypatch) -> None
     assert result.exit_code == 1
     assert "FAIL AWS identity: instance profile missing" in result.stdout
     assert "1 required check" in result.stdout
+
+
+def test_worker_list_requires_environment_credential() -> None:
+    result = runner.invoke(app, ["worker", "list"], env={"RUNPOD_API_KEY": ""})
+
+    assert result.exit_code == 2
+    assert "Configuration error" in result.stderr
+    assert "RUNPOD_API_KEY is required" in result.stderr
+
+
+def test_worker_list_renders_normalized_workers(monkeypatch) -> None:
+    worker = Worker(
+        id="pod-123",
+        name="training-worker",
+        state=WorkerState.RUNNING,
+        native_status="RUNNING",
+        gpu_type="NVIDIA RTX 4090",
+        gpu_count=1,
+        hourly_cost=Decimal("0.69"),
+    )
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return None
+
+        def list_workers(self) -> list[Worker]:
+            return [worker]
+
+    monkeypatch.setattr(cli, "RunPodClient", lambda config: FakeClient())
+
+    result = runner.invoke(
+        app,
+        ["worker", "list"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 0
+    assert "pod-123\tRUNNING\tNVIDIA RTX 4090\t1\t0.6900\ttraining-worker" in result.stdout
+
+
+def test_worker_show_renders_normalized_worker(monkeypatch) -> None:
+    worker = Worker(
+        id="pod-123",
+        name="training-worker",
+        state=WorkerState.STOPPED,
+        native_status="EXITED",
+        hourly_cost=Decimal("0.69"),
+        ssh_port=10341,
+    )
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return None
+
+        def get_worker(self, worker_id: str) -> Worker:
+            assert worker_id == "pod-123"
+            return worker
+
+    monkeypatch.setattr(cli, "RunPodClient", lambda config: FakeClient())
+
+    result = runner.invoke(
+        app,
+        ["worker", "show", "pod-123"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 0
+    assert "ID: pod-123" in result.stdout
+    assert "State: STOPPED" in result.stdout
+    assert "Native status: EXITED" in result.stdout
+    assert "SSH port: 10341" in result.stdout

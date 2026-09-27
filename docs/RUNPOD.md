@@ -8,7 +8,7 @@ Phases 0–2 use the stable REST API v1 base URL:
 https://rest.runpod.io/v1
 ```
 
-Planned Phase 2 operations:
+Implemented Phase 2 operations:
 
 ```text
 GET /pods
@@ -26,13 +26,14 @@ records the decision to keep the production read path on v1 until a deliberate r
 ## Normalization
 
 The provider returns `desiredStatus` with documented values `RUNNING`, `EXITED`, and
-`TERMINATED`. The Phase 2 application will map these to `RUNNING`, `STOPPED`, and `DESTROYED` while
-retaining the native value. Unknown or missing statuses normalize to `UNKNOWN`.
+`TERMINATED`. The application maps these to `RUNNING`, `STOPPED`, and `DESTROYED`
+while retaining the native value. Unknown or missing statuses normalize to `UNKNOWN`.
 
 Where available, the internal worker view includes provider ID, name, GPU display name
 and count, effective/base hourly cost, public IP, mapped SSH port, datacenter, image,
 interruptibility, and last-started timestamp. Missing fields remain absent rather than
-being inferred.
+being inferred. Both reads request the documented `includeMachine=true` expansion so
+machine and datacenter fields are available when RunPod has assigned them.
 
 The v1 sample schema represents `costPerHr` as a string and `adjustedCostPerHr` as a
 number. Normalization accepts either numeric representation and uses decimal values to
@@ -41,8 +42,9 @@ avoid binary floating-point cost artifacts.
 ## Read retries
 
 Only safe GET operations retry. Retryable conditions are transport/timeouts, HTTP 429,
-and HTTP 5xx. Attempts are bounded and use exponential backoff. Authentication, not
-found, validation, and other 4xx failures are not retried.
+and HTTP 5xx. Attempts are bounded, use exponential backoff, and cap each delay at 30
+seconds. Authentication, not found, redirects, validation, and other 4xx failures are
+not retried.
 
 Resource creation will require a separate conservative design because retrying after an
 ambiguous create response can duplicate paid Pods.
@@ -55,9 +57,9 @@ RunPod documents two key-authenticated paths:
 - Full SSH requires a machine with public-IP support, TCP port 22 exposed, a running
   SSH daemon, and the provider-mapped external port.
 
-The Phase 2 API will report `publicIp` and `portMappings["22"]`; that is not equivalent to
-a successful SSH health check. SSH readiness belongs to a later phase. Artifact transfer
-must not depend on SCP.
+The Phase 2 API reports `publicIp` and `portMappings["22"]` when present; that is not
+equivalent to a successful SSH health check. SSH readiness belongs to a later phase.
+Artifact transfer must not depend on SCP.
 
 ## Current limitations
 

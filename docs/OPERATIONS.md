@@ -58,7 +58,7 @@ cloud resources.
 infra doctor
 ```
 
-RunPod worker reads become available in Phase 2:
+Inspect existing RunPod workers without changing provider state:
 
 ```bash
 infra worker list
@@ -70,8 +70,9 @@ SSH key, RunPod credential presence, network endpoints, EC2 instance-profile ide
 and the configured S3 prefix. Required failures produce exit 1; invalid configuration
 produces exit 2. Optional unconfigured checks are reported as warnings or skips.
 
-Phase 2 `worker list` and `worker show` call only documented GET endpoints. They do not
-change provider state.
+`worker list` and `worker show` call only documented GET endpoints. The API token must
+be present as `RUNPOD_API_KEY`; it is never read from TOML or a CLI option. These
+commands do not change provider state.
 
 ## Controller reconstruction
 

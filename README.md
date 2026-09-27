@@ -11,17 +11,19 @@ repository.
 
 ## Delivery status
 
-The repository currently implements Phases 0–1 of the v1 specification:
+The repository currently implements Phases 0–2 of the v1 specification:
 
 - a typed `infra` CLI and layered TOML/environment configuration;
 - Ruff, pytest, ShellCheck, and shfmt validation;
 - a locked `uv` environment and credential-free CI;
 - idempotent Ubuntu controller bootstrap and thin cloud-init;
 - `infra doctor` controller, credential-source, configuration, and connectivity checks;
+- read-only `infra worker list` and `infra worker show` RunPod operations;
+- provider-neutral worker models and bounded retries for safe provider reads;
 - initial architecture, security, operations, provider, and decision documentation.
 
-Read-only RunPod worker inspection is the next phase. No implemented command can
-provision a paid resource.
+No implemented command can create, modify, or destroy a RunPod resource. Paid worker
+lifecycle operations remain unavailable pending a separate review.
 
 ## Architecture
 
@@ -94,6 +96,8 @@ uv run infra config validate
 infra --help
 infra config validate
 infra doctor
+infra worker list
+infra worker show <worker-id>
 ```
 
 Global `--config`, `--runpod-api-url`, `--runpod-timeout`, and `--verbose` options must
@@ -103,8 +107,9 @@ appear before the command name.
 
 The planned lifecycle is create, wait for provider readiness, discover SSH, bootstrap,
 health-check, execute an exact committed wavCSE revision, persist requested outputs,
-and explicitly stop or destroy. Phases 0–1 implement none of this lifecycle. Creation
-and destruction remain intentionally unavailable pending review.
+and explicitly stop or destroy. Phase 2 only inspects existing workers. Creation,
+mutation, SSH access, job execution, and destruction remain intentionally unavailable
+pending review.
 
 ## Storage model
 

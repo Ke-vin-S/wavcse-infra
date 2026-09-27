@@ -25,8 +25,9 @@ a bounded S3 prefix listing. Later storage phases will require narrowly scoped
 
 Set `RUNPOD_API_KEY` in the controller environment or an external secret facility. The
 key is rejected from the TOML configuration and never accepted as a CLI option, avoiding
-committed secrets and process-list exposure. HTTP authorization headers and provider
-errors pass through redaction before user display.
+committed secrets and process-list exposure. HTTP authorization headers are never
+rendered. Provider failures expose only the operation and safe status context;
+user-facing errors pass through redaction before display.
 
 ### SSH
 

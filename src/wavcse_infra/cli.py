@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Never
 
 import typer
 
 from wavcse_infra import __version__
 from wavcse_infra.config import Settings, load_settings, resolved_config_path
 from wavcse_infra.doctor import CheckStatus, DoctorReport, run_doctor
-from wavcse_infra.errors import ConfigurationError
+from wavcse_infra.errors import ConfigurationError, ProviderError
+from wavcse_infra.models import Worker
+from wavcse_infra.providers.runpod import RunPodClient
+from wavcse_infra.redaction import redact
 
 app = typer.Typer(
     name="infra",
@@ -20,7 +24,9 @@ app = typer.Typer(
     pretty_exceptions_enable=False,
 )
 config_app = typer.Typer(help="Validate controller configuration.", no_args_is_help=True)
+worker_app = typer.Typer(help="Inspect RunPod GPU workers.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
+app.add_typer(worker_app, name="worker")
 
 
 @dataclass(frozen=True)
@@ -106,6 +112,56 @@ def doctor_command(context: typer.Context) -> None:
         raise typer.Exit(code=1)
 
 
+@worker_app.command("list")
+def list_workers(context: typer.Context) -> None:
+    """List RunPod workers without changing provider state."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient(settings.runpod) as client:
+            workers = client.list_workers()
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    if not workers:
+        typer.echo("No RunPod workers found.")
+        return
+
+    typer.echo("ID\tSTATE\tGPU\tCOUNT\tCOST/HR\tNAME")
+    for worker in workers:
+        typer.echo(
+            "\t".join(
+                (
+                    worker.id,
+                    worker.state.value,
+                    worker.gpu_type or "-",
+                    str(worker.gpu_count) if worker.gpu_count is not None else "-",
+                    _money(worker.hourly_cost),
+                    worker.name or "-",
+                )
+            )
+        )
+
+
+@worker_app.command("show")
+def show_worker(
+    context: typer.Context,
+    worker_id: Annotated[str, typer.Argument(help="RunPod worker ID.")],
+) -> None:
+    """Show one RunPod worker without changing provider state."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient(settings.runpod) as client:
+            worker = client.get_worker(worker_id)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    _print_worker(worker)
+
+
 def _context(context: typer.Context) -> CliContext:
     root_context = context.find_root().obj
     if not isinstance(root_context, CliContext):
@@ -120,8 +176,7 @@ def _load_cli_settings(cli_context: CliContext) -> Settings:
             cli_overrides=cli_context.cli_overrides,
         )
     except ConfigurationError as exc:
-        typer.echo(f"Configuration error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+        _configuration_failure(exc)
 
 
 def _print_doctor_report(report: DoctorReport) -> None:
@@ -138,6 +193,42 @@ def _print_doctor_report(report: DoctorReport) -> None:
         typer.echo("Controller checks passed.")
     else:
         typer.echo(f"Controller checks failed ({report.failed_count} required check(s)).")
+
+
+def _print_worker(worker: Worker) -> None:
+    fields = (
+        ("Provider", worker.provider),
+        ("ID", worker.id),
+        ("Name", worker.name),
+        ("State", worker.state.value),
+        ("Native status", worker.native_status),
+        ("GPU", worker.gpu_type),
+        ("GPU count", worker.gpu_count),
+        ("Hourly cost", _money(worker.hourly_cost)),
+        ("Base hourly cost", _money(worker.base_hourly_cost)),
+        ("Public IP", worker.public_ip),
+        ("SSH port", worker.ssh_port),
+        ("Datacenter", worker.datacenter),
+        ("Image", worker.image),
+        ("Interruptible", worker.interruptible),
+        ("Last started", worker.last_started_at.isoformat() if worker.last_started_at else None),
+    )
+    for label, value in fields:
+        typer.echo(f"{label}: {value if value is not None else '-'}")
+
+
+def _money(value: Decimal | None) -> str:
+    return f"{value:.4f}" if value is not None else "-"
+
+
+def _configuration_failure(exc: Exception) -> Never:
+    typer.echo(f"Configuration error: {redact(exc)}", err=True)
+    raise typer.Exit(code=2) from exc
+
+
+def _provider_failure(exc: Exception) -> Never:
+    typer.echo(f"RunPod error: {redact(exc)}", err=True)
+    raise typer.Exit(code=1) from exc
 
 
 def main() -> None:
