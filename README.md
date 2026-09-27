@@ -57,32 +57,49 @@ make check
 On a supported Ubuntu EC2 controller:
 
 ```bash
+git clone https://github.com/Ke-vin-S/wavcse-infra.git
+cd wavcse-infra
 ./controller/bootstrap.sh
+nano ~/.config/wavcse-infra/config.toml
+# Provision RUNPOD_API_KEY and the separate wavCSE checkout, then:
+infra doctor
 ```
 
-The bootstrap is safe to rerun. It does not install OMP, configure user credentials,
-or create cloud resources. See [Operations](docs/OPERATIONS.md) for controller setup
-and reconstruction.
+On its first run, bootstrap copies the committed non-secret example to the controller's
+user configuration. It never overwrites an existing `config.toml`, so the command is
+safe to rerun. Bootstrap does not install OMP, configure credentials, or create cloud
+resources. See [Operations](docs/OPERATIONS.md) for controller setup and reconstruction.
 
 ## Configuration
 
-The default user configuration is:
+Configuration has four distinct roles:
+
+| Location | Role |
+| --- | --- |
+| `config/infra.example.toml` | Committed example containing all supported non-secret settings |
+| `~/.config/wavcse-infra/config.toml` | Controller-specific runtime configuration; never overwritten by bootstrap |
+| `.env.example` | Committed reference for supported environment variables, including secret variables |
+| Process environment or external secret facility | Real secrets; never committed |
+
+The default runtime user configuration is:
 
 ```text
 ~/.config/wavcse-infra/config.toml
 ```
 
-Copy [`config/infra.example.toml`](config/infra.example.toml) and adjust non-secret
-values. Precedence is:
+Bootstrap creates it from [`config/infra.example.toml`](config/infra.example.toml) when
+missing. Replace `CHANGE_ME` before running workloads; doctor treats it as unconfigured.
+Precedence remains:
 
 1. CLI options
 2. environment variables
 3. user configuration file
 4. built-in defaults
 
-`RUNPOD_API_KEY` is accepted only from the environment. Do not put it in TOML. The
-supported variables are listed in [`.env.example`](.env.example) and documented in
-[Operations](docs/OPERATIONS.md).
+`RUNPOD_API_KEY` is accepted only from the environment. AWS authentication comes from
+the controller's EC2 instance profile. Do not put credentials in TOML or commit a
+populated `.env` file. [`.env.example`](.env.example) documents variables but is not
+automatically loaded.
 
 Validate without making network calls:
 

@@ -103,6 +103,34 @@ sync_project() {
     "${CONTROLLER_HOME}/.local/bin/infra"
 }
 
+ensure_user_config() {
+  local config_directory="${CONTROLLER_HOME}/.config/wavcse-infra"
+  local config_file="${config_directory}/config.toml"
+  local example_config="${REPOSITORY_ROOT}/config/infra.example.toml"
+
+  [[ -r "${example_config}" ]] || fail "example configuration is not readable: ${example_config}"
+  run_as_controller install -d -m 0700 -- "${config_directory}"
+
+  if [[ -e "${config_file}" || -L "${config_file}" ]]; then
+    printf 'Preserving existing controller configuration: %s\n' "${config_file}"
+    return
+  fi
+
+  # Positional parameters expand inside the child Bash process.
+  # shellcheck disable=SC2016
+  if run_as_controller bash -c \
+    'set -o noclobber; umask 077; cat -- "$1" > "$2"' \
+    bootstrap-config-copy "${example_config}" "${config_file}"; then
+    printf 'Created controller configuration: %s\n' "${config_file}"
+    printf 'Next: edit %s and replace template values before running infra doctor.\n' \
+      "${config_file}"
+  elif [[ -e "${config_file}" || -L "${config_file}" ]]; then
+    printf 'Preserving controller configuration created concurrently: %s\n' "${config_file}"
+  else
+    fail "could not create controller configuration: ${config_file}"
+  fi
+}
+
 main() {
   require_ubuntu
 
@@ -115,12 +143,15 @@ main() {
     fail "could not determine home directory for ${CONTROLLER_USER}"
 
   printf 'Bootstrapping controller for %s from %s\n' "${CONTROLLER_USER}" "${REPOSITORY_ROOT}"
+  ensure_user_config
   install_os_packages
   install_uv
   sync_project
 
   printf 'Controller bootstrap complete.\n'
-  printf 'Next: configure ~/.config/wavcse-infra/config.toml and RUNPOD_API_KEY, then run infra doctor.\n'
+  printf 'Next: configure RUNPOD_API_KEY in the environment, then run infra doctor.\n'
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

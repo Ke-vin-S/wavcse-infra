@@ -105,8 +105,12 @@ def validate_config(context: typer.Context) -> None:
 def doctor_command(context: typer.Context) -> None:
     """Check controller prerequisites and configured external connectivity."""
 
-    settings = _load_cli_settings(_context(context))
-    report = run_doctor(settings)
+    cli_context = _context(context)
+    settings = _load_cli_settings(cli_context)
+    report = run_doctor(
+        settings,
+        config_path=resolved_config_path(cli_context.config_path),
+    )
     _print_doctor_report(report)
     if not report.successful:
         raise typer.Exit(code=1)

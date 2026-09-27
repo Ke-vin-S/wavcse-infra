@@ -7,6 +7,7 @@ from wavcse_infra.config import Settings
 from wavcse_infra.doctor import (
     AwsIdentity,
     CheckStatus,
+    DoctorCheck,
     SystemProbes,
     _require_instance_profile,
     run_doctor,
@@ -70,11 +71,22 @@ def _configured_settings(tmp_path: Path) -> Settings:
     )
 
 
+def _config_file(tmp_path: Path) -> Path:
+    path = tmp_path / "config.toml"
+    path.write_text("# test controller configuration\n", encoding="utf-8")
+    return path
+
+
 def test_doctor_passes_with_expected_controller_dependencies(tmp_path: Path) -> None:
     settings = _configured_settings(tmp_path)
-    existing_paths = {settings.paths.wavcse, settings.ssh.private_key}
+    config_path = _config_file(tmp_path)
+    existing_paths = {settings.paths.wavcse, settings.ssh.private_key, config_path}
 
-    report = run_doctor(settings, HealthyProbes(existing_paths))
+    report = run_doctor(
+        settings,
+        HealthyProbes(existing_paths),
+        config_path=config_path,
+    )
 
     assert report.successful
     assert report.failed_count == 0
@@ -83,6 +95,7 @@ def test_doctor_passes_with_expected_controller_dependencies(tmp_path: Path) -> 
 
 def test_doctor_rejects_non_instance_profile_aws_credentials(tmp_path: Path) -> None:
     settings = _configured_settings(tmp_path)
+    config_path = _config_file(tmp_path)
 
     class EnvironmentCredentialProbes(HealthyProbes):
         def aws_identity(self, timeout_seconds: float, region: str | None) -> AwsIdentity:
@@ -96,7 +109,8 @@ def test_doctor_rejects_non_instance_profile_aws_credentials(tmp_path: Path) -> 
 
     report = run_doctor(
         settings,
-        EnvironmentCredentialProbes({settings.paths.wavcse, settings.ssh.private_key}),
+        EnvironmentCredentialProbes({settings.paths.wavcse, settings.ssh.private_key, config_path}),
+        config_path=config_path,
     )
 
     identity_check = next(check for check in report.checks if check.name == "AWS identity")
@@ -106,6 +120,7 @@ def test_doctor_rejects_non_instance_profile_aws_credentials(tmp_path: Path) -> 
 
 def test_doctor_redacts_external_error_details(tmp_path: Path) -> None:
     settings = _configured_settings(tmp_path)
+    config_path = _config_file(tmp_path)
 
     class FailingAwsProbes(HealthyProbes):
         def aws_identity(self, timeout_seconds: float, region: str | None) -> AwsIdentity:
@@ -117,7 +132,8 @@ def test_doctor_redacts_external_error_details(tmp_path: Path) -> None:
 
     report = run_doctor(
         settings,
-        FailingAwsProbes({settings.paths.wavcse, settings.ssh.private_key}),
+        FailingAwsProbes({settings.paths.wavcse, settings.ssh.private_key, config_path}),
+        config_path=config_path,
     )
 
     identity_check = next(check for check in report.checks if check.name == "AWS identity")
@@ -129,6 +145,7 @@ def test_doctor_redacts_external_error_details(tmp_path: Path) -> None:
 
 def test_unconfigured_optional_ssh_and_mlflow_checks_do_not_fail(tmp_path: Path) -> None:
     configured = _configured_settings(tmp_path)
+    config_path = _config_file(tmp_path)
     settings = Settings.model_validate(
         {
             "aws": {"region": "ap-south-1"},
@@ -145,15 +162,63 @@ def test_unconfigured_optional_ssh_and_mlflow_checks_do_not_fail(tmp_path: Path)
             },
         }
     )
-    probes = HealthyProbes({settings.paths.wavcse})
+    probes = HealthyProbes({settings.paths.wavcse, config_path})
 
-    report = run_doctor(settings, probes)
+    report = run_doctor(settings, probes, config_path=config_path)
 
     assert report.successful
     statuses = {check.name: check.status for check in report.checks}
     assert statuses["Worker SSH key"] is CheckStatus.WARN
     assert statuses["OMP"] is CheckStatus.SKIP
     assert statuses["MLflow connectivity"] is CheckStatus.SKIP
+
+
+def test_doctor_reports_loaded_configuration_values(tmp_path: Path) -> None:
+    settings = _configured_settings(tmp_path)
+    config_path = _config_file(tmp_path)
+    existing_paths = {settings.paths.wavcse, settings.ssh.private_key, config_path}
+
+    report = run_doctor(
+        settings,
+        HealthyProbes(existing_paths),
+        config_path=config_path,
+    )
+
+    checks = {check.name: check for check in report.checks}
+    assert checks["Config"] == DoctorCheck("Config", CheckStatus.PASS, str(config_path))
+    assert checks["AWS region"] == DoctorCheck("AWS region", CheckStatus.PASS, "ap-south-1")
+    assert checks["S3 bucket"] == DoctorCheck(
+        "S3 bucket", CheckStatus.PASS, "private-wavcse-artifacts"
+    )
+    assert checks["Worker SSH key"] == DoctorCheck(
+        "Worker SSH key", CheckStatus.PASS, str(settings.ssh.private_key)
+    )
+
+
+def test_doctor_reports_missing_config_and_actionable_keys(tmp_path: Path) -> None:
+    settings = Settings.model_validate(
+        {
+            "controller": {"expect_omp": False},
+            "paths": {"wavcse": tmp_path / "wavCSE"},
+            "runpod": {"api_key": SecretStr("fake-token")},
+        }
+    )
+    missing_config = tmp_path / "missing-config.toml"
+    probes = HealthyProbes({settings.paths.wavcse})
+
+    report = run_doctor(settings, probes, config_path=missing_config)
+
+    checks = {check.name: check for check in report.checks}
+    assert checks["Config"].status is CheckStatus.FAIL
+    assert str(missing_config) in checks["Config"].detail
+    assert checks["AWS region"].status is CheckStatus.FAIL
+    assert "aws.region" in checks["AWS region"].detail
+    assert "WAVCSE_INFRA_AWS_REGION" in checks["AWS region"].detail
+    assert checks["S3 bucket"].status is CheckStatus.FAIL
+    assert "storage.bucket" in checks["S3 bucket"].detail
+    assert "WAVCSE_INFRA_S3_BUCKET" in checks["S3 bucket"].detail
+    assert checks["Worker SSH key"].status is CheckStatus.WARN
+    assert "ssh.private_key" in checks["Worker SSH key"].detail
 
 
 def test_system_probe_refuses_static_aws_credentials_before_use() -> None:

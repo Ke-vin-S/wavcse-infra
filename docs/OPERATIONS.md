@@ -2,11 +2,22 @@
 
 ## Configuration
 
-Create the user configuration:
+Configuration files have separate responsibilities:
+
+| Location | Purpose | Committed |
+| --- | --- | --- |
+| `config/infra.example.toml` | Complete non-secret configuration template | Yes |
+| `~/.config/wavcse-infra/config.toml` | Controller-specific runtime configuration | No |
+| `.env.example` | Reference for supported environment variables | Yes |
+| Real environment/secrets facility | Runtime secrets such as `RUNPOD_API_KEY` | No |
+
+`controller/bootstrap.sh` creates the runtime file from the template when it is absent.
+It prints the path that needs editing and never overwrites an existing file. To create it
+manually instead:
 
 ```bash
 mkdir -p ~/.config/wavcse-infra
-cp config/infra.example.toml ~/.config/wavcse-infra/config.toml
+cp --no-clobber config/infra.example.toml ~/.config/wavcse-infra/config.toml
 ```
 
 Supported environment variables:
@@ -34,6 +45,11 @@ result without network calls:
 infra config validate
 ```
 
+The default precedence is CLI arguments, environment variables, the runtime user TOML,
+then application defaults. `CHANGE_ME` is a template marker and is treated as missing
+configuration. `.env.example` is documentation only; this project does not automatically
+load `.env` files.
+
 ## Initial controller setup
 
 Prerequisites outside this repository:
@@ -42,11 +58,20 @@ Prerequisites outside this repository:
 2. Attach an instance profile with least-privilege access to the private artifact
    bucket/prefix. Do not create local static AWS credentials.
 3. Configure controller SSH access and host security through normal AWS operations.
-4. Apply `controller/cloud-init.yaml` as user data, or clone this repository and run
-   `controller/bootstrap.sh` manually.
+4. Apply `controller/cloud-init.yaml` as user data, or run:
+
+   ```bash
+   git clone https://github.com/Ke-vin-S/wavcse-infra.git
+   cd wavcse-infra
+   ./controller/bootstrap.sh
+   nano ~/.config/wavcse-infra/config.toml
+   ```
+
+   Bootstrap creates the user configuration if missing and preserves it on every later
+   run.
 5. Complete user-specific GitHub, RunPod, DagsHub/MLflow, and OMP authentication.
 6. Clone the separate wavCSE repository under `~/projects/wavCSE`.
-7. Configure `~/.config/wavcse-infra/config.toml` and run `infra doctor`.
+7. Run `infra doctor`.
 
 Bootstrap installs controller prerequisites and the locked Python project. It is
 idempotent and safe to rerun. It does not install OMP, inject secrets, or provision
@@ -65,10 +90,20 @@ infra worker list
 infra worker show <worker-id>
 ```
 
-`infra doctor` checks local tools, Python version, OMP policy, the wavCSE path, optional
-SSH key, RunPod credential presence, network endpoints, EC2 instance-profile identity,
-and the configured S3 prefix. Required failures produce exit 1; invalid configuration
-produces exit 2. Optional unconfigured checks are reported as warnings or skips.
+`infra doctor` reports the loaded configuration path, AWS region, S3 bucket, and worker
+SSH key as separate checks before checking local tools, Python, OMP policy, the wavCSE
+path, RunPod credential presence, network endpoints, EC2 instance-profile identity, and
+S3 access. Missing values identify the TOML key and environment override that can fix
+them. Required failures produce exit 1; invalid TOML produces exit 2.
+
+Example configuration section:
+
+```text
+PASS Config: /home/ubuntu/.config/wavcse-infra/config.toml
+PASS AWS region: us-east-1
+PASS S3 bucket: wavcse-research-artifacts
+PASS Worker SSH key: /home/ubuntu/.ssh/wavcse_worker
+```
 
 `worker list` and `worker show` call only documented GET endpoints. The API token must
 be present as `RUNPOD_API_KEY`; it is never read from TOML or a CLI option. These
@@ -107,6 +142,8 @@ No automated cleanup is present in Phases 0–2, and no paid resource is created
   controlled upgrade.
 - uv is installed into the target user's `~/.local/bin` without modifying shell files.
 - Python 3.12 and the exact `uv.lock` environment are synchronized on every run.
+- The configuration directory is created with mode `0700` and a new `config.toml` with
+  mode `0600`; an existing file is preserved byte-for-byte.
 - OMP, credentials, and user-specific external authentication remain explicit
   post-bootstrap steps.
 

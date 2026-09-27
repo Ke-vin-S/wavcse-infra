@@ -1,5 +1,9 @@
+# Committed non-secret template. Bootstrap copies this file to
+# ~/.config/wavcse-infra/config.toml once and never overwrites that user file.
+# Keep credentials and tokens out of TOML; see .env.example for environment variables.
+
 [aws]
-region = "ap-south-1"
+region = "us-east-1"
 
 [controller]
 expect_omp = true
@@ -16,8 +20,8 @@ max_read_attempts = 3
 retry_backoff_seconds = 0.5
 
 [storage]
-# bucket = "private-wavcse-artifacts"
+bucket = "CHANGE_ME"
 prefix = "wavcse"
 
 [ssh]
-# private_key = "~/.ssh/wavcse_workers_ed25519"
+private_key = "~/.ssh/wavcse_worker"

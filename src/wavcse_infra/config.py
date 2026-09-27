@@ -23,6 +23,13 @@ from wavcse_infra.errors import ConfigurationError
 
 DEFAULT_CONFIG_PATH = Path("~/.config/wavcse-infra/config.toml")
 DEFAULT_RUNPOD_API_URL = "https://rest.runpod.io/v1"
+TEMPLATE_PLACEHOLDER = "CHANGE_ME"
+
+
+def _placeholder_as_none(value: object) -> object:
+    if isinstance(value, str) and value.strip().upper() == TEMPLATE_PLACEHOLDER:
+        return None
+    return value
 
 
 class FrozenModel(BaseModel):
@@ -59,6 +66,13 @@ class AwsConfig(FrozenModel):
 
     region: str | None = Field(default=None, min_length=1)
 
+    @field_validator("region", mode="before")
+    @classmethod
+    def template_placeholder_is_unconfigured(cls, value: object) -> object:
+        """Do not mistake the committed template marker for a configured region."""
+
+        return _placeholder_as_none(value)
+
 
 class RunPodConfig(FrozenModel):
     """Safe read-path settings for the RunPod REST API."""
@@ -85,11 +99,25 @@ class StorageConfig(FrozenModel):
     bucket: str | None = Field(default=None, min_length=3, max_length=63)
     prefix: str = Field(default="wavcse", min_length=1)
 
+    @field_validator("bucket", mode="before")
+    @classmethod
+    def template_placeholder_is_unconfigured(cls, value: object) -> object:
+        """Treat the example bucket marker as absent configuration."""
+
+        return _placeholder_as_none(value)
+
 
 class SshConfig(FrozenModel):
     """Controller-side worker SSH key location."""
 
     private_key: Path | None = None
+
+    @field_validator("private_key", mode="before")
+    @classmethod
+    def template_placeholder_is_unconfigured(cls, value: object) -> object:
+        """Treat a placeholder path as absent configuration."""
+
+        return _placeholder_as_none(value)
 
 
 class Settings(FrozenModel):

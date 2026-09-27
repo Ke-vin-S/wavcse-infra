@@ -8,6 +8,14 @@ not trusted with durable credentials or the only copy of important data.
 
 ## Credentials
 
+### Configuration files
+
+`config/infra.example.toml` and `~/.config/wavcse-infra/config.toml` contain only
+non-secret configuration. Bootstrap copies the example once with user-only permissions
+and refuses to replace an existing file. `.env.example` lists supported variables but
+contains no values and is not loaded automatically. Real tokens remain in the process
+environment or an explicitly managed external secret facility and are never committed.
+
 ### AWS
 
 The controller uses an attached EC2 instance profile. Boto3 discovers and refreshes the

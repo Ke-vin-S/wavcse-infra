@@ -38,13 +38,17 @@ def test_config_validate_reports_invalid_file(tmp_path: Path) -> None:
 
 def test_doctor_uses_nonzero_exit_for_failed_required_check(monkeypatch) -> None:
     report = DoctorReport(
-        checks=(DoctorCheck("AWS identity", CheckStatus.FAIL, "instance profile missing"),)
+        checks=(
+            DoctorCheck("Config", CheckStatus.PASS, "/home/ubuntu/.config/config.toml"),
+            DoctorCheck("AWS identity", CheckStatus.FAIL, "instance profile missing"),
+        )
     )
-    monkeypatch.setattr(cli, "run_doctor", lambda settings: report)
+    monkeypatch.setattr(cli, "run_doctor", lambda settings, *, config_path: report)
 
     result = runner.invoke(app, ["doctor"], env={})
 
     assert result.exit_code == 1
+    assert "PASS Config: /home/ubuntu/.config/config.toml" in result.stdout
     assert "FAIL AWS identity: instance profile missing" in result.stdout
     assert "1 required check" in result.stdout
 

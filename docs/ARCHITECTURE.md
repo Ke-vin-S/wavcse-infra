@@ -57,14 +57,19 @@ No generic provider base class exists; RunPod is the only implemented provider.
 
 ```text
 built-in defaults
-  <- user TOML
+  <- ~/.config/wavcse-infra/config.toml
   <- environment
   <- CLI overrides
   -> immutable Pydantic Settings
+
+config/infra.example.toml
+  -- bootstrap copies once if absent --> user TOML
 ```
 
-Secrets are absent from committed configuration. `RUNPOD_API_KEY` is read only from the
-process environment and stored as a Pydantic secret value.
+The example is committed; the controller-specific user TOML is not. Bootstrap never
+overwrites an existing user file. Secrets are absent from both TOML roles.
+`RUNPOD_API_KEY` is read only from the process environment and stored as a Pydantic
+secret value.
 
 ## Reliability stance
 

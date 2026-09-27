@@ -116,19 +116,28 @@ class SystemProbes:
         return int(response.get("KeyCount", 0))
 
 
-def run_doctor(settings: Settings, probes: SystemProbes | None = None) -> DoctorReport:
+def run_doctor(
+    settings: Settings,
+    probes: SystemProbes | None = None,
+    *,
+    config_path: Path,
+) -> DoctorReport:
     """Run all controller checks without changing local or cloud state."""
 
     active_probes = probes or SystemProbes()
     timeout = settings.runpod.request_timeout_seconds
+    expanded_config_path = config_path.expanduser()
     checks = [
+        _config_file_check(active_probes, expanded_config_path),
+        _aws_region_check(settings, expanded_config_path),
+        _s3_bucket_check(settings, expanded_config_path),
+        _ssh_key_check(active_probes, settings.ssh.private_key, expanded_config_path),
         _command_check(active_probes, "Git", "git"),
         _python_check(active_probes),
         _command_check(active_probes, "uv", "uv"),
         _command_check(active_probes, "tmux", "tmux"),
         _omp_check(active_probes, settings.controller.expect_omp),
-        _directory_check(active_probes, "wavCSE repository", settings.paths.wavcse),
-        _ssh_key_check(active_probes, settings.ssh.private_key),
+        _wavcse_directory_check(active_probes, settings.paths.wavcse, expanded_config_path),
         _runpod_credential_check(settings),
         _http_check(
             active_probes,
@@ -151,6 +160,40 @@ def _command_check(probes: SystemProbes, name: str, command: str) -> DoctorCheck
     return DoctorCheck(name, CheckStatus.PASS, path)
 
 
+def _config_file_check(probes: SystemProbes, config_path: Path) -> DoctorCheck:
+    if probes.path_is_file(config_path):
+        return DoctorCheck("Config", CheckStatus.PASS, str(config_path))
+    return DoctorCheck(
+        "Config",
+        CheckStatus.FAIL,
+        f"file does not exist: {config_path}; run ./controller/bootstrap.sh or copy "
+        "config/infra.example.toml to that path",
+    )
+
+
+def _aws_region_check(settings: Settings, config_path: Path) -> DoctorCheck:
+    region = settings.aws.region
+    if region is not None:
+        return DoctorCheck("AWS region", CheckStatus.PASS, region)
+    return DoctorCheck(
+        "AWS region",
+        CheckStatus.FAIL,
+        f"aws.region is not configured; set it in {config_path} or set WAVCSE_INFRA_AWS_REGION",
+    )
+
+
+def _s3_bucket_check(settings: Settings, config_path: Path) -> DoctorCheck:
+    bucket = settings.storage.bucket
+    if bucket is not None:
+        return DoctorCheck("S3 bucket", CheckStatus.PASS, bucket)
+    return DoctorCheck(
+        "S3 bucket",
+        CheckStatus.FAIL,
+        f"storage.bucket is not configured; replace CHANGE_ME in {config_path} or set "
+        "WAVCSE_INFRA_S3_BUCKET",
+    )
+
+
 def _python_check(probes: SystemProbes) -> DoctorCheck:
     version = probes.python_version()
     version_text = probes.python_version_text()
@@ -169,18 +212,33 @@ def _omp_check(probes: SystemProbes, expected: bool) -> DoctorCheck:
     return _command_check(probes, "OMP", "omp")
 
 
-def _directory_check(probes: SystemProbes, name: str, path: Path) -> DoctorCheck:
+def _wavcse_directory_check(probes: SystemProbes, path: Path, config_path: Path) -> DoctorCheck:
     if probes.path_is_directory(path):
-        return DoctorCheck(name, CheckStatus.PASS, str(path))
-    return DoctorCheck(name, CheckStatus.FAIL, f"directory does not exist: {path}")
+        return DoctorCheck("wavCSE repository", CheckStatus.PASS, str(path))
+    return DoctorCheck(
+        "wavCSE repository",
+        CheckStatus.FAIL,
+        f"directory does not exist: {path}; set paths.wavcse in {config_path} or set "
+        "WAVCSE_INFRA_WAVCSE_PATH",
+    )
 
 
-def _ssh_key_check(probes: SystemProbes, path: Path | None) -> DoctorCheck:
+def _ssh_key_check(probes: SystemProbes, path: Path | None, config_path: Path) -> DoctorCheck:
     if path is None:
-        return DoctorCheck("Worker SSH key", CheckStatus.WARN, "not configured yet")
+        return DoctorCheck(
+            "Worker SSH key",
+            CheckStatus.WARN,
+            f"ssh.private_key is not configured; set it in {config_path} or set "
+            "WAVCSE_INFRA_SSH_PRIVATE_KEY",
+        )
     if probes.path_is_file(path):
         return DoctorCheck("Worker SSH key", CheckStatus.PASS, str(path))
-    return DoctorCheck("Worker SSH key", CheckStatus.FAIL, f"file does not exist: {path}")
+    return DoctorCheck(
+        "Worker SSH key",
+        CheckStatus.FAIL,
+        f"file does not exist: {path}; set ssh.private_key in {config_path} or set "
+        "WAVCSE_INFRA_SSH_PRIVATE_KEY",
+    )
 
 
 def _runpod_credential_check(settings: Settings) -> DoctorCheck:
@@ -227,6 +285,8 @@ def _runpod_connectivity_check(
 def _aws_identity_check(
     probes: SystemProbes, timeout_seconds: float, region: str | None
 ) -> DoctorCheck:
+    if region is None:
+        return DoctorCheck("AWS identity", CheckStatus.SKIP, "aws.region is not configured")
     try:
         identity = probes.aws_identity(timeout_seconds, region)
     except Exception as exc:  # Botocore failures are converted to one actionable result.
@@ -248,7 +308,9 @@ def _aws_identity_check(
 def _s3_check(probes: SystemProbes, settings: Settings, timeout_seconds: float) -> DoctorCheck:
     bucket = settings.storage.bucket
     if bucket is None:
-        return DoctorCheck("S3 storage", CheckStatus.FAIL, "storage.bucket is not configured")
+        return DoctorCheck("S3 storage", CheckStatus.SKIP, "storage.bucket is not configured")
+    if settings.aws.region is None:
+        return DoctorCheck("S3 storage", CheckStatus.SKIP, "aws.region is not configured")
     try:
         count = probes.s3_prefix_count(
             bucket,

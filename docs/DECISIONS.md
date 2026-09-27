@@ -256,3 +256,34 @@ claim SSH readiness. S3 remains the planned data path.
 ### Official source
 
 - [RunPod: Connect to a Pod with SSH](https://docs.runpod.io/pods/configuration/use-ssh)
+
+## ADR-010: Seed controller configuration once from a committed template
+
+- **Status:** Accepted
+- **Date:** 2026-09-27
+
+### Context
+
+Controllers need machine-specific non-secret settings, while the repository needs a
+complete, reviewable example. Re-running bootstrap must not erase operational choices.
+
+### Decision
+
+Commit `config/infra.example.toml` and have bootstrap copy it to
+`~/.config/wavcse-infra/config.toml` only when that file is absent. Keep the established
+precedence of CLI, environment, user TOML, then defaults. Keep secrets out of TOML.
+
+### Alternatives considered
+
+- Read the committed example directly at runtime: rejected because controller-specific
+  edits would dirty the repository and risk accidental commits.
+- Overwrite the user file during bootstrap: rejected because bootstrap must be
+  idempotent and preserve operator configuration.
+- Put all settings in environment variables: rejected because durable non-secret
+  configuration is easier to inspect and reconstruct as TOML.
+
+### Consequences
+
+The committed template and runtime configuration can evolve independently. Operators
+must merge newly introduced settings into an existing controller file deliberately;
+doctor reports the loaded file and actionable missing settings.

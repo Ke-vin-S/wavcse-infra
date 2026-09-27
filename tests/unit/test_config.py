@@ -2,17 +2,67 @@ from pathlib import Path
 
 import pytest
 
-from wavcse_infra.config import DEFAULT_RUNPOD_API_URL, load_settings
+from wavcse_infra.config import DEFAULT_RUNPOD_API_URL, load_settings, resolved_config_path
 from wavcse_infra.errors import ConfigurationError
 
+EXAMPLE_CONFIG = Path(__file__).resolve().parents[2] / "config" / "infra.example.toml"
 
-def test_defaults_are_safe_and_do_not_require_secrets() -> None:
+
+def test_defaults_are_safe_and_do_not_require_secrets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     settings = load_settings(environ={})
 
     assert str(settings.runpod.api_url).rstrip("/") == DEFAULT_RUNPOD_API_URL
     assert settings.runpod.api_key is None
     assert settings.storage.bucket is None
     assert settings.paths.wavcse == Path("~/projects/wavCSE").expanduser()
+
+
+def test_default_user_config_is_loaded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_file = tmp_path / ".config" / "wavcse-infra" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text(
+        """
+[aws]
+region = "us-east-1"
+
+[storage]
+bucket = "wavcse-research-artifacts"
+
+[ssh]
+private_key = "~/.ssh/wavcse_worker"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(environ={})
+
+    assert resolved_config_path(environ={}) == config_file
+    assert settings.aws.region == "us-east-1"
+    assert settings.storage.bucket == "wavcse-research-artifacts"
+    assert settings.ssh.private_key == tmp_path / ".ssh" / "wavcse_worker"
+
+
+def test_committed_example_is_valid_and_contains_no_secret_fields() -> None:
+    settings = load_settings(config_path=EXAMPLE_CONFIG, environ={})
+    example_text = EXAMPLE_CONFIG.read_text(encoding="utf-8")
+
+    assert settings.aws.region == "us-east-1"
+    assert str(settings.runpod.api_url).rstrip("/") == DEFAULT_RUNPOD_API_URL
+    assert settings.storage.bucket is None
+    assert settings.storage.prefix == "wavcse"
+    assert settings.ssh.private_key is not None
+    assert settings.ssh.private_key.name == "wavcse_worker"
+    for secret_name in (
+        "RUNPOD_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    ):
+        assert secret_name not in example_text
 
 
 def test_precedence_is_cli_then_environment_then_file_then_defaults(tmp_path: Path) -> None:
@@ -64,6 +114,29 @@ def test_explicit_missing_config_file_is_an_error(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigurationError, match="does not exist"):
         load_settings(config_path=missing_file, environ={})
+
+
+def test_template_placeholders_are_treated_as_unconfigured(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[aws]
+region = "change_me"
+
+[storage]
+bucket = "CHANGE_ME"
+
+[ssh]
+private_key = " CHANGE_ME "
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=config_file, environ={})
+
+    assert settings.aws.region is None
+    assert settings.storage.bucket is None
+    assert settings.ssh.private_key is None
 
 
 def test_unknown_configuration_field_is_an_error(tmp_path: Path) -> None:
