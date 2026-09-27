@@ -91,6 +91,41 @@ def test_doctor_passes_with_expected_controller_dependencies(tmp_path: Path) -> 
     assert report.successful
     assert report.failed_count == 0
     assert all(check.status is not CheckStatus.FAIL for check in report.checks)
+    checks = {check.name: check for check in report.checks}
+    assert checks["OMP"] == DoctorCheck("OMP", CheckStatus.PASS, "/usr/bin/omp")
+    assert checks["Codex"] == DoctorCheck("Codex", CheckStatus.PASS, "/usr/bin/codex")
+    assert checks["AGF"] == DoctorCheck("AGF", CheckStatus.PASS, "/usr/bin/agf")
+
+
+@pytest.mark.parametrize(
+    ("command", "check_name"),
+    (("omp", "OMP"), ("codex", "Codex"), ("agf", "AGF")),
+)
+def test_doctor_reports_each_missing_agent_tool_with_install_command(
+    tmp_path: Path,
+    command: str,
+    check_name: str,
+) -> None:
+    settings = _configured_settings(tmp_path)
+    config_path = _config_file(tmp_path)
+    existing_paths = {settings.paths.wavcse, settings.ssh.private_key, config_path}
+
+    class MissingAgentProbes(HealthyProbes):
+        def command_path(self, candidate: str) -> str | None:
+            if candidate == command:
+                return None
+            return super().command_path(candidate)
+
+    report = run_doctor(
+        settings,
+        MissingAgentProbes(existing_paths),
+        config_path=config_path,
+    )
+
+    check = next(check for check in report.checks if check.name == check_name)
+    assert check.status is CheckStatus.FAIL
+    assert f"{command} was not found on PATH" in check.detail
+    assert f"./controller/install-agents.sh --only {command}" in check.detail
 
 
 def test_doctor_rejects_non_instance_profile_aws_credentials(tmp_path: Path) -> None:

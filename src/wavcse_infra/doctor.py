@@ -137,6 +137,8 @@ def run_doctor(
         _command_check(active_probes, "uv", "uv"),
         _command_check(active_probes, "tmux", "tmux"),
         _omp_check(active_probes, settings.controller.expect_omp),
+        _agent_tool_check(active_probes, "Codex", "codex"),
+        _agent_tool_check(active_probes, "AGF", "agf"),
         _wavcse_directory_check(active_probes, settings.paths.wavcse, expanded_config_path),
         _runpod_credential_check(settings),
         _http_check(
@@ -157,6 +159,17 @@ def _command_check(probes: SystemProbes, name: str, command: str) -> DoctorCheck
     path = probes.command_path(command)
     if path is None:
         return DoctorCheck(name, CheckStatus.FAIL, f"{command} was not found on PATH")
+    return DoctorCheck(name, CheckStatus.PASS, path)
+
+
+def _agent_tool_check(probes: SystemProbes, name: str, command: str) -> DoctorCheck:
+    path = probes.command_path(command)
+    if path is None:
+        return DoctorCheck(
+            name,
+            CheckStatus.FAIL,
+            f"{command} was not found on PATH; run ./controller/install-agents.sh --only {command}",
+        )
     return DoctorCheck(name, CheckStatus.PASS, path)
 
 
@@ -209,7 +222,7 @@ def _python_check(probes: SystemProbes) -> DoctorCheck:
 def _omp_check(probes: SystemProbes, expected: bool) -> DoctorCheck:
     if not expected:
         return DoctorCheck("OMP", CheckStatus.SKIP, "not required by configuration")
-    return _command_check(probes, "OMP", "omp")
+    return _agent_tool_check(probes, "OMP", "omp")
 
 
 def _wavcse_directory_check(probes: SystemProbes, path: Path, config_path: Path) -> DoctorCheck:

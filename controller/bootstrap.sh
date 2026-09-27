@@ -4,8 +4,10 @@ set -Eeuo pipefail
 readonly UV_VERSION="${WAVCSE_INFRA_UV_VERSION:-0.12.19}"
 REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPOSITORY_ROOT
+readonly INSTALL_AGENTS_SCRIPT="${REPOSITORY_ROOT}/controller/install-agents.sh"
 CONTROLLER_USER=''
 CONTROLLER_HOME=''
+SKIP_AGENTS=false
 
 fail() {
   printf 'Controller bootstrap failed: %s\n' "$*" >&2
@@ -19,6 +21,30 @@ on_error() {
 }
 
 trap on_error ERR
+
+usage() {
+  cat <<'EOF'
+Usage: ./controller/bootstrap.sh [--skip-agents]
+
+Bootstrap the controller and install controller-only agent tools by default.
+EOF
+}
+
+parse_args() {
+  while (($# > 0)); do
+    case "$1" in
+    --skip-agents)
+      SKIP_AGENTS=true
+      shift
+      ;;
+    --help | -h)
+      usage
+      exit 0
+      ;;
+    *) fail "unknown argument: $1" ;;
+    esac
+  done
+}
 
 controller_user() {
   if [[ -n "${WAVCSE_INFRA_CONTROLLER_USER:-}" ]]; then
@@ -103,6 +129,16 @@ sync_project() {
     "${CONTROLLER_HOME}/.local/bin/infra"
 }
 
+install_agent_tools() {
+  if [[ "${SKIP_AGENTS}" == true ]]; then
+    printf 'Skipping controller agent tools (--skip-agents).\n'
+    return
+  fi
+  [[ -x "${INSTALL_AGENTS_SCRIPT}" ]] ||
+    fail "agent installer is missing or not executable: ${INSTALL_AGENTS_SCRIPT}"
+  env WAVCSE_INFRA_CONTROLLER_USER="${CONTROLLER_USER}" "${INSTALL_AGENTS_SCRIPT}"
+}
+
 ensure_user_config() {
   local config_directory="${CONTROLLER_HOME}/.config/wavcse-infra"
   local config_file="${config_directory}/config.toml"
@@ -132,6 +168,7 @@ ensure_user_config() {
 }
 
 main() {
+  parse_args "$@"
   require_ubuntu
 
   CONTROLLER_USER="$(controller_user)"
@@ -147,9 +184,10 @@ main() {
   install_os_packages
   install_uv
   sync_project
+  install_agent_tools
 
   printf 'Controller bootstrap complete.\n'
-  printf 'Next: configure RUNPOD_API_KEY in the environment, then run infra doctor.\n'
+  printf 'Next: configure the controller and authenticate agent providers, then run infra doctor.\n'
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

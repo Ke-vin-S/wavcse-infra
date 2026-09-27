@@ -43,6 +43,23 @@ Future worker access will use a dedicated key. Private keys remain on the contro
 Host-key handling must be explicit; globally disabling strict host-key checking is not
 allowed. RunPod basic proxied SSH and full public-IP SSH are separate endpoint types.
 
+### Controller agent tools
+
+`controller/install-agents.sh` uses only official upstream sources. OMP's installer is
+downloaded from the exact pinned `can1357/oh-my-pi` Git tag and its resulting release
+binary is checked against a reviewed SHA-256 digest. Codex uses OpenAI's official
+standalone installer with an explicit release; that installer verifies the selected
+release digest. AGF is downloaded from the pinned `subinium/agf` GitHub release and
+checked against its reviewed SHA-256 digest. Installer scripts are saved to temporary
+files before execution rather than piped directly into a privileged shell.
+
+These tools run as the controller user, not as root. The script may use `apt` only for
+missing download primitives, and never weakens filesystem permissions. Tool
+installation does not perform authentication. OMP and Codex credentials remain in
+their user-owned upstream stores; AGF needs no account and reads existing local agent
+session stores. No agent tool or controller authentication state is installed on a
+normal GPU worker.
+
 ## Presigned URLs
 
 Future S3 transfers will use Signature Version 4 URLs scoped to one object and method.
@@ -58,6 +75,7 @@ Never log:
 - authorization headers or API tokens;
 - AWS access keys, secret keys, or session tokens;
 - private SSH keys;
+- OMP or Codex authentication stores and tokens;
 - full presigned URLs or query strings;
 - complete environment dumps.
 

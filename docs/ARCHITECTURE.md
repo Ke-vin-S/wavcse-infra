@@ -9,7 +9,8 @@ MLflow instrumentation.
 
 The components are:
 
-- **AWS EC2 controller:** persistent but stoppable; authoritative writable environment.
+- **AWS EC2 controller:** persistent but stoppable; authoritative writable environment
+  containing OMP, Codex CLI, and AGF.
 - **wavCSE repository:** research code and experiment source of truth.
 - **wavcse-infra repository:** infrastructure CLI and machine bootstrap.
 - **RunPod Pods:** disposable GPU execution environments.
@@ -48,10 +49,16 @@ artifact-transfer portion of this flow.
 - `redaction.py` removes authorization values, known secret assignments, and URL
   query strings from user-facing external errors.
 - `controller/bootstrap.sh` converges supported Ubuntu controllers on required tools
-  and the locked project environment.
+  and the locked project environment, then delegates controller agent installation.
+- `controller/install-agents.sh` installs pinned, verified OMP, Codex CLI, and AGF
+  releases for the controller user without performing authentication.
 - `controller/cloud-init.yaml` performs only initial public clone and bootstrap dispatch.
 
 No generic provider base class exists; RunPod is the only implemented provider.
+
+Controller agent installation is not part of the worker lifecycle. Normal GPU workers
+remain minimal execution environments and do not receive OMP, Codex, AGF, or controller
+authentication state.
 
 ## Configuration flow
 

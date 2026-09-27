@@ -17,6 +17,7 @@ The repository currently implements Phases 0–2 of the v1 specification:
 - Ruff, pytest, ShellCheck, and shfmt validation;
 - a locked `uv` environment and credential-free CI;
 - idempotent Ubuntu controller bootstrap and thin cloud-init;
+- reproducible controller-only installation of OMP, Codex CLI, and AGF;
 - `infra doctor` controller, credential-source, configuration, and connectivity checks;
 - read-only `infra worker list` and `infra worker show` RunPod operations;
 - provider-neutral worker models and bounded retries for safe provider reads;
@@ -28,8 +29,9 @@ lifecycle operations remain unavailable pending a separate review.
 ## Architecture
 
 The persistent/stoppable EC2 controller is the writable development environment. It
-contains OMP, the `wavCSE` checkout, this repository, and the `infra` CLI. AWS access
-comes from an EC2 instance profile. The RunPod API key comes from the environment.
+contains OMP, Codex CLI, AGF, the `wavCSE` checkout, this repository, and the `infra`
+CLI. AWS access comes from an EC2 instance profile. The RunPod API key comes from the
+environment.
 
 Disposable GPU workers execute immutable wavCSE commits. GitHub distributes code, a
 private S3 bucket is the canonical store for large artifacts, and wavCSE retains
@@ -61,14 +63,47 @@ git clone https://github.com/Ke-vin-S/wavcse-infra.git
 cd wavcse-infra
 ./controller/bootstrap.sh
 nano ~/.config/wavcse-infra/config.toml
-# Provision RUNPOD_API_KEY and the separate wavCSE checkout, then:
+# Authenticate OMP and Codex, provision RUNPOD_API_KEY, and clone wavCSE, then:
 infra doctor
 ```
 
 On its first run, bootstrap copies the committed non-secret example to the controller's
 user configuration. It never overwrites an existing `config.toml`, so the command is
-safe to rerun. Bootstrap does not install OMP, configure credentials, or create cloud
-resources. See [Operations](docs/OPERATIONS.md) for controller setup and reconstruction.
+safe to rerun. It delegates agent installation to `controller/install-agents.sh` and
+preserves commands that are already installed. Bootstrap never configures credentials
+or creates cloud resources. Use `./controller/bootstrap.sh --skip-agents` only when
+agent installation is intentionally managed separately. See
+[Operations](docs/OPERATIONS.md) for controller setup and reconstruction.
+
+## Controller agent tools
+
+Install or repair the controller-only tools independently with either command:
+
+```bash
+make install-agents
+# or
+./controller/install-agents.sh
+```
+
+The installer uses reviewed upstream release pins, reports detected versions, and
+supports `--only omp`, `--only codex`, `--only agf`, and the explicit `--upgrade` mode.
+It places managed binaries in `~/.local/bin` and configures the controller login shell
+to find `~/.local/bin`, `~/.cargo/bin`, and `~/.bun/bin` without duplicate profile
+entries. The latter two preserve compatibility with historical installations; the
+default installer does not require Cargo or Bun.
+
+Installation and authentication are separate. On a headless controller, authenticate
+after installation:
+
+```text
+OMP:   start omp, then run /login (or /login <provider>)
+Codex: codex login --device-auth
+AGF:   no authentication required
+```
+
+OMP, Codex, and AGF are controller development tools. They are not installed on normal
+GPU training workers. The selected upstream mechanisms and version policy are recorded
+in [ADR-011](docs/DECISIONS.md#adr-011-install-controller-agents-from-pinned-official-releases).
 
 ## Configuration
 
@@ -127,6 +162,10 @@ health-check, execute an exact committed wavCSE revision, persist requested outp
 and explicitly stop or destroy. Phase 2 only inspects existing workers. Creation,
 mutation, SSH access, job execution, and destruction remain intentionally unavailable
 pending review.
+
+Normal GPU workers do not install OMP, Codex, AGF, or other agent-development tooling.
+Any future development-worker profile must add that behavior explicitly without
+changing the training-worker contract.
 
 ## Storage model
 

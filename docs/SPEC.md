@@ -67,7 +67,7 @@ v1 primarily orchestrates independent jobs.
     +------------v-------------+
     | AWS EC2 Controller       |
     |                          |
-    | OMP                      |
+    | OMP / Codex / AGF        |
     | tmux                     |
     | wavCSE                   |
     | wavcse-infra             |
@@ -101,6 +101,7 @@ It may be stopped when not required but is not routinely terminated.
 The controller is responsible for:
 
 - hosting OMP
+- hosting Codex CLI and AGF as additional controller development tools
 - hosting the writable wavCSE checkout
 - hosting wavcse-infra
 - creating/destroying GPU workers
@@ -572,6 +573,8 @@ Controller:
     uv
     tmux
     OMP if expected
+    Codex CLI
+    AGF
     AWS identity availability
     RunPod credential presence
     wavCSE path
@@ -716,6 +719,7 @@ Deliver:
 Deliver:
 
 - controller bootstrap
+- reproducible controller-only agent/tool installation
 - thin cloud-init
 - `infra doctor`
 - controller recovery documentation

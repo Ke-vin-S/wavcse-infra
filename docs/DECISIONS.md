@@ -287,3 +287,74 @@ precedence of CLI, environment, user TOML, then defaults. Keep secrets out of TO
 The committed template and runtime configuration can evolve independently. Operators
 must merge newly introduced settings into an existing controller file deliberately;
 doctor reports the loaded file and actionable missing settings.
+
+## ADR-011: Install controller agents from pinned official releases
+
+- **Status:** Accepted
+- **Date:** 2026-09-27
+
+### Context
+
+The controller needs OMP, Codex CLI, and AGF after reconstruction, but their current
+upstream distribution methods are not identical. The base bootstrap must remain
+auditable, normal GPU workers must not receive agent tooling, and rerunning bootstrap
+must not replace an existing working installation unexpectedly.
+
+Upstream behavior also differs from older assumptions: OMP's recommended Linux path is
+now a prebuilt release installer rather than a required Bun package, Codex recommends
+its standalone installer rather than requiring Node/npm, and AGF publishes official
+release binaries so Cargo/Rust is optional rather than required.
+
+### Decision
+
+Keep agent setup in `controller/install-agents.sh` and have controller bootstrap call it
+by default, with `--skip-agents` as the explicit opt-out. Never call it from normal
+worker bootstrap.
+
+Install reviewed release pins by default:
+
+- OMP `v18.3.2` through the installer in that exact upstream Git tag, forced to binary
+  mode; verify the resulting Linux binary against the release SHA-256 digest.
+- Codex CLI `0.157.1` through OpenAI's official standalone installer and its explicit
+  `--release` option; the upstream installer verifies the downloaded release digest.
+- AGF `v0.15.1` from the official GitHub release archive, verified against the release
+  SHA-256 digest, without installing Rust or Cargo.
+
+Install controller-owned binaries in `~/.local/bin`. Persist an idempotent PATH block in
+the target user's login-shell profile for both `~/.local/bin` and historical
+`~/.cargo/bin`/`~/.bun/bin` installations. Normal runs preserve any command already
+found on PATH. `--upgrade` explicitly reinstalls the selected configured release;
+version overrides require matching checksum overrides where this repository performs
+verification.
+
+Installation never performs agent authentication or writes provider tokens.
+
+### Alternatives considered
+
+- Install OMP with Bun and Codex with npm: rejected because neither runtime is required
+  by the current recommended upstream Linux installers.
+- Install AGF with `cargo install agf --locked`: supported upstream, but rejected for
+  the controller default because the official prebuilt archive avoids an otherwise
+  unnecessary Rust toolchain and C compiler.
+- Track unpinned `latest` releases: rejected because two fresh controllers could then
+  receive different binaries from the same infrastructure commit.
+- Put the commands directly in `bootstrap.sh`: rejected because it would obscure the
+  stable base-controller setup and make standalone repair harder.
+
+### Consequences
+
+Tool upgrades are deliberate repository maintenance: review upstream changes, update
+the release pins and checksums, run validation, then use `--upgrade` on a controller.
+An operator can also provide documented environment overrides for a controlled
+one-off upgrade. Existing authentication under `~/.omp` and `~/.codex` is preserved.
+Historical Cargo or Bun installations remain discoverable because their user-local
+binary directories stay on the login-shell PATH.
+
+### Official sources
+
+- [OMP repository and install options](https://github.com/can1357/oh-my-pi#install)
+- [OMP official installer](https://omp.sh/install)
+- [OpenAI Codex CLI installation](https://developers.openai.com/codex/cli)
+- [OpenAI Codex authentication](https://developers.openai.com/codex/auth)
+- [AGF repository and install options](https://github.com/subinium/agf#install)
+- [AGF v0.15.1 release](https://github.com/subinium/agf/releases/tag/v0.15.1)

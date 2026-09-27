@@ -1,10 +1,13 @@
 SHELL := /usr/bin/env bash
 SHELL_FILES := $(shell find controller scripts worker -type f -name '*.sh' 2>/dev/null)
 
-.PHONY: bootstrap-controller check cloud-init-check doctor format format-check lint test
+.PHONY: bootstrap-controller check cloud-init-check doctor format format-check install-agents lint test
 
 bootstrap-controller:
 	./controller/bootstrap.sh
+
+install-agents:
+	./controller/install-agents.sh
 
 doctor:
 	uv run --locked infra doctor
