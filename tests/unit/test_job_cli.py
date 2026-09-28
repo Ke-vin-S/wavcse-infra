@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,10 @@ from wavcse_infra.jobs.models import JobState
 
 runner = CliRunner()
 JOB_ID = "job-0123456789abcdef"
+
+
+def _strip_ansi(output: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", output)
 
 
 @pytest.fixture
@@ -72,8 +77,9 @@ def test_job_help_lists_the_phase_six_commands() -> None:
 
     submit_help = runner.invoke(app, ["job", "submit", "--help"])
     assert submit_help.exit_code == 0
-    assert "--worker" in submit_help.output
-    assert "--wait" in submit_help.output
+    plain_help = _strip_ansi(submit_help.output)
+    assert "--worker" in plain_help
+    assert "--wait" in plain_help
 
 
 def test_submit_requires_an_explicit_worker(cli_job_context) -> None:
@@ -86,7 +92,7 @@ def test_submit_requires_an_explicit_worker(cli_job_context) -> None:
     )
 
     assert result.exit_code != 0
-    assert "--worker" in result.output
+    assert "--worker" in _strip_ansi(result.output)
 
 
 def test_submit_reports_the_job_and_never_touches_worker_lifecycle(
