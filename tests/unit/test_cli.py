@@ -1,12 +1,13 @@
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import Mock
 
 from typer.testing import CliRunner
 
 from wavcse_infra import cli
 from wavcse_infra.cli import app
 from wavcse_infra.doctor import CheckStatus, DoctorCheck, DoctorReport
-from wavcse_infra.errors import ProviderNotFoundError
+from wavcse_infra.errors import CredentialError, ProviderNotFoundError
 from wavcse_infra.models import (
     Availability,
     CloudType,
@@ -21,6 +22,7 @@ from wavcse_infra.models import (
     WorkerSpec,
     WorkerState,
 )
+from wavcse_infra.providers import runpod as runpod_provider
 from wavcse_infra.state import WorkerStateStore
 from wavcse_infra.workers.ssh import SshWaitResult
 
@@ -157,10 +159,19 @@ def test_doctor_uses_nonzero_exit_for_failed_required_check(monkeypatch) -> None
     assert "FAIL AWS identity: instance profile missing" in result.stdout
 
 
-def test_worker_list_requires_resolvable_credential() -> None:
+def test_worker_list_requires_resolvable_credential(monkeypatch) -> None:
+    resolver = Mock(
+        side_effect=CredentialError(
+            "RunPod credential unavailable: unit-test credential sources are disabled"
+        )
+    )
+    monkeypatch.setattr(runpod_provider, "resolve_runpod_api_key", resolver)
+
     result = runner.invoke(app, ["worker", "list"], env={"RUNPOD_API_KEY": ""})
+
     assert result.exit_code == 2
     assert "RunPod credential unavailable" in result.stderr
+    resolver.assert_called_once()
 
 
 def test_worker_list_renders_normalized_workers(monkeypatch, tmp_path: Path) -> None:
