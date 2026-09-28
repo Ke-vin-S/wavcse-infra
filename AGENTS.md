@@ -1020,3 +1020,22 @@ v1 is successful when, from the controller, a user can:
 A destroyed worker must not destroy the authoritative source code, embeddings, experiment metrics, or explicitly persisted outputs.
 
 That property is more important than feature count.
+
+## Session bootstrap
+
+At the beginning of a new agent session:
+
+1. Read `AGENTS.md`.
+2. Read:
+   - `README.md`
+   - `docs/SPEC.md`
+   - `docs/ARCHITECTURE.md`
+   - `docs/SECURITY.md`
+   - `docs/OPERATIONS.md`
+   - `docs/RUNPOD.md`
+3. Inspect `git status`.
+4. Inspect recent commits.
+5. Inspect relevant source and tests before modifying code.
+6. Treat repository documentation and committed implementation as the source of truth.
+7. Never assume cloud state from a previous conversation.
+
