@@ -30,7 +30,15 @@ bootstrap_version=invalid-format
 """
 
 
-def _health_output(*, gpu_rows: str = "NVIDIA RTX A4000, 16376, 550.54.15") -> str:
+def _health_output(
+    *,
+    gpu_rows: str = "NVIDIA RTX A4000, 16376, 550.54.15",
+    disk_path: str = "/",
+    disk_available_bytes: str = "53687091200",
+    disk_inspection_ok: str = "true",
+    required_mount_path: str = "",
+    required_mount_present: str = "",
+) -> str:
     return "\n".join(
         (
             "wavcse_health_schema\t1",
@@ -39,8 +47,11 @@ def _health_output(*, gpu_rows: str = "NVIDIA RTX A4000, 16376, 550.54.15") -> s
             "git_version\tgit version 2.43.0",
             "python_version\tPython 3.12.3",
             "uv_version\tuv 0.10.9",
-            "disk_path\t/workspace",
-            "disk_available_bytes\t53687091200",
+            f"disk_path\t{disk_path}",
+            f"disk_inspection_ok\t{disk_inspection_ok}",
+            f"disk_available_bytes\t{disk_available_bytes}",
+            f"required_mount_path\t{required_mount_path}",
+            f"required_mount_present\t{required_mount_present}",
             "nvidia_smi_available\ttrue",
             "nvidia_smi_ok\ttrue",
             f"gpu_rows\t{gpu_rows}",
@@ -60,14 +71,22 @@ def _connection() -> WorkerConnectionInfo:
     )
 
 
-def _worker(gpu_type: str = "NVIDIA RTX A4000") -> Worker:
+def _worker(
+    gpu_type: str = "NVIDIA RTX A4000",
+    *,
+    volume_gb: int | None = 0,
+    volume_mount_path: str | None = None,
+    network_volume_id: str | None = None,
+) -> Worker:
     return Worker(
         id="pod-123",
         state=WorkerState.RUNNING,
         native_status="RUNNING",
         gpu_type=gpu_type,
         gpu_count=1,
-        volume_mount_path="/workspace",
+        volume_gb=volume_gb,
+        volume_mount_path=volume_mount_path,
+        network_volume_id=network_volume_id,
         ssh_direct=_connection(),
     )
 
@@ -112,7 +131,7 @@ class Executor:
     ) -> SshCommandResult:
         assert connection.provider_worker_id == "pod-123"
         self.calls.append((remote_argv, input_text, timeout_seconds))
-        is_health = "nvidia-smi" in " ".join(remote_argv)
+        is_health = input_text is not None and "wavcse_health_schema" in input_text
         stdout = (
             self.health_output if is_health else f"wavcse_bootstrap_complete\t{BOOTSTRAP_VERSION}\n"
         )
@@ -121,33 +140,6 @@ class Executor:
             stdout=stdout,
             stderr=self.health_stderr if is_health else "",
         )
-
-
-class ProxyDropsStdinExecutor:
-    """Model a successful RunPod proxy exec channel that does not forward stdin."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[tuple[str, ...], str | None]] = []
-
-    def run_checked(
-        self,
-        connection: WorkerConnectionInfo,
-        remote_argv: tuple[str, ...],
-        *,
-        input_text: str | None = None,
-        timeout_seconds: float | None = None,
-    ) -> SshCommandResult:
-        del timeout_seconds
-        assert connection.kind == "proxy"
-        self.calls.append((remote_argv, input_text))
-        if input_text is not None:
-            return SshCommandResult(exit_code=0, stdout="", stderr="")
-        stdout = (
-            _health_output()
-            if "nvidia-smi" in " ".join(remote_argv)
-            else f"wavcse_bootstrap_complete\t{BOOTSTRAP_VERSION}\n"
-        )
-        return SshCommandResult(exit_code=0, stdout=stdout, stderr="")
 
 
 def _config(tmp_path: Path) -> SshConfig:
@@ -177,37 +169,34 @@ def test_bootstrap_runs_versioned_script_then_health_and_reaches_ready(tmp_path:
     assert report.gpu.cuda_version == "12.8"
     assert report.disk_available_bytes == 53687091200
     assert waiter.calls == [("pod-123", 20)]
-    assert executor.calls[0][0][:2] == ("bash", "-c")
-    assert "set -Eeuo pipefail" in executor.calls[0][0][2]
-    assert executor.calls[0][0][3:] == ("wavcse-bootstrap.sh", BOOTSTRAP_VERSION)
-    assert executor.calls[0][1] is None
+    assert executor.calls[0][0] == ("bash", "-s", "--", BOOTSTRAP_VERSION)
+    assert executor.calls[0][1] is not None
+    assert "set -Eeuo pipefail" in executor.calls[0][1]
+    assert "wavcse_bootstrap_complete" in executor.calls[0][1]
     assert executor.calls[0][2] == 120
-    assert executor.calls[1][0][:2] == ("bash", "-c")
-    assert "wavcse_health_schema" in executor.calls[1][0][2]
-    assert executor.calls[1][0][3:] == (
-        "wavcse-health-check.sh",
+    assert executor.calls[1][0] == (
+        "bash",
+        "-s",
+        "--",
         BOOTSTRAP_VERSION,
-        "/workspace",
+        "/",
+        "",
     )
-    assert executor.calls[1][1] is None
+    assert executor.calls[1][1] is not None
+    assert "wavcse_health_schema" in executor.calls[1][1]
     assert [event[0] for event in state.events] == ["bootstrapped", "gpu", "health"]
 
 
-def test_bootstrap_does_not_depend_on_proxy_forwarding_stdin(tmp_path: Path) -> None:
-    proxy = _connection().model_copy(
-        update={"kind": "proxy", "host": "ssh.runpod.io", "port": 22, "username": "pod-route"}
-    )
-    worker = _worker().model_copy(update={"ssh_direct": None, "ssh_proxy": proxy})
-    waiter = Waiter(worker)
-    waiter.result = SshWaitResult(worker=worker, connection=proxy)
-    executor = ProxyDropsStdinExecutor()
-    state = StateRecorder()
+def test_bootstrap_uses_stdin_script_transport_over_direct_ssh(tmp_path: Path) -> None:
+    executor = Executor(_health_output())
 
-    report = WorkerBootstrapper(waiter, executor, state, _config(tmp_path)).bootstrap("pod-123")
+    report = WorkerBootstrapper(Waiter(), executor, StateRecorder(), _config(tmp_path)).bootstrap(
+        "pod-123"
+    )
 
     assert report.ready
-    assert all(input_text is None for _, input_text in executor.calls)
-    assert [event[0] for event in state.events] == ["bootstrapped", "gpu", "health"]
+    assert all(remote_argv[:3] == ("bash", "-s", "--") for remote_argv, _, _ in executor.calls)
+    assert all(input_text for _, input_text, _ in executor.calls)
 
 
 def test_bootstrap_failure_does_not_run_health_or_mark_ready(tmp_path: Path) -> None:
@@ -231,7 +220,11 @@ def test_bootstrap_requires_explicit_remote_completion_marker(tmp_path: Path) ->
     class MissingMarkerExecutor(Executor):
         def run_checked(self, *args: object, **kwargs: object) -> SshCommandResult:
             del args, kwargs
-            return SshCommandResult(exit_code=0, stdout="", stderr="proxy diagnostic")
+            return SshCommandResult(
+                exit_code=0,
+                stdout="Error: Your SSH client doesn't support PTY\n",
+                stderr="",
+            )
 
     state = StateRecorder()
     bootstrapper = WorkerBootstrapper(
@@ -241,7 +234,7 @@ def test_bootstrap_requires_explicit_remote_completion_marker(tmp_path: Path) ->
     with pytest.raises(WorkerBootstrapError, match="without completion marker") as captured:
         bootstrapper.bootstrap("pod-123")
 
-    assert "proxy diagnostic" in str(captured.value)
+    assert "doesn't support PTY" in str(captured.value)
     assert state.events == []
 
 
@@ -253,7 +246,8 @@ def test_remote_health_nonzero_does_not_mark_ready(tmp_path: Path) -> None:
             remote_argv: tuple[str, ...],
             **kwargs: object,
         ) -> SshCommandResult:
-            if "nvidia-smi" in " ".join(remote_argv):
+            input_text = kwargs.get("input_text")
+            if isinstance(input_text, str) and "wavcse_health_schema" in input_text:
                 raise SshCommandError("health script exited 7: driver unavailable")
             return super().run_checked(connection, remote_argv, **kwargs)
 
@@ -317,6 +311,113 @@ def test_health_with_no_visible_gpu_is_failed_and_never_ready(tmp_path: Path) ->
     gpu_check = next(check for check in report.checks if check.name == "gpu")
     assert gpu_check.status is HealthCheckStatus.FAIL
     assert [event[0] for event in state.events] == ["health"]
+
+
+def test_zero_volume_uses_healthy_ephemeral_disk_and_reaches_ready(tmp_path: Path) -> None:
+    executor = Executor(_health_output())
+
+    report = WorkerBootstrapper(
+        Waiter(_worker(volume_gb=0)), executor, StateRecorder(), _config(tmp_path)
+    ).health("pod-123")
+
+    assert report.ready
+    assert report.disk_path == "/"
+    assert executor.calls[0][0] == (
+        "bash",
+        "-s",
+        "--",
+        BOOTSTRAP_VERSION,
+        "/",
+        "",
+    )
+
+
+def test_zero_volume_does_not_require_configured_workspace_mount(tmp_path: Path) -> None:
+    executor = Executor(_health_output())
+    worker = _worker(volume_gb=0, volume_mount_path="/workspace")
+
+    report = WorkerBootstrapper(
+        Waiter(worker), executor, StateRecorder(), _config(tmp_path)
+    ).health("pod-123")
+
+    assert report.ready
+    assert all(check.name != "volume" for check in report.checks)
+    assert executor.calls[0][0][-2:] == ("/", "")
+
+
+def test_requested_persistent_volume_missing_mount_fails_readiness() -> None:
+    worker = _worker(volume_gb=20, volume_mount_path="/workspace")
+    output = _health_output(
+        disk_path="/workspace",
+        required_mount_path="/workspace",
+        required_mount_present="false",
+    )
+
+    report = parse_health_output(
+        SshWaitResult(worker=worker, connection=_connection()),
+        output,
+    )
+
+    volume_check = next(check for check in report.checks if check.name == "volume")
+    assert volume_check.status is HealthCheckStatus.FAIL
+    assert "persistent volume is not mounted" in volume_check.detail
+    assert report.readiness_state is WorkerReadinessState.FAILED
+
+
+def test_requested_persistent_volume_present_mount_passes(tmp_path: Path) -> None:
+    worker = _worker(volume_gb=20, volume_mount_path="/workspace")
+    executor = Executor(
+        _health_output(
+            disk_path="/workspace",
+            required_mount_path="/workspace",
+            required_mount_present="true",
+        )
+    )
+
+    report = WorkerBootstrapper(
+        Waiter(worker), executor, StateRecorder(), _config(tmp_path)
+    ).health("pod-123")
+
+    volume_check = next(check for check in report.checks if check.name == "volume")
+    assert volume_check.status is HealthCheckStatus.PASS
+    assert report.ready
+    assert executor.calls[0][0][-2:] == ("/workspace", "/workspace")
+
+
+def test_requested_network_volume_requires_its_mount() -> None:
+    worker = _worker(
+        volume_gb=0,
+        volume_mount_path="/runpod-volume",
+        network_volume_id="network-volume-123",
+    )
+    output = _health_output(
+        disk_path="/runpod-volume",
+        required_mount_path="/runpod-volume",
+        required_mount_present="false",
+    )
+
+    report = parse_health_output(
+        SshWaitResult(worker=worker, connection=_connection()),
+        output,
+    )
+
+    volume_check = next(check for check in report.checks if check.name == "volume")
+    assert volume_check.status is HealthCheckStatus.FAIL
+    assert "network volume is not mounted" in volume_check.detail
+    assert not report.ready
+
+
+def test_disk_inspection_failure_fails_readiness() -> None:
+    output = _health_output(disk_available_bytes="", disk_inspection_ok="false")
+
+    report = parse_health_output(
+        SshWaitResult(worker=_worker(), connection=_connection()),
+        output,
+    )
+
+    disk_check = next(check for check in report.checks if check.name == "disk")
+    assert disk_check.status is HealthCheckStatus.FAIL
+    assert report.readiness_state is WorkerReadinessState.FAILED
 
 
 def test_health_requires_expected_bootstrap_version() -> None:
@@ -437,6 +538,9 @@ def test_worker_scripts_are_strict_idempotent_and_contain_no_controller_secrets(
     assert "mktemp" in bootstrap and "bootstrap-version" in bootstrap
     assert "wavcse_bootstrap_complete" in bootstrap
     assert "nvidia-smi --query-gpu" in health
+    assert "df -PB1 --" in health
+    assert "--output" not in health
+    assert "mountpoint -q --" in health
     for forbidden in (
         "RUNPOD_API_KEY",
         "AWS_ACCESS_KEY_ID",

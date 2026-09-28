@@ -34,7 +34,8 @@ BOOTSTRAP_VERSION = "1"
 _BOOTSTRAP_COMPLETION_KEY = "wavcse_bootstrap_complete"
 _HEALTH_SCHEMA_KEY = "wavcse_health_schema"
 _HEALTH_SCHEMA_VERSION = "1"
-_DEFAULT_DISK_PATH = "/workspace"
+_EPHEMERAL_DISK_PATH = "/"
+_DEFAULT_VOLUME_MOUNT_PATH = "/workspace"
 _EMBEDDING_SIZE_BYTES = 20 * 1024**3
 _DIAGNOSTIC_LIMIT = 500
 
@@ -69,6 +70,7 @@ class WorkerBootstrapper:
             result = self._executor.run_checked(
                 ready.connection,
                 _script_command("bootstrap.sh", BOOTSTRAP_VERSION),
+                input_text=load_worker_script("bootstrap.sh"),
                 timeout_seconds=(
                     self._config.bootstrap_timeout_seconds
                     if command_timeout_seconds is None
@@ -102,11 +104,17 @@ class WorkerBootstrapper:
         *,
         command_timeout_seconds: float | None,
     ) -> WorkerHealthReport:
-        disk_path = ready.worker.volume_mount_path or _DEFAULT_DISK_PATH
+        disk_path, required_mount_path = _health_storage_paths(ready.worker)
         try:
             result = self._executor.run_checked(
                 ready.connection,
-                _script_command("health-check.sh", BOOTSTRAP_VERSION, disk_path),
+                _script_command(
+                    "health-check.sh",
+                    BOOTSTRAP_VERSION,
+                    disk_path,
+                    required_mount_path or "",
+                ),
+                input_text=load_worker_script("health-check.sh"),
                 timeout_seconds=(
                     self._config.command_timeout_seconds
                     if command_timeout_seconds is None
@@ -140,15 +148,9 @@ def load_worker_script(name: str) -> str:
 
 
 def _script_command(name: str, *arguments: str) -> tuple[str, ...]:
-    """Carry a small trusted script in the exec request, not proxy-fragile stdin."""
+    """Run a reviewed script supplied on stdin over direct, non-interactive SSH."""
 
-    return (
-        "bash",
-        "-c",
-        load_worker_script(name),
-        f"wavcse-{name}",
-        *arguments,
-    )
+    return ("bash", "-s", "--", *arguments)
 
 
 def _require_bootstrap_completion(worker_id: str, result: SshCommandResult) -> None:
@@ -196,8 +198,9 @@ def parse_health_output(ready: SshWaitResult, output: str) -> WorkerHealthReport
     observed_bootstrap = values.get("bootstrap_version") or None
     disk_path = values.get("disk_path") or None
     disk_available = _optional_nonnegative_int(values.get("disk_available_bytes"))
+    disk_inspection_ok = _optional_bool(values.get("disk_inspection_ok"))
     gpu = _parse_nvidia_gpu(values)
-    checks = (
+    checks = [
         WorkerHealthCheck(
             name="provider",
             status=HealthCheckStatus.PASS,
@@ -239,7 +242,7 @@ def parse_health_output(ready: SshWaitResult, output: str) -> WorkerHealthReport
             values.get("uv_version") or "uv is missing",
             "uv is missing",
         ),
-        _disk_check(disk_path, disk_available),
+        _disk_check(disk_path, disk_available, disk_inspection_ok),
         _presence_check(
             "gpu",
             gpu is not None and gpu.count > 0,
@@ -250,7 +253,10 @@ def parse_health_output(ready: SshWaitResult, output: str) -> WorkerHealthReport
             ),
             "nvidia-smi is missing, failed, or reported no GPU",
         ),
-    )
+    ]
+    volume_check = _volume_mount_check(ready.worker, values)
+    if volume_check is not None:
+        checks.append(volume_check)
     readiness = (
         WorkerReadinessState.READY
         if all(check.status is not HealthCheckStatus.FAIL for check in checks)
@@ -269,7 +275,7 @@ def parse_health_output(ready: SshWaitResult, output: str) -> WorkerHealthReport
         python_version=values.get("python_version") or None,
         uv_version=values.get("uv_version") or None,
         gpu=gpu,
-        checks=checks,
+        checks=tuple(checks),
     )
 
 
@@ -333,9 +339,57 @@ def _presence_check(
     )
 
 
-def _disk_check(path: str | None, available_bytes: int | None) -> WorkerHealthCheck:
-    displayed_path = path or _DEFAULT_DISK_PATH
-    if available_bytes is None or available_bytes <= 0:
+def _health_storage_paths(worker: Worker) -> tuple[str, str | None]:
+    """Select execution storage and any provider-requested mount independently."""
+
+    volume_requested = (worker.volume_gb or 0) > 0 or worker.network_volume_id is not None
+    if not volume_requested:
+        return _EPHEMERAL_DISK_PATH, None
+    mount_path = worker.volume_mount_path or _DEFAULT_VOLUME_MOUNT_PATH
+    return mount_path, mount_path
+
+
+def _volume_mount_check(
+    worker: Worker,
+    values: dict[str, str],
+) -> WorkerHealthCheck | None:
+    kind: str | None = None
+    if worker.network_volume_id is not None:
+        kind = "network volume"
+    elif (worker.volume_gb or 0) > 0:
+        kind = "persistent volume"
+    if kind is None:
+        return None
+
+    expected_path = worker.volume_mount_path or _DEFAULT_VOLUME_MOUNT_PATH
+    observed_path = values.get("required_mount_path") or None
+    present = _optional_bool(values.get("required_mount_present"))
+    if observed_path != expected_path:
+        return WorkerHealthCheck(
+            name="volume",
+            status=HealthCheckStatus.FAIL,
+            detail=f"could not inspect required {kind} mount at {expected_path}",
+        )
+    if present is not True:
+        return WorkerHealthCheck(
+            name="volume",
+            status=HealthCheckStatus.FAIL,
+            detail=f"required {kind} is not mounted at {expected_path}",
+        )
+    return WorkerHealthCheck(
+        name="volume",
+        status=HealthCheckStatus.PASS,
+        detail=f"required {kind} is mounted at {expected_path}",
+    )
+
+
+def _disk_check(
+    path: str | None,
+    available_bytes: int | None,
+    inspection_ok: bool | None,
+) -> WorkerHealthCheck:
+    displayed_path = path or _EPHEMERAL_DISK_PATH
+    if inspection_ok is not True or available_bytes is None or available_bytes <= 0:
         return WorkerHealthCheck(
             name="disk",
             status=HealthCheckStatus.FAIL,
@@ -367,6 +421,16 @@ def _optional_nonnegative_int(value: str | None) -> int | None:
     if parsed < 0:
         raise WorkerHealthError("Worker returned negative disk availability")
     return parsed
+
+
+def _optional_bool(value: str | None) -> bool | None:
+    if value is None or not value.strip():
+        return None
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise WorkerHealthError("Worker returned malformed boolean health data")
 
 
 def _require_supported_accelerator(worker: Worker) -> None:

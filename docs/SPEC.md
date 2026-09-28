@@ -164,7 +164,9 @@ Do not assume local state is always synchronized with RunPod.
 Provider lifecycle and controller-observed readiness are separate. RunPod `RUNNING`
 only means the Pod resource is running; local `READY` additionally requires a current
 SSH endpoint, authenticated command execution, the expected bootstrap version, disk and
-tool checks, and a supported healthy GPU.
+tool checks, and a supported healthy GPU. Disk health means usable ephemeral execution
+storage when no volume was requested; persistent or network mount health is required only
+when that storage was explicitly requested.
 
 # 8. Worker profiles
 

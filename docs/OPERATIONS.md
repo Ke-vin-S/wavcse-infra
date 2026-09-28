@@ -297,7 +297,7 @@ value, length, prefix, suffix, hash, or fingerprint.
    availability and note its displayed total hourly price:
 
    ```bash
-   infra worker gpu-types --cloud COMMUNITY --gpu-count 1
+   infra worker gpu-types --cloud COMMUNITY --gpu-count 1 --require-direct-ssh
    ```
 
 2. Confirm that the public half of the dedicated key configured as `ssh.private_key`
@@ -325,6 +325,7 @@ value, length, prefix, suffix, hash, or fingerprint.
      --container-disk 20 \
      --volume 0 \
      --start-ssh \
+     --require-direct-ssh \
      --max-price '<maximum-total-usd-per-hour>'
    ```
 
@@ -332,6 +333,11 @@ value, length, prefix, suffix, hash, or fingerprint.
    availability, and current provider list price before prompting. Review the complete
    plan, then answer `y`. For deliberate non-interactive automation, add `--yes`; it
    does not bypass the maximum price or availability checks.
+
+   The direct-SSH constraint uses RunPod's GraphQL scheduler filter and refuses before
+   confirmation when no public-IP-compatible offer exists. The create request repeats
+   that constraint atomically with placement; it does not select an arbitrary Community
+   host from the broader REST catalog.
 
 4. Record the provider ID printed after the Pod reaches provider `RUNNING`. Then wait
    for authenticated SSH, bootstrap idempotently, and inspect the resulting readiness:
@@ -343,11 +349,14 @@ value, length, prefix, suffix, hash, or fingerprint.
    infra worker health <exact-worker-id>
    ```
 
-   `RUNNING` alone is not `READY`. Bootstrap first refreshes the v2 SSH endpoint, waits
-   for sshd, installs only stable worker prerequisites, and requires the expected marker,
-   Git, Python, uv, disk visibility, and a healthy NVIDIA GPU. It is safe to rerun after
-   a partial failure. `health` is read-only on the worker apart from the controller's
-   supplemental local-state update. JSON is available with `--json`.
+   `RUNNING` alone is not `READY`. Bootstrap first refreshes the v2 direct SSH endpoint,
+   proves non-interactive execution with a marker, installs only stable worker
+   prerequisites, and requires the expected bootstrap marker, Git, Python, uv, usable
+   execution storage, any explicitly requested volume mount, and a healthy NVIDIA GPU.
+   A zero-volume worker checks its ephemeral container filesystem and does not require
+   `/workspace` to be a mount. It is safe to rerun after a partial failure.
+   `health` is read-only on the worker apart from the controller's supplemental
+   local-state update. JSON is available with `--json`.
 
 5. Stop/start or destroy it using only that exact ID:
 
@@ -437,7 +446,12 @@ artifacts from S3, and experiment metadata from MLflow/DagsHub.
 - Lifecycle timeout: inspect the exact ID with `infra worker show`; the error includes
   the last known provider state and does not imply the resource is absent.
 - SSH endpoint unavailable: verify provider state, create-time `--start-ssh`, port
-  `22/tcp`, an SSH-capable image, and a registered RunPod account public key.
+  `22/tcp`, an SSH-capable image, a registered RunPod account public key, and a public
+  IP with a mapped external port. A proxy-only `ssh.runpod.io` endpoint supports an
+  interactive PTY but is insufficient for exec, bootstrap, health, or future jobs.
+- Community Cloud proxy-only Pod: it was created without the GraphQL public-IP placement
+  requirement. Replace it using both `--start-ssh` and `--require-direct-ssh`; do not use
+  the basic PTY proxy for automation.
 - SSH authentication failure: verify the configured private key corresponds to that
   registered public key; do not print or copy the private key.
 - SSH host-key mismatch: inspect the exact Pod ID, public IP, and mapped port before

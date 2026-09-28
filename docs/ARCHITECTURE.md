@@ -56,10 +56,11 @@ research dependency installation, or job execution.
   and provider-authoritative reconciliation.
 - `workers/ssh.py` invokes system OpenSSH with an explicit identity, isolated
   known-hosts file, bounded timeouts, captured streams, and provider-refreshed endpoint
-  readiness polling.
-- `workers/bootstrap.py` carries reviewed Bash scripts as SSH exec-command arguments,
+  readiness polling. Interactive shells may use RunPod's PTY proxy, while automation
+  requires true SSH through a mapped public `22/tcp` endpoint.
+- `workers/bootstrap.py` streams reviewed Bash scripts to `bash -s` over direct SSH,
   parses normalized health facts, and gates local readiness without changing provider
-  lifecycle state. This avoids depending on stdin forwarding through RunPod's proxy.
+  lifecycle state.
 - `worker/bootstrap.sh` and `worker/health-check.sh` are the idempotent worker-side
   setup and inspection contracts packaged with the CLI.
 - `redaction.py` removes authorization values, known secret assignments, and URL
@@ -110,10 +111,11 @@ config runpod.api_key_parameter
 
 ```text
 explicit WorkerSpec
-  -> current exact GPU/cloud/count catalog offer
+  -> current exact GPU/cloud/count offer
+  -> optional GraphQL public-IP scheduler filter
   -> availability and maximum-price guard
   -> operator-visible plan and confirmation
-  -> one create POST
+  -> one create POST (REST v2, or GraphQL when direct SSH is required)
   -> persist provider ID atomically
   -> bounded GET polling to RUNNING
 ```
@@ -132,19 +134,22 @@ After provider `RUNNING`, readiness proceeds independently:
 ```text
 RUNNING
   -> refresh ssh.direct / ssh.proxy from GET /pods/{id}
-  -> authenticated SSH no-op
+  -> authenticated non-interactive SSH marker
   -> SSH_READY
   -> versioned idempotent bootstrap through SSH exec
   -> BOOTSTRAPPED
-  -> disk/tool/nvidia-smi health
+  -> execution-disk/tool/nvidia-smi health
+  -> requested persistent/network mount verification, when applicable
   -> GPU_HEALTHY
   -> READY
 ```
 
-The direct endpoint is preferred because it is the Pod's mapped public `22/tcp` port;
-the RunPod proxy is a command-only fallback. Endpoint metadata is refreshed during
-polling because IP/port publication can lag provider `RUNNING`. Stopping or destroying
-a tracked Pod resets local readiness without redefining its provider state.
+The direct endpoint is required for automation because it is the Pod's true SSH daemon
+through a mapped public `22/tcp` port. RunPod's basic proxy requires a PTY and is used
+only by `infra worker ssh`; it is never an automation fallback. Endpoint metadata is
+refreshed during polling because IP/port publication can lag provider `RUNNING`.
+Stopping or destroying a tracked Pod resets local readiness without redefining its
+provider state.
 
 ## Reliability stance
 

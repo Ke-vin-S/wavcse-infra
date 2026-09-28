@@ -232,6 +232,24 @@ def test_readiness_transitions_persist_health_and_reset_when_stopped(tmp_path: P
     assert "PRIVATE KEY" not in serialized
     assert "Authorization" not in serialized
 
+    failed_report = report.model_copy(
+        update={
+            "readiness_state": WorkerReadinessState.FAILED,
+            "checks": (
+                WorkerHealthCheck(
+                    name="volume",
+                    status=HealthCheckStatus.FAIL,
+                    detail="required persistent volume is not mounted",
+                ),
+            ),
+        }
+    )
+    store.record_health(failed_report)
+    failed = store.get("pod-123")
+    assert failed is not None
+    assert failed.readiness_state is WorkerReadinessState.FAILED
+    assert failed.health_status == "FAILED"
+
     store.observe(_worker(state=WorkerState.STOPPED, native_status="EXITED"))
     stopped = store.get("pod-123")
     assert stopped is not None

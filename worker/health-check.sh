@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 readonly EXPECTED_BOOTSTRAP_VERSION="${1:?expected bootstrap version argument is required}"
-readonly DISK_PATH="${2:-/workspace}"
+readonly DISK_PATH="${2:-/}"
+readonly REQUIRED_MOUNT_PATH="${3:-}"
 readonly VERSION_FILE="${HOME}/.local/state/wavcse-worker/bootstrap-version"
 
 emit() {
@@ -42,10 +43,24 @@ emit uv_version "${uv_version}"
 
 emit disk_path "${DISK_PATH}"
 disk_available_bytes=""
-if [[ -d "${DISK_PATH}" ]]; then
-  disk_available_bytes="$(df -PB1 --output=avail "${DISK_PATH}" 2>/dev/null | tail -n 1 | tr -d ' ' || true)"
+disk_inspection_ok=false
+if [[ -d "${DISK_PATH}" ]] && disk_available_bytes="$(
+  df -PB1 -- "${DISK_PATH}" 2>/dev/null | awk 'NR == 2 { print $4 }'
+)" && [[ "${disk_available_bytes}" =~ ^[0-9]+$ ]]; then
+  disk_inspection_ok=true
 fi
+emit disk_inspection_ok "${disk_inspection_ok}"
 emit disk_available_bytes "${disk_available_bytes}"
+
+required_mount_present=""
+if [[ -n "${REQUIRED_MOUNT_PATH}" ]]; then
+  required_mount_present=false
+  if mountpoint -q -- "${REQUIRED_MOUNT_PATH}"; then
+    required_mount_present=true
+  fi
+fi
+emit required_mount_path "${REQUIRED_MOUNT_PATH}"
+emit required_mount_present "${required_mount_present}"
 
 nvidia_smi_available=false
 nvidia_smi_ok=false

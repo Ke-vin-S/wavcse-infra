@@ -434,8 +434,9 @@ to the user's normal SSH state would mix automation trust with unrelated hosts.
 Invoke system OpenSSH with an explicit dedicated worker identity, `-F /dev/null`,
 batch/key-only authentication, and bounded timeouts. Store accepted keys only in
 `~/.local/state/wavcse-infra/known_hosts` with `StrictHostKeyChecking=accept-new`.
-Prefer the direct mapped endpoint, fall back to the proxy for command execution, and
-refresh provider endpoint metadata while waiting. Do not depend on SCP/SFTP.
+Require the direct mapped endpoint for command execution and refresh provider endpoint
+metadata while waiting. Permit the basic proxy only for an explicitly interactive PTY
+session. Do not depend on SCP/SFTP.
 
 ### Alternatives considered
 
@@ -449,12 +450,47 @@ refresh provider endpoint metadata while waiting. Do not depend on SCP/SFTP.
 
 The first connection uses trust on first use and is therefore not protected against a
 first-contact network attacker. Subsequent changed keys fail closed. Operators must
-inspect the exact provider endpoint before removing a stale entry. The RunPod proxy
-remains unsuitable for SCP/SFTP, but Phase 4 streams only small reviewed scripts over
-stdin and later artifacts use S3.
+inspect the exact provider endpoint before removing a stale entry. The RunPod proxy is
+unsuitable for non-interactive automation. Phase 4 streams only small reviewed scripts
+through direct SSH stdin and later artifacts use S3.
 
 ### Official sources
 
 - [RunPod: Connect to a Pod with SSH](https://docs.runpod.io/pods/configuration/use-ssh)
 - [RunPod REST v2: Get a Pod](https://docs.runpod.io/api-reference-v2/pods/get-a-pod)
 - [RunPod REST v2: Create a Pod](https://docs.runpod.io/api-reference-v2/pods/create-a-pod)
+
+## ADR-014: Constrain direct-SSH Pods with RunPod GraphQL public-IP placement
+
+- **Status:** Accepted; narrows ADR-012's REST-only decision
+- **Date:** 2026-09-28
+
+### Context
+
+Live Community Cloud validation produced a Pod with `startSsh` and `22/tcp` but only the
+basic PTY proxy. REST v2 catalog and create schemas do not expose a public-IP placement
+constraint. Current official RunPod interfaces do: the GraphQL schema exposes
+`supportPublicIp` in both compatible-price lookup and `podFindAndDeployOnDemand`, and
+the official CLI exposes it as `pod create --public-ip`.
+
+### Decision
+
+Keep REST v2 for reads and ordinary lifecycle operations. When direct SSH is required,
+use GraphQL only for public-IP-filtered offer discovery and the single create mutation.
+Require `startSsh`, `22/tcp`, and `supportPublicIp: true` together. Apply the existing
+availability, confirmation, exact-name reconciliation, and maximum-price safeguards to
+the compatible offer rather than the broader REST catalog offer.
+
+### Consequences
+
+Community Cloud remains usable when compatible capacity exists. An unavailable
+compatible offer fails before confirmation, and the placement mutation cannot silently
+select a no-public-IP host. Secure Cloud may have more consistent provider-managed
+capacity, but it is neither required nor used as an implicit fallback. GraphQL remains
+isolated inside the RunPod provider and is not introduced as a general abstraction.
+
+### Official sources
+
+- [RunPod GraphQL schema](https://graphql-spec.runpod.io/)
+- [RunPod CLI Pod reference](https://docs.runpod.io/runpodctl/reference/runpodctl-pod)
+- [RunPod SSH methods](https://docs.runpod.io/pods/configuration/use-ssh)

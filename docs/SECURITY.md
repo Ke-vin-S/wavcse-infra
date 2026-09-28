@@ -94,8 +94,9 @@ the SSH private key to a worker.
 System OpenSSH is invoked with an argv, `shell=False`, an explicit identity, batch/key-
 only authentication, bounded connect/command timeouts, and `-F /dev/null` so user SSH
 configuration cannot silently redirect the connection. Basic proxied SSH and the
-mapped public-IP endpoint are modeled separately; direct is preferred, proxy is the
-command-only fallback, and neither is used for artifact transfer.
+mapped public-IP endpoint are modeled separately. Automation forces `-T` and requires
+the direct endpoint; the proxy is restricted to an explicitly interactive `-tt`
+session. Neither is used for artifact transfer.
 
 Host keys use a dedicated `~/.local/state/wavcse-infra/known_hosts` file with mode
 `0600`, `StrictHostKeyChecking=accept-new`, and the global known-hosts file disabled for
@@ -106,10 +107,10 @@ requires the operator to inspect the exact Pod endpoint before changing the entr
 user's normal `~/.ssh/known_hosts` and global SSH configuration are not weakened.
 
 Bootstrap and health scripts contain no credentials. Their small reviewed content is
-shell-quoted as one SSH exec argument so proxy execution does not depend on stdin; provider
-fields remain separate positional arguments. The worker stores only a non-secret
-bootstrap-version marker. Normal workers do not receive OMP, Codex, AGF, controller
-authentication stores, or permanent cloud credentials.
+sent on stdin to `bash -s` over direct SSH; fixed provider-derived values remain
+separate positional arguments. The worker stores only a non-secret bootstrap-version
+marker. Normal workers do not receive OMP, Codex, AGF, controller authentication
+stores, or permanent cloud credentials.
 
 ### Controller agent tools
 

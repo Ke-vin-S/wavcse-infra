@@ -21,6 +21,20 @@ POST   /pods/{id}/action   {"action":"stop"}
 DELETE /pods/{id}
 ```
 
+Public-IP-filtered offer discovery and constrained creation use RunPod's current
+GraphQL endpoint:
+
+```text
+https://api.runpod.io/graphql
+
+gpuTypes.lowestPrice(input: {supportPublicIp: true, ...})
+podFindAndDeployOnDemand(input: {supportPublicIp: true, ...})
+```
+
+This narrow mixed surface is required because REST v2 still cannot express the public-IP
+placement constraint. RunPod's current official `runpodctl pod create --public-ip` uses
+the same GraphQL placement mutation.
+
 Authentication remains `Authorization: Bearer <token>`. The client resolves the token
 once from a non-empty `RUNPOD_API_KEY`, otherwise from the SSM `SecureString` named by
 `runpod.api_key_parameter`. It never writes the value to configuration or state.
@@ -44,6 +58,12 @@ GPU count, and one explicit cloud tier. The normalized result contains:
 - maximum GPUs of that type on one machine;
 - provider list price per GPU-hour and total GPU price for the requested count;
 - per-datacenter availability where RunPod reports it.
+
+With `--require-direct-ssh`, discovery instead asks GraphQL `lowestPrice` for capacity
+filtered by `supportPublicIp: true`, the requested cloud/count, and any datacenter IDs.
+It displays only confirmed compatible offers, sorts them by compatible on-demand price,
+and marks `PUBLIC IP` as `YES`. This price can be higher than the unfiltered GPU-type
+catalog price and is the value used by `--max-price` during a constrained create.
 
 RunPod documents catalog prices as the list price for one GPU. The CLI multiplies that
 value by `--gpu-count`; it does not hardcode rates. `--max-price` compares the total
@@ -74,8 +94,16 @@ The v2 request is nested and names exactly one GPU type:
 The CLI requires exactly one of `--image` or `--template`. Optional request fields cover
 an explicit list of datacenter IDs, a host-local persistent volume, one existing
 network volume, and RunPod's `startSsh` setup flag. Persistent and network volumes are
-mutually exclusive. `--start-ssh` sends `startSsh: true` and exposes `22/tcp`; this is
-required for a direct mapped endpoint and is recommended for Phase 4 bootstrap.
+mutually exclusive. `--start-ssh` sends `startSsh: true` and exposes `22/tcp`. Both are
+necessary for direct SSH, but they are not sufficient on a Community Cloud host without
+a public IP.
+
+`--require-direct-ssh` requires `--start-ssh`, verifies a public-IP-filtered compatible
+offer before confirmation, and creates through `podFindAndDeployOnDemand` with all three
+requirements in one placement request: `supportPublicIp: true`, `startSsh: true`, and
+`ports: "22/tcp"`. If no matching machine exists, the scheduler rejects the mutation
+instead of placing a paid Pod on an unsuitable host. Unconstrained creates retain REST
+v2 behavior for backward compatibility.
 
 REST v2 currently has no interruptible/spot property in `CreatePodRequest` and its GPU
 catalog does not expose a spot offer for Pod creation. `--interruptible` is retained as
@@ -138,8 +166,10 @@ timeouts report the last known provider state.
 
 Current v2 Pod responses expose an `ssh` object with either or both of:
 
-- `ssh.proxy`: `ssh.runpod.io:22` with a Pod-specific username. RunPod documents this
-  basic connection as command capable but without SCP/SFTP support.
+- `ssh.proxy`: `ssh.runpod.io:22` with a Pod-specific username. This is RunPod's basic
+  terminal gateway rather than true SSH to the container. Live validation showed that
+  it requires a PTY and answers non-interactive exec requests with an error on stdout
+  and exit status zero.
 - `ssh.direct`: a public IP, provider-assigned external TCP port, and normally username
   `root`. This exists only when the machine supports a public IP, an SSH daemon is
   running, and container port `22/tcp` is exposed. The external port is not assumed to
@@ -149,11 +179,15 @@ Current v2 Pod responses expose an `ssh` object with either or both of:
 public IP or direct SSH port while still exposing a usable `ssh.proxy`; configured
 `22/tcp` alone does not prove that the host supports a public IP or direct mapping.
 
-`infra worker wait-ssh` repeatedly calls exact `GET /pods/{id}`, prefers `ssh.direct`,
-falls back to `ssh.proxy`, and runs an authenticated remote `true`. It does not equate
-RunPod `RUNNING` with SSH readiness. Missing IP/port metadata, startup connection
-refusal, and transient provider GET failures remain within a bounded backoff; terminal
-Pod states, authentication failure, host-key mismatch, and timeout are explicit errors.
+`infra worker wait-ssh` repeatedly calls exact `GET /pods/{id}`, requires `ssh.direct`,
+and runs an authenticated remote marker command with PTY allocation disabled. Both exit
+status zero and the marker are required, so a gateway-generated success status cannot
+be mistaken for remote execution. `infra worker exec`, bootstrap, and health use the
+same direct non-interactive mode. `infra worker ssh` is separate: it forces a PTY and
+may fall back to `ssh.proxy` for a human terminal. Missing IP/port metadata, startup
+connection refusal, and transient provider GET failures remain within a bounded
+backoff; terminal Pod states, authentication failure, host-key mismatch, and timeout
+are explicit errors.
 
 On create, `startSsh` injects a `PUBLIC_KEY` value containing the account's registered
 SSH public keys unless the request supplied one. It does nothing when the account has
@@ -171,25 +205,34 @@ avoiding an undocumented guess between the two names.
 
 ## Bootstrap, GPU health, and readiness
 
-`infra worker bootstrap <id>` carries the small reviewed `worker/bootstrap.sh` content in
-the SSH exec command and runs it with `bash -c`; it does not require SCP/SFTP or depend on
-exec-channel stdin forwarding. The script is non-interactive and idempotent: on a
+`infra worker bootstrap <id>` streams the small reviewed `worker/bootstrap.sh` content
+over direct SSH stdin and runs it with `bash -s`; it does not require SCP/SFTP or an
+interactive PTY. The script is non-interactive and idempotent: on a
 supported Ubuntu image it installs missing CA certificates, curl, Git, Python, uv,
 tar/gzip, and basic process/filesystem utilities, creates `/workspace`, then atomically
 writes the expected version to `~/.local/state/wavcse-worker/bootstrap-version`. A
 successful exit is accepted only with the expected completion marker. It does not clone
 wavCSE or install PyTorch, research dependencies, OMP, Codex, or AGF.
 
+`/workspace` is a conventional execution directory, not evidence that storage is
+mounted. RunPod's official image also defines `/workspace` as its workspace location,
+and the bootstrap makes the directory available idempotently. When no persistent or
+network volume was requested, it is part of the ephemeral container filesystem.
+
 The subsequent health script emits a versioned, tab-delimited schema on stdout and keeps
 remote stderr separate for diagnostics. The parser requires exactly one supported schema
 declaration and validates every protocol row; a bounded, redacted stdout/stderr excerpt is
 included when parsing fails. The protocol reports the bootstrap marker, Git/Python/uv
-versions, available bytes at the selected workspace path, and `nvidia-smi` facts: GPU
-count, model, MiB, driver, and CUDA compatibility version. A valid NVIDIA GPU is required
-for Phase 4 `READY`. AMD and other accelerators are reported as unsupported rather than
-being tested with the wrong tool. Less than roughly 20 GiB free produces a warning because
-the planned embeddings alone are approximately that size; it does not invent a larger
-readiness minimum.
+versions, execution-storage availability, and `nvidia-smi` facts: GPU count, model, MiB,
+driver, and CUDA compatibility version. With no requested volume, disk availability is
+measured on the ephemeral container filesystem at `/`; `/workspace` is not treated as a
+required mount. With a requested persistent or network volume, availability is measured
+at its configured path and `mountpoint` must confirm an actual mount there. A plain
+directory cannot satisfy that requirement. A valid NVIDIA GPU is required for Phase 4
+`READY`. AMD and other accelerators are reported as unsupported rather than being tested
+with the wrong tool. Less than roughly 20 GiB free produces a warning because the planned
+embeddings alone are approximately that size; it does not invent a larger readiness
+minimum. Failure to inspect the selected filesystem is a required-check failure.
 
 RunPod state and local readiness are separate. The local progression is `NOT_READY` →
 `SSH_READY` → `BOOTSTRAPPED` → `GPU_HEALTHY` → `READY`; a required failed check records
@@ -250,10 +293,12 @@ query strings pass through central redaction.
 - Availability is a current catalog signal, not a capacity guarantee.
 - Worker bootstrap currently supports Ubuntu images with `apt-get` and NVIDIA health
   through `nvidia-smi`; it will not mark AMD workers READY.
-- Proxy SSH does not support SCP/SFTP, and live behavior showed that successful exec
-  channels may not forward stdin reliably. wavcse-infra carries only its small reviewed
-  bootstrap/health scripts in the quoted SSH exec command and deliberately leaves data
-  transport to the later S3 phase.
+- RunPod's basic SSH proxy is interactive-only. It requires a PTY and can return its own
+  error text with exit status zero for non-interactive requests. Automation therefore
+  requires `ssh.direct`; proxy-only Pods cannot reach `READY`.
+- REST v2's GPU catalog does not carry the host-level `supportPublicIp` property. Use
+  `--require-direct-ssh` so discovery and creation use the GraphQL scheduler filter;
+  unqualified REST catalog availability is not evidence of direct-SSH compatibility.
 - Trust-on-first-use cannot authenticate the first SSH host key. Later changed keys fail
   closed in the dedicated known-hosts file.
 - No artifact transfer, exact-commit execution, research environment, or job management
@@ -272,3 +317,5 @@ query strings pass through central redaction.
 - [Terminate a Pod](https://docs.runpod.io/api-reference-v2/pods/terminate-a-pod)
 - [Pod pricing](https://docs.runpod.io/pods/pricing)
 - [Connect to a Pod with SSH](https://docs.runpod.io/pods/configuration/use-ssh)
+- [RunPod GraphQL schema](https://graphql-spec.runpod.io/)
+- [RunPod CLI Pod reference](https://docs.runpod.io/runpodctl/reference/runpodctl-pod)
