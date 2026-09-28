@@ -496,6 +496,44 @@ def test_download_command_presigns_and_streams_the_worker_module(
     assert timeout == 3600
 
 
+def test_download_command_passes_an_explicit_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_storage(monkeypatch, FakeClient(head=_head()))
+    executor = _install_worker(monkeypatch, _protocol("download", path="/workspace/embeddings.tar"))
+
+    result = runner.invoke(
+        app,
+        [
+            "storage",
+            "download",
+            KEY,
+            "/workspace/embeddings.tar",
+            "--worker",
+            "pod-123",
+            "--expected-size",
+            "3072",
+            "--concurrency",
+            "4",
+        ],
+        env=CONFIGURED_ENV,
+    )
+
+    assert result.exit_code == 0
+    remote_argv, _, _ = executor.calls[0]
+    assert remote_argv == (
+        "python3",
+        "-",
+        "download",
+        "--destination",
+        "/workspace/embeddings.tar",
+        "--expected-size",
+        "3072",
+        "--concurrency",
+        "4",
+    )
+
+
 def test_download_command_rejects_a_relative_destination(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

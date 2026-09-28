@@ -110,8 +110,10 @@ state and the worker's own files remain authoritative; a local record is never u
   JSON form, and the embedding archive key conventions.
 - `storage/worker_transfer.py` is the stdlib-only program executed on the worker: it
   streams a presigned transfer, verifies size and SHA-256, materializes atomically, and
-  reports a tab-separated result. It is also importable, so the same code is unit-tested
-  on the controller.
+  reports a tab-separated result. Large objects with a known expected size download as
+  bounded parallel HTTP byte ranges over a deterministic resumable partial file and
+  range record; small or size-unknown objects keep the single-connection path. It is also
+  importable, so the same code is unit-tested on the controller.
 - `storage/transfer.py` presigns, streams that module over direct SSH stdin with the URL
   on the same stream, parses the worker result strictly, and verifies uploaded objects.
 - `redaction.py` removes authorization values, known secret assignments, and URL
@@ -189,8 +191,18 @@ infra storage download <key> <worker-path> --worker <id>
        WAVCSE_PRESIGNED_URL = '<url>'
        WAVCSE_IF_NONE_MATCH = False
        <reviewed worker module source>
-  -> worker streams to <path>.wavcse-partial-<pid>-<random>
-  -> expected size/SHA-256 checked when supplied, then atomic materialization
+  -> one destination has one transfer at a time: the whole critical section holds
+       <path>.wavcse-transfer.lock, for every transport
+  -> small or size-unknown object: one-shot staging <path>.wavcse-partial-<pid>-<random>
+  -> large object with a known expected size: bounded parallel HTTP byte ranges
+       appended at explicit offsets into <path>.wavcse-partial
+       (one-shot random staging instead when no expected SHA-256 is supplied)
+       completed range indices recorded atomically in <path>.wavcse-partial.json
+       (no bearer material, so a later run with a fresh URL resumes the same digest)
+  -> whole assembled artifact checked against expected size and SHA-256
+  -> only then placement at <path>: the destination is linked from the open staging
+       inode and the created entry is verified, never moved from a pathname
+       (--overwrite removes the previous entry first)
   -> tab-separated result parsed and validated at the controller
 
 infra storage upload <key> <worker-path> --worker <id>

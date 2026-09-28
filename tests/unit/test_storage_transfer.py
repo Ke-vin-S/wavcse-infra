@@ -269,6 +269,58 @@ def test_download_passes_verification_expectations_and_limits(
     assert executor.calls[0][2] == 900
 
 
+def test_download_passes_a_bounded_parallel_concurrency_to_the_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:  # type: ignore[no-untyped-def]
+    transfer, _, executor = _transfer(monkeypatch, tmp_path, _protocol())
+    storage = FakeStorage()
+
+    transfer.download(  # type: ignore[arg-type]
+        "pod-123",
+        storage=storage,
+        key=KEY,
+        destination=DESTINATION,
+        expected_size=20 * 1024 * 1024 * 1024,
+        expected_sha256=DIGEST,
+        concurrency=4,
+    )
+
+    assert executor.calls[0][0] == (
+        "python3",
+        "-",
+        "download",
+        "--destination",
+        DESTINATION,
+        "--expected-size",
+        str(20 * 1024 * 1024 * 1024),
+        "--expected-sha256",
+        DIGEST,
+        "--concurrency",
+        "4",
+    )
+
+
+@pytest.mark.parametrize("concurrency", [0, -1, 17])
+def test_download_rejects_an_out_of_range_concurrency_before_presigning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, concurrency: int
+) -> None:  # type: ignore[no-untyped-def]
+    transfer, waiter, executor = _transfer(monkeypatch, tmp_path, _protocol())
+    storage = FakeStorage()
+
+    with pytest.raises(ArtifactTransferError, match="concurrency"):
+        transfer.download(  # type: ignore[arg-type]
+            "pod-123",
+            storage=storage,
+            key=KEY,
+            destination=DESTINATION,
+            concurrency=concurrency,
+        )
+
+    assert storage.presign_download_calls == []
+    assert waiter.calls == []
+    assert executor.calls == []
+
+
 def test_download_rejects_a_relative_destination_before_presigning(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:  # type: ignore[no-untyped-def]

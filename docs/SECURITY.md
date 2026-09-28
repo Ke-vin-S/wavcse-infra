@@ -216,19 +216,98 @@ as a SHA-256 checksum
 and is never compared against a recorded digest, because multipart uploads make the ETag
 depend on part boundaries.
 
-Downloads materialize through a temporary sibling file:
+Downloads only ever materialize through a sibling staging path, and one destination has
+exactly one transfer at a time:
 
 ```text
-<destination>.wavcse-partial-<pid>-<random>
-  -> streamed write + incremental SHA-256
-  -> expected size and digest checks when supplied
-  -> fsync, then atomic link (or rename with --overwrite)
+<destination>.wavcse-transfer.lock      (destination-wide lock, see below)
+
+one-shot staging, removed on failure:
+  small or size-unknown object:
+    <destination>.wavcse-partial-<pid>-<random>
+      -> streamed write + incremental SHA-256
+      -> expected size and digest checks when supplied
+      -> fsync, then link from the open staging inode
+  large object with a known expected size but no expected SHA-256:
+    the same one-shot name, filled by bounded parallel byte ranges
+
+resumable staging, deliberately retained on a transient failure:
+  large object with a known expected size and expected SHA-256:
+    <destination>.wavcse-partial + <destination>.wavcse-partial.json
+      -> bounded parallel inclusive byte ranges, each written at its own offset
+      -> per-range HTTP 206 / Content-Range / Content-Length validation
+      -> bounded per-range retries with backoff, fsync after each durable range
+      -> completed range indices recorded atomically (no bearer material)
+      -> whole-file SHA-256 streamed over the assembled artifact
+      -> expected size and digest checks
+      -> link from the open staging inode, then the staging name is released
 ```
 
-An incomplete or failing transfer never appears at the destination path; temporary files
-are removed on failure, and an existing destination is never replaced without explicit
-`--overwrite`. A supplied digest mismatch, a supplied size mismatch, an announced-size
-mismatch, or a non-2xx response fails the transfer.
+Placement creates the destination with `linkat` from the open verified inode and then
+proves the created entry is that inode, so it never depends on what a pathname names at
+the moment of placement. `--overwrite` is therefore a two-step replace: the previous
+entry is removed and the destination is then created from the verified inode, so the
+destination name is briefly absent, and a racing writer that takes the name first is
+never overwritten. On a worker where `/proc/self/fd` is unavailable the destination is
+linked from the staging name; that link is immediately verified, and the entry is removed
+again and the transfer fails if it is not the verified inode.
+
+Neither staging form is ever the destination path, so a partially written or unverified
+artifact cannot be mistaken for a complete one. Staging state is removed in these cases
+and retained in no others:
+
+| State | When it exists | What happens to it |
+| --- | --- | --- |
+| one-shot staging file | during one non-resumable transfer | removed on every failure, consumed on success |
+| resumable staging file + range record | during and after a resumable transfer | retained on a transient failure so a later invocation can resume; removed on success, on a size or digest failure, or when the record is discarded as incompatible |
+| completed artifact at the destination | only after verified placement | never replaced without explicit `--overwrite` |
+| `... .wavcse-transfer.lock` | from the first transfer for that destination, whatever its transport | never unlinked; it is an empty lock, not an artifact or a credential |
+| `... .wavcse-stage-*` (legacy) | only as crash residue from an earlier build's placement | released when it aliases our own staging inode |
+
+Only the complete-artifact comparison of size and SHA-256 authorizes placement, so a
+retained partial file is never itself treated as a valid artifact. A successful range
+request, an HTTP 206 status, and an S3 ETag are each insufficient on their own.
+
+Resumable state is only reused when the invocation can prove it describes the same bytes.
+The range record names the destination, expected size, expected SHA-256, range granularity,
+and completed range indices, and the record schema requires that digest; a version 1
+record, or one missing the digest, is discarded rather than trusted. A download without an
+expected SHA-256 is therefore never resumable: it still uses the parallel ranged transport,
+but into a one-shot staging file with no persisted state, and it discards any leftover
+resumable state for that destination first. The record never contains a presigned URL or
+any part of its signature, so a resumed invocation must be given a new URL.
+
+Transport failures that can be transient — connection reset, timeout, temporary 5xx,
+truncated body, an incomplete read during the response body — are retried a bounded number
+of times per range with backoff, and a failed attempt can never leave a range half-trusted:
+a range is only recorded after its bytes are complete and fsynced. An expired or rejected
+authorization, a malformed `Content-Range`, or an inconsistent announced size fails
+immediately rather than looping. Every transport failure surface, including failures raised
+while reading a response body, is converted to a transfer error whose message has URLs and
+signatures stripped.
+
+Staging files are opened with `O_NOFOLLOW` and validated through the returned descriptor:
+regular-file mode, a single hard link, and a pathname that still names that same inode. When
+a staging file has extra links, only aliases in our own `... .wavcse-stage-*` placement
+namespace that resolve to that exact inode are released as crash residue; any other extra
+link keeps the shared-file refusal, so a hard link planted to a victim file is still never
+written through.
+Placement hard-links the open inode (through `linkat` on the process descriptor path on a
+Linux worker, with a re-verified pathname fallback where `/proc` is unavailable) relative to
+an open destination-directory descriptor, so a staging pathname replaced after validation
+cannot redirect what lands at the destination. Metadata records are opened the same way and
+rejected if they are symlinks, non-regular files, or hard-linked. A stale staging name that
+merely hard-links an already-placed artifact — the residue of a crash between placement and
+cleanup — is removed while the lock is held instead of blocking the next transfer.
+
+The lock file is a fixed sibling path opened with `O_NOFOLLOW`, validated the same way, and
+locked with `flock(LOCK_EX | LOCK_NB)` for the whole critical section: inspecting the
+destination, opening or creating staging state, downloading, verifying, placing, and
+cleaning up. Every download takes it — sequential, size-unknown, non-resumable, and ranged
+alike — so a transfer cannot bypass serialization by being small or by lacking a digest,
+and an empty lock file is left beside the destination even for a one-connection transfer. Because it is never unlinked, its lifetime does not depend on the staging file
+being renamed or removed, and a second transfer for the same destination is refused with an
+actionable error rather than racing the first.
 
 Uploads stream SHA-256 over the bytes handed to HTTP and report the resulting size and
 digest. The controller then confirms the stored object's size with a HEAD request. A

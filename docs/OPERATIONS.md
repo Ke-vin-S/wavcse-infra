@@ -477,6 +477,115 @@ explicitly. Use `download` with `--expected-sha256` when content must be proven 
 machine that will consume it. Single presigned PUT uploads are limited to 5 GB by S3;
 larger outputs need a separate multipart transfer workflow.
 
+### Large download transport
+
+`infra storage download` and Phase 6 input materialization share one worker-side
+downloader with two transports:
+
+| Condition | Transport |
+| --- | --- |
+| expected size unknown, or below 64 MiB | one sequential connection |
+| expected size known and at or above 64 MiB | parallel inclusive HTTP byte ranges |
+
+Parallel downloads use 8 concurrent range requests by default and a 16 MiB range size, so
+a 20 GiB artifact is about 1280 ranges. There is no worker-side tuning file: the worker
+uses its default unless the controller passes `--concurrency`, whose maximum is 16. Phase
+6 uses the default, so recorded jobs keep the same command line. Only a bounded number of
+ranges are ever scheduled at once, so an enormous expected size does not allocate
+proportional work items.
+
+Resumability requires the expected SHA-256. A digest is the only immutable identity the
+worker can verify, so:
+
+| Condition | Transport | Resumable |
+| --- | --- | --- |
+| known size ≥ threshold, expected SHA-256 supplied | parallel ranges | yes |
+| known size ≥ threshold, no expected SHA-256 | parallel ranges | no |
+| size unknown or below threshold | one sequential connection | no |
+
+A non-resumable ranged download still runs in parallel, but into a one-shot staging file
+with no persisted state, and it discards any leftover resumable state for that destination
+first. Its bytes are only checked against the announced size. Phase 6 supplies a digest
+whenever the input declares a manifest or a SHA-256, so declared inputs keep resumability;
+add `--expected-sha256` to a direct `infra storage download` to get it too.
+
+Each range is written at its own offset in the staging file, and for a resumable transfer
+`<destination>.wavcse-partial.json` records the durable range indices together with the
+destination, expected size, expected SHA-256, and range size. A rerun for the same
+destination, size, and digest skips the recorded ranges even though the controller issues
+a new presigned URL. A record whose digest is absent or does not match, who cannot be
+parsed, or that belongs to an artifact that now uses the single-connection path is
+discarded rather than trusted.
+
+One destination has one transfer at a time, whatever transport it uses. A fixed
+`<destination>.wavcse-transfer.lock` is locked for the whole operation — checking the
+destination, staging, downloading, verifying, placing, and cleaning up — and is never
+deleted, so it survives the staging file being released at completion. Every download
+takes it, including a small, size-unknown, or digest-less one, so none of them can bypass
+serialization against a ranged transfer to the same path. A second transfer for the same
+destination fails with "is already in progress"; it cannot race the first one's completion,
+and it does not touch the first one's state. The lock is an advisory `flock`, so it is
+released automatically if the transfer process dies; an empty lock file (0 bytes) left
+beside the destination is normal and harmless.
+
+Placement creates the destination from the verified staging inode rather than by moving a
+pathname. That also means `--overwrite` is a two-step replace — the previous entry is
+removed, then the destination is created from the verified inode — so the destination name
+is briefly absent, a crash in between leaves the resumable state usable rather than
+wedged, and a writer that takes the name first is never overwritten (the transfer fails
+with "appeared during the download").
+
+Retries are bounded per range (four attempts, then failure). Connection resets, timeouts,
+temporary 5xx responses, truncated bodies, and incomplete reads while a body is streaming
+are all retried; an expired URL (HTTP 403), a malformed or mismatched `Content-Range`, an
+announced-size mismatch, or an extra byte beyond the requested range fails immediately with
+an actionable message. If the endpoint answers a range request with HTTP 200, the
+downloader switches to one sequential full-object transfer instead of concatenating full
+bodies.
+
+Peak disk use for a ranged download is approximately the artifact size plus the small
+range record: ranges are written in place and the verified file is hard-linked or renamed
+into position, so the object is neither buffered in memory nor copied twice.
+
+State left behind depends on why the transfer stopped:
+
+| Outcome | Left on disk |
+| --- | --- |
+| success | only the artifact (and the empty lock file) |
+| transient failure of a resumable transfer | `... .wavcse-partial` + `.json` record, kept for the next run |
+| crash before or after placement | a staging name that only hard-links the placed artifact is released, and the record is removed, on the next attempt |
+| size or digest failure, or a reset | staging files removed |
+| transient failure of a non-resumable transfer | nothing |
+
+To abandon retained state deliberately, remove the `... .wavcse-partial` file and its
+`.json` record while no transfer is running. A `... .wavcse-stage-*` file next to a
+destination is only crash residue from an earlier build; it is released automatically when
+it aliases that destination's staging inode, and it can be deleted by hand otherwise. Removing either one alone forces a restart,
+because the record is discarded when it does not describe the data file. A staging name
+that merely hard-links an already-placed artifact — the residue of a crash between
+placement and cleanup — is detected under the lock and removed automatically on the next
+attempt; it can be deleted manually as well, and it never holds the only copy of anything.
+
+Whole-object SHA-256 remains authoritative. Completing every range is not evidence of
+artifact integrity, and nothing is placed at the destination until the assembled file
+matches the expected size and, when supplied, the digest.
+
+#### Controlled large-download benchmark
+
+The parallel transport was motivated by one measured worker-to-`ap-south-1` path, not by a
+service-level target. Measure the path in front of you before treating any figure as
+expected.
+
+1. Pick an existing artifact with a recorded manifest and confirm it with
+   `infra storage verify <key> --manifest <key>.manifest.json`.
+2. Use an existing `READY` worker. Do not create one for a benchmark.
+3. Baseline: `infra storage download <key> /workspace/bench-a.tar --worker <id>
+   --expected-size <bytes> --expected-sha256 <hex> --concurrency 1`.
+4. Default: the same command writing `/workspace/bench-b.tar` without `--concurrency`.
+5. Compare wall-clock time and confirm both runs report identical size and digest.
+6. Remove the benchmark files when done. One sample is not a guarantee; repeat before
+   drawing a conclusion.
+
 ### Operator test 1 — controller only, no paid resource
 
 This exercises presign, upload, listing, verification, and download against the real

@@ -213,6 +213,7 @@ infra storage presign-download <artifact> [--expires-in <seconds>]
 infra storage presign-upload <artifact> [--expires-in <seconds>] [--overwrite]
 infra storage verify <artifact> [--expected-size <bytes>] [--manifest <key> | --manifest-file <path>]
 infra storage download <artifact> <absolute-worker-path> --worker <exact-worker-id>
+                       [--expected-size <bytes>] [--expected-sha256 <hex>] [--concurrency <n>] [--overwrite]
 infra storage upload <artifact> <absolute-worker-path> --worker <exact-worker-id> [--overwrite]
 infra job submit <job-spec.json> --worker <exact-worker-id> [--wait] [--wait-timeout <seconds>]
 infra job status <job-id> [--json]
@@ -304,14 +305,26 @@ actually known, the generator commit and extracted destination. It never stores 
 presigned URL or any credential.
 
 `infra storage download` presigns a GET URL, streams the reviewed worker transfer module
-over direct SSH stdin together with the URL, downloads into a temporary sibling file,
-verifies size and SHA-256 when expectations are supplied, and only then materializes it
-atomically. `infra storage upload` hashes the bytes it sends, PUTs them through a
-presigned URL, and then verifies the stored object's size at the controller. Default
-uploads use a signed no-replacement header; `--overwrite` opts out. A single PUT is
-limited to 5 GB. `infra storage verify` proves existence, size, and
-manifest consistency — and states explicitly that it does not verify content, because
-the object body is never downloaded back to the controller.
+over direct SSH stdin together with the URL, and materializes one artifact atomically after
+verifying its size and, when supplied, its SHA-256. A large artifact whose expected size is
+known is fetched as bounded parallel HTTP byte ranges — worker default 8 streams,
+`--concurrency` up to 16 — and a download that also knows the expected SHA-256 resumes
+after an interruption instead of restarting from byte zero: it stages into
+`<destination>.wavcse-partial` with a `<destination>.wavcse-partial.json` record of
+completed inclusive ranges, and that record holds no presigned URL. Without a digest the
+same parallel transport still runs, but into a one-shot staging file with no resumable
+state, so an artifact of the same size can never be mixed with another. One destination has
+one transfer at a time, serialized by `<destination>.wavcse-transfer.lock` for every
+download, resumable or not. Nothing reaches the destination path until the whole assembled
+file matches the expected size and, when supplied, its digest; placement links the verified
+inode rather than moving a pathname; and an endpoint that ignores `Range` falls back to the
+single-connection path.
+`infra storage upload` hashes the bytes it sends, PUTs them through a presigned URL, and
+then verifies the stored object's size at the controller. Default uploads use a signed
+no-replacement header; `--overwrite` opts out. A single PUT is limited to 5 GB.
+`infra storage verify` proves existence, size, and manifest consistency — and states
+explicitly that it does not verify content, because the object body is never downloaded
+back to the controller.
 
 Git stores code and small metadata, not generated tensors or archives. MLflow/DagsHub
 continues to own experiment metadata.

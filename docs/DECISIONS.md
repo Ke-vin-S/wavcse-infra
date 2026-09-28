@@ -728,3 +728,217 @@ exports those variables in the submitting shell. Missing values fail before any 
 created. The worker holds the values only in process memory for the life of the job, which
 matches the existing threat assumption that a compromised worker may expose short-lived
 values delivered to it.
+
+## ADR-020: Parallel ranged, resumable worker artifact downloads
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+
+### Context
+
+Phase 5 downloads one S3 object with a single `urllib` connection and stages it in a
+PID/random sibling file, so an interrupted multi-gigabyte transfer restarts from byte
+zero. A live Phase 6 job on a Community worker in France pulling a 1.26 GB object from
+`ap-south-1` exposed the cost: that one long-lived TCP flow averaged roughly 0.28 MB/s
+while eight parallel HTTP ranges over the same path reached roughly 22.7 MB/s. The
+observation is one measured path, not a target or an SLA. Worker CPU, GPU, disk, and
+general connectivity were demonstrably not the bottleneck; the pathology was a single flow
+over roughly 181 ms RTT with loss and reordering.
+
+### Decision
+
+Keep one downloader with two transports, selected by information Phase 5 already has:
+
+- unknown expected size, or below 64 MiB: the existing single-connection path, unchanged;
+- known expected size at or above 64 MiB: inclusive HTTP byte ranges.
+
+Ranged downloads use bounded concurrency — default 8, hard maximum 16, selectable through
+`infra storage download --concurrency` — with a 16 MiB range size. Each range is written
+at its own offset with `os.pwrite` into a deterministic `<destination>.wavcse-partial`
+file, and its durability is recorded by atomically replacing
+`<destination>.wavcse-partial.json`. That record is keyed by destination, expected size,
+expected SHA-256, and range size, and contains no bearer material, so a later invocation
+holding a new presigned URL resumes instead of restarting. State that does not match the
+current identity, cannot be parsed, or belongs to an artifact that now uses the
+single-connection path is discarded.
+
+Per-range retries are bounded: four attempts with exponential backoff, for connection
+resets, timeouts, 408/425/429, temporary 5xx, and truncated bodies. An expired or rejected
+authorization, a malformed or mismatched `Content-Range`, an announced-size mismatch, or
+extra bytes beyond the requested range fail immediately. An endpoint that answers a range
+request with HTTP 200 triggers one sequential full-object fallback rather than
+concatenating whole bodies.
+
+Completion of every range is never treated as artifact integrity: the assembled file must
+match the expected size and the whole-object SHA-256 before it is placed at the
+destination, and placement stays atomic (sibling hard link, or `os.replace` with
+`--overwrite`).
+
+### Alternatives considered
+
+- `curl`/`aria2` on the worker: rejected because it adds a worker dependency, duplicates
+  size and digest enforcement outside the unit-tested module, and tends to want the URL on
+  an argument list.
+- Keeping one connection and raising timeouts: rejected because the bottleneck was RTT,
+  loss, and reordering, not a local timeout.
+- One file per completed range in a partial directory: rejected because assembly needs a
+  concatenation pass and roughly doubles peak disk use for a multi-gigabyte artifact.
+- Recording range progress in a database or controller-side service: rejected because
+  workers are disposable and the transfer program is stdlib-only.
+- Treating S3 ETags as digests for resume verification: rejected; multipart ETags depend on
+  part boundaries and are not SHA-256.
+- Always using ranged transfer: rejected because tiny objects do not justify the machinery.
+- S3 Transfer Acceleration, a CDN, or a region-local mirror: out of scope here; each is a
+  separate architectural decision with its own cost and security surface.
+
+### Consequences
+
+The worker stays stdlib-only (`concurrent.futures`, `fcntl`, and `json` are standard
+library), and Phase 6 keeps its command line and gains the faster transport by default.
+A worker can now hold one artifact's partial state on disk between attempts, which the
+operator owns and deletes to abandon a transfer. Concurrency multiplies sockets per
+worker, which is why the bound is explicit and small. Measured throughput remains a
+property of the path between one worker and one bucket region, so the numbers above are
+recorded as an observation and not as an expectation.
+
+## ADR-021: Harden the resumable ranged downloader
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+
+### Context
+
+ADR-020 introduced parallel ranged downloads with resumable partial state. A read-only
+adversarial review of that implementation found six defects: HTTP body-read failures
+escaped the bounded retry and redaction path; staging files were trusted from their
+pathname alone; resume identity accepted an expected size without a digest, which allowed
+two same-sized artifacts to be combined; the destination lock was attached to the staging
+inode, so it disappeared when that name was renamed during completion; one future was
+created per range instead of per worker slot; and the security documentation claimed
+staging files are always removed, which contradicted the deliberate retention of resumable
+state.
+
+### Decision
+
+Amend the ADR-020 design without changing its transport:
+
+- Opening a response and consuming its body are one controlled attempt. Connection resets,
+  timeouts, `http.client.HTTPException` (including `IncompleteRead`), and truncated bodies
+  raised during a read are mapped to the same bounded per-range retry, and every surfaced
+  transport message is passed through URL redaction. `main` also converts any unexpected
+  exception into the sanitized error protocol instead of a traceback. A range is recorded
+  only after its bytes are complete and fsynced, and every retry rewrites its whole range,
+  so a failed attempt cannot leave a half-trusted range behind.
+- Staging files, the metadata record, and the lock file are validated through the returned
+  descriptor: `O_NOFOLLOW`, regular-file mode, exactly one hard link, and a pathname that
+  still names that inode. Placement hard-links the open inode relative to an open
+  destination-directory descriptor (through `linkat` on `/proc/self/fd` on a Linux worker,
+  with a re-verified pathname fallback where procfs is unavailable). Residue that merely
+  hard-links an already-placed artifact is removed under the lock.
+- Resume requires the expected SHA-256. A large object without one is still fetched in
+  parallel, but into a one-shot staging file with no persisted state, and any leftover
+  resumable state for that destination is discarded first. The record schema is version 2;
+  version 1 records are never reused.
+- The destination-wide lock lives in its own fixed file that is never unlinked, and it is
+  held across the entire critical section.
+- Range work is scheduled through a rolling window sized by the configured concurrency, and
+  the executor is always joined before failure returns, so no write continues afterwards.
+
+### Alternatives considered
+
+- Keeping inode-coupled locking and relying on short critical sections: rejected because the
+  completion rename is exactly when the lock must still hold.
+- Requiring no digest and validating resume state by re-hashing recorded ranges: rejected
+  because per-range digests were not recorded, and adding them would still not identify an
+  artifact whose expected digest is unknown.
+- Falling back to a purely sequential transfer when no digest is supplied: rejected because
+  it would remove the measured parallelism benefit from direct CLI downloads while
+  providing no additional safety over one-shot staging.
+- Refusing to download without a digest: rejected as unnecessarily restrictive; size remains
+  checked and nothing resumable is stored.
+- Addressing placement by pathname with an `os.path.isfile` pre-check: rejected because it
+  does not close the validation/use window.
+- Adopting a transfer library for range scheduling and staging: rejected; the standard
+  library covers it and the worker program must stay stdlib-only.
+
+### Consequences
+
+Interrupted resumable downloads keep a validated staging file and record; integrity
+failures remove them; non-resumable transfers keep nothing. Placement no longer depends on
+a pathname that another actor could have replaced, at the documented cost of using
+`/proc/self/fd` on Linux and a re-verified pathname fallback elsewhere. A worker can hold a
+staging file plus an empty lock file next to a destination, which operators own and can
+remove. Direct CLI downloads without `--expected-sha256` are parallel but non-resumable,
+which is the documented, safe default when no immutable content identity is known.
+
+## ADR-022: Inode-anchored placement, destination-wide locking, and crash-residue recovery
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+- **Amends:** ADR-020, ADR-021
+
+### Context
+
+A second read-only adversarial review of the ranged downloader found that placement could
+still be redirected through a pathname. `--overwrite` linked the verified inode to a
+sibling `... .wavcse-stage-*` name and then renamed that name onto the destination, and the
+no-procfs fallback linked from the staging pathname after re-checking it. Both are
+"re-check a pathname, then operate on the pathname" windows: a third party that replaced
+the name in the window could make the destination whatever the *substituted* file was.
+Reproduced against the previous code, a swapped rename source made `download` report the
+verified digest while the destination held `attacker-bytes`.
+
+Three further defects accompanied it. Only ranged downloads took the destination lock, so
+a small, size-unknown, or digest-less download could run concurrently with a ranged one.
+A crash between creating the `... .wavcse-stage-*` link and the rename left a second hard
+link for the staging file, which the `st_nlink != 1` guard then refused on every later
+attempt: a permanent wedge needing manual cleanup. And the shutdown harvest added ranges
+that finished during a failure to the in-memory set without marking the record dirty, so
+those durable ranges were not persisted and were re-fetched on the next attempt.
+
+### Decision
+
+- Placement never moves a pathname. The destination entry is created with `linkat` from
+  the open verified inode (through `/proc/self/fd`), then re-checked so the created entry
+  is proven to be that inode; anything else is unlinked and reported. `--overwrite` removes
+  the previous entry first, which makes it a two-step replace with a briefly absent
+  destination name, in exchange for never placing bytes that were not verified. A racing
+  writer that takes the name first is never overwritten.
+- Where `/proc/self/fd` is unavailable the destination is linked from the staging name
+  after re-proving that name, and the created entry is then verified and removed again if
+  it is not the verified inode. That fallback is documented as requiring a destination
+  directory that is not adversarially writable.
+- Every download takes the destination lock, so serialization does not depend on the
+  transport, the size, or the presence of a digest. The lock file remains an empty,
+  never-unlinked sibling.
+- A staging file with extra links is refused as before, but aliases in our own
+  `... .wavcse-stage-*` namespace that resolve to that exact inode are released first as
+  placement crash residue. A hard link to any other file keeps the refusal, so the
+  shared-file defense is unchanged.
+- The shutdown harvest marks the record dirty, and persisting runs in a nested `finally`,
+  so ranges that complete while a transfer shuts down are resumable afterwards.
+
+### Alternatives considered
+
+- Keeping the rename and verifying the destination afterwards: rejected because the
+  previous destination content is already gone by then, so a detected substitution cannot
+  be undone without losing data.
+- `renameat2` with `RENAME_EXCHANGE` to swap and restore: rejected because Python does not
+  expose it, and the worker program must stay stdlib-only.
+- Refusing to place at all without procfs: rejected as a hard portability regression; the
+  verified-then-undone fallback is weaker but never silently wrong.
+- Creating a lock file only when a ranged transfer is chosen: rejected because it is exactly
+  the bypass the review found.
+- Globally releasing any extra link on a staging file: rejected because it would delete a
+  link planted to a victim file and silently write through a shared inode.
+- Persisting on every harvest regardless of dirtiness: rejected as needless metadata
+  writes; the dirty flag is set by the harvest instead.
+
+### Consequences
+
+`--overwrite` is no longer a single atomic replacement: readers can observe the destination
+absent in the interval between removing the old entry and creating the new one, and a crash
+there leaves the previous entry gone. In exchange, the destination can only ever be the
+verified inode, and the crash leaves the resumable staging file and range record intact
+with one link, so the next attempt continues rather than wedging. Small downloads now leave
+an empty lock file next to their destination like ranged ones.

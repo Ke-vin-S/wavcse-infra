@@ -65,6 +65,7 @@ from wavcse_infra.storage.transfer import (
     ArtifactTransferResult,
     WorkerArtifactTransfer,
 )
+from wavcse_infra.storage.worker_transfer import MAX_DOWNLOAD_CONCURRENCY
 from wavcse_infra.workers.bootstrap import WorkerBootstrapper
 from wavcse_infra.workers.lifecycle import WorkerLifecycle
 from wavcse_infra.workers.ssh import SshExecutor, WorkerSshWaiter, select_worker_connection
@@ -946,6 +947,18 @@ def download_artifact(
         bool,
         typer.Option("--overwrite", help="Replace an existing destination file on the worker."),
     ] = False,
+    concurrency: Annotated[
+        int | None,
+        typer.Option(
+            "--concurrency",
+            min=1,
+            max=MAX_DOWNLOAD_CONCURRENCY,
+            help=(
+                "Parallel byte-range streams for a large artifact "
+                f"(1-{MAX_DOWNLOAD_CONCURRENCY}); the worker default applies when omitted."
+            ),
+        ),
+    ] = None,
     expires_in: Annotated[
         int | None,
         typer.Option(
@@ -980,6 +993,7 @@ def download_artifact(
                 expected_size=expected_size,
                 expected_sha256=expected_sha256,
                 overwrite=overwrite,
+                concurrency=concurrency,
                 expires_in_seconds=expires_in,
                 wait_timeout_seconds=wait_timeout,
                 command_timeout_seconds=command_timeout,

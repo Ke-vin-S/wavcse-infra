@@ -28,6 +28,7 @@ from wavcse_infra.storage.worker_transfer import (
     SCHEMA_VERSION,
     UPLOAD_OPERATION,
     TransferInputError,
+    download_concurrency,
     validate_presigned_url,
     validate_worker_path,
 )
@@ -178,6 +179,7 @@ class WorkerArtifactTransfer:
         expected_size: int | None = None,
         expected_sha256: str | None = None,
         overwrite: bool = False,
+        concurrency: int | None = None,
         expires_in_seconds: int | None = None,
         wait_timeout_seconds: float | None = None,
         command_timeout_seconds: float | None = None,
@@ -185,12 +187,20 @@ class WorkerArtifactTransfer:
         """Materialize one artifact atomically on a READY worker."""
 
         _worker_path(destination, label="download destination")
+        validated_concurrency = None
+        if concurrency is not None:
+            try:
+                validated_concurrency = download_concurrency(concurrency)
+            except TransferInputError as exc:
+                raise ArtifactTransferError(str(exc)) from exc
         presigned = storage.presign_download(key, expires_in_seconds=expires_in_seconds)
         arguments = ["--destination", destination]
         if expected_size is not None:
             arguments += ["--expected-size", str(expected_size)]
         if expected_sha256 is not None:
             arguments += ["--expected-sha256", expected_sha256]
+        if validated_concurrency is not None:
+            arguments += ["--concurrency", str(validated_concurrency)]
         if overwrite:
             arguments.append("--overwrite")
         return self._execute(

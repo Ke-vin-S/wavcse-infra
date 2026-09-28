@@ -28,6 +28,15 @@ URL = (
 )
 PAYLOAD = b"wavcse-artifact-payload" * 3
 DIGEST = hashlib.sha256(PAYLOAD).hexdigest()
+LOCK_SUFFIX = ".wavcse-transfer.lock"
+
+
+def _staged_entries(directory: Path) -> list[str]:
+    """Directory entries other than the destination lock every download keeps."""
+
+    return sorted(
+        entry.name for entry in directory.iterdir() if not entry.name.endswith(LOCK_SUFFIX)
+    )
 
 
 class FakeResponse:
@@ -167,7 +176,7 @@ def test_download_materializes_the_verified_artifact_atomically(
 
     assert destination.read_bytes() == PAYLOAD
     assert result == {"path": str(destination), "size_bytes": str(len(PAYLOAD)), "sha256": DIGEST}
-    assert [entry.name for entry in tmp_path.iterdir()] == ["voxceleb.tar"]
+    assert _staged_entries(tmp_path) == ["voxceleb.tar"]
     assert transport.timeouts == [worker_transfer.DEFAULT_TIMEOUT_SECONDS]
 
 
@@ -190,7 +199,7 @@ def test_download_never_materializes_an_incomplete_transfer(
 
     assert "connection reset" in str(error.value)
     assert not destination.exists()
-    assert list(tmp_path.iterdir()) == []
+    assert _staged_entries(tmp_path) == []
     assert len(transport.calls) == 1
 
 
@@ -205,7 +214,7 @@ def test_download_rejects_a_size_mismatch_and_removes_the_temporary_file(
 
     assert "downloaded" in str(error.value)
     assert not destination.exists()
-    assert list(tmp_path.iterdir()) == []
+    assert _staged_entries(tmp_path) == []
 
 
 def test_download_fails_fast_when_the_announced_size_is_wrong(
@@ -218,7 +227,7 @@ def test_download_fails_fast_when_the_announced_size_is_wrong(
         download(URL, str(destination), expected_size=len(PAYLOAD))
 
     assert "announces 99 bytes" in str(error.value)
-    assert list(tmp_path.iterdir()) == []
+    assert _staged_entries(tmp_path) == []
 
 
 def test_download_rejects_a_checksum_mismatch(
@@ -232,7 +241,7 @@ def test_download_rejects_a_checksum_mismatch(
 
     assert DIGEST in str(error.value)
     assert not destination.exists()
-    assert list(tmp_path.iterdir()) == []
+    assert _staged_entries(tmp_path) == []
 
 
 def test_download_accepts_a_matching_expectation(
@@ -262,7 +271,7 @@ def test_download_reports_http_failure_without_materializing_a_file(
 
     assert "HTTP 403" in str(error.value)
     assert "X-Amz-Signature" not in str(error.value)
-    assert list(tmp_path.iterdir()) == []
+    assert _staged_entries(tmp_path) == []
 
 
 def test_download_reports_transport_failure(
@@ -328,7 +337,7 @@ def test_download_refuses_a_file_that_appears_during_the_transfer(
     assert raced is True
     assert destination.read_bytes() == b"raced"
     assert len(transport.calls) == 1
-    assert list(tmp_path.iterdir()) == [destination]
+    assert _staged_entries(tmp_path) == [destination.name]
 
 
 def test_download_cannot_overwrite_a_file_created_at_materialization(
@@ -338,9 +347,9 @@ def test_download_cannot_overwrite_a_file_created_at_materialization(
     destination = tmp_path / "voxceleb.tar"
     original_link = worker_transfer.os.link
 
-    def racing_link(source: str, target: str) -> None:
+    def racing_link(source: str, target: str, **kwargs: object) -> None:
         destination.write_bytes(b"raced")
-        original_link(source, target)
+        original_link(source, target, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(worker_transfer.os, "link", racing_link)
 
@@ -348,7 +357,7 @@ def test_download_cannot_overwrite_a_file_created_at_materialization(
         download(URL, str(destination))
 
     assert destination.read_bytes() == b"raced"
-    assert list(tmp_path.iterdir()) == [destination]
+    assert _staged_entries(tmp_path) == [destination.name]
 
 
 @pytest.mark.parametrize("destination", ["relative.tar", "/workspace/dir/", "", " /workspace/x"])

@@ -361,6 +361,25 @@ Download:
         ->
     extract
 
+A large artifact (default threshold 64 MiB) whose expected size is known is downloaded as
+inclusive HTTP byte ranges by a bounded rolling window of concurrent streams (default 8,
+maximum 16), each written at its own offset in a sibling staging file. The window is
+bounded by the configured concurrency rather than by the range count, so an enormous
+expected size does not allocate proportional work items. Resumability requires the expected
+SHA-256: with it, the transfer stages into a deterministic
+`<destination>.wavcse-partial` file and records completed ranges in
+`<destination>.wavcse-partial.json`, which holds no presigned URL, so a later invocation
+that receives a fresh URL resumes instead of restarting from byte zero. Without it, the
+transfer is still parallel but one-shot, with no persisted state and no reuse of any
+earlier ranges. One destination has one transfer at a time, whatever transport it uses, serialized by
+`<destination>.wavcse-transfer.lock`, whose lifetime does not depend on the staging file
+being released at completion. The destination is created by linking the verified staging
+inode rather than by moving a pathname, so `--overwrite` removes the previous entry first
+and the destination name is briefly absent; the destination is only ever written after the
+assembled file matches the expected size and, when supplied, the whole-object SHA-256, and
+completion of individual ranges is never treated as artifact integrity. Small or size-unknown objects
+keep the single-connection path.
+
 Upload:
 
     worker produces artifact
