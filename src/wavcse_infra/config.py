@@ -136,6 +136,35 @@ class StorageConfig(FrozenModel):
             raise ValueError(str(exc)) from exc
 
 
+class JobsConfig(FrozenModel):
+    """Worker-side job workspace, reviewed runner location, and bounded defaults."""
+
+    worker_root: str = Field(default="/workspace/wavcse-jobs", min_length=1, max_length=1024)
+    runner_path: str = Field(
+        default="/root/.local/state/wavcse-worker/job_runner.py",
+        min_length=1,
+        max_length=1024,
+    )
+    default_timeout_seconds: int = Field(default=86400, ge=1, le=604800)
+    log_tail_bytes: int = Field(default=262144, ge=1024, le=16 * 1024 * 1024)
+
+    @field_validator("worker_root", "runner_path")
+    @classmethod
+    def absolute_worker_path(cls, value: str) -> str:
+        """Require an unambiguous absolute worker path without traversal segments."""
+
+        normalized = value.strip()
+        if normalized != value:
+            raise ValueError("worker paths must not start or end with whitespace")
+        if not normalized.startswith("/"):
+            raise ValueError("worker paths must be absolute")
+        if normalized != "/" and normalized.endswith("/"):
+            raise ValueError("worker paths must not end with a separator")
+        if any(segment in {"", ".", ".."} for segment in normalized.split("/")[1:]):
+            raise ValueError("worker paths must not contain empty, '.' or '..' segments")
+        return normalized
+
+
 class SshConfig(FrozenModel):
     """Controller-side worker SSH execution and bounded polling settings."""
 
@@ -162,6 +191,7 @@ class Settings(FrozenModel):
 
     aws: AwsConfig = AwsConfig()
     controller: ControllerConfig = ControllerConfig()
+    jobs: JobsConfig = JobsConfig()
     paths: PathsConfig = PathsConfig()
     runpod: RunPodConfig = RunPodConfig()
     storage: StorageConfig = StorageConfig()
@@ -216,6 +246,10 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
         "ssh",
         "max_poll_interval_seconds",
     ),
+    "WAVCSE_INFRA_JOBS_WORKER_ROOT": ("jobs", "worker_root"),
+    "WAVCSE_INFRA_JOBS_RUNNER_PATH": ("jobs", "runner_path"),
+    "WAVCSE_INFRA_JOBS_DEFAULT_TIMEOUT_SECONDS": ("jobs", "default_timeout_seconds"),
+    "WAVCSE_INFRA_JOBS_LOG_TAIL_BYTES": ("jobs", "log_tail_bytes"),
     "WAVCSE_INFRA_WAVCSE_PATH": ("paths", "wavcse"),
 }
 

@@ -26,6 +26,45 @@ from wavcse_infra.models import (
 DEFAULT_STATE_PATH = Path("~/.local/state/wavcse-infra/workers.json")
 
 
+def write_json_atomically(path: Path, payload: object) -> None:
+    """Replace one JSON document with a same-directory temporary file and atomic rename.
+
+    The containing directory is created with mode 0700 and the document with mode 0600,
+    because controller-side operational state may name workers, jobs, and paths but must
+    never contain credentials. The temporary file is removed when the write fails.
+    """
+
+    directory = path.parent
+    temporary_path: Path | None = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=directory,
+            prefix=f".{path.stem}-",
+            suffix=".tmp",
+        )
+        temporary_path = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as state_file:
+            json.dump(payload, state_file, indent=2, sort_keys=True)
+            state_file.write("\n")
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        directory_descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OSError as exc:
+        raise StateError(f"Could not atomically write state {path}: {exc}") from exc
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 class WorkerRecord(BaseModel):
     """Non-secret local metadata for one wavcse-infra-created worker."""
 
@@ -329,40 +368,7 @@ class WorkerStateStore:
             raise StateError(f"Could not read worker state {self.path}: {exc}") from exc
 
     def _write(self, document: _StateDocument) -> None:
-        directory = self.path.parent
-        temporary_path: Path | None = None
-        try:
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            directory.chmod(0o700)
-            descriptor, temporary_name = tempfile.mkstemp(
-                dir=directory,
-                prefix=".workers-",
-                suffix=".tmp",
-            )
-            temporary_path = Path(temporary_name)
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as state_file:
-                json.dump(
-                    document.model_dump(mode="json"),
-                    state_file,
-                    indent=2,
-                    sort_keys=True,
-                )
-                state_file.write("\n")
-                state_file.flush()
-                os.fsync(state_file.fileno())
-            os.replace(temporary_path, self.path)
-            temporary_path = None
-            directory_descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
-        except OSError as exc:
-            raise StateError(f"Could not atomically write worker state {self.path}: {exc}") from exc
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+        write_json_atomically(self.path, document.model_dump(mode="json"))
 
 
 def _known_running_price(

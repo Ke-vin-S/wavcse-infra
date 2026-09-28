@@ -448,6 +448,43 @@ def test_upload_digest_describes_the_bytes_actually_sent(
     assert result["sha256"] != DIGEST
 
 
+def test_job_upload_rejects_symlinks_and_lexical_escapes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "job"
+    outputs = workspace / "outputs"
+    outputs.mkdir(parents=True)
+    outside = _write_source(tmp_path)
+    (outputs / "linked-file").symlink_to(outside)
+    (workspace / "linked-dir").symlink_to(tmp_path, target_is_directory=True)
+    transport = _install(monkeypatch, FakeTransport())
+
+    for source in (
+        outputs / "linked-file",
+        workspace / "linked-dir" / "artifact.tar",
+        workspace / ".." / "artifact.tar",
+        outside,
+    ):
+        with pytest.raises((TransferInputError, TransferError)):
+            upload(URL, str(source), allowed_root=str(workspace))
+    assert transport.calls == []
+
+
+def test_job_upload_accepts_a_regular_file_inside_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "job"
+    outputs = workspace / "outputs"
+    outputs.mkdir(parents=True)
+    source = _write_source(outputs)
+    transport = _install(monkeypatch, FakeTransport())
+
+    result = upload(URL, str(source), allowed_root=str(workspace))
+
+    assert result["sha256"] == DIGEST
+    assert transport.uploaded == [PAYLOAD]
+
+
 def test_upload_reports_http_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install(monkeypatch, FakeTransport(error=_http_error(403)))
     source = _write_source(tmp_path)

@@ -3,9 +3,9 @@
 ## Boundaries
 
 `wavcse-infra` owns infrastructure bootstrap, provider communication, controller
-diagnostics, Pod lifecycle, SSH readiness, and worker bootstrap. Later phases add
-exact-commit execution and artifact transport. It does not own research code,
-experiment semantics, model dependencies, or MLflow instrumentation.
+diagnostics, Pod lifecycle, SSH readiness, worker bootstrap, exact-commit job execution,
+and artifact transport. It does not own research code, experiment semantics, model
+dependencies, or MLflow instrumentation.
 
 The components are:
 
@@ -41,8 +41,41 @@ direct SSH stdin stream rather than as a process argument, and worker-side code 
 AWS credential.
 
 Phase 5 adds canonical S3 access, version 1 artifact manifests, and worker artifact
-transfer. It does not perform repository checkout, research dependency installation,
-or job execution.
+transfer. Phase 6 adds the versioned job specification, exact-commit materialization,
+detached execution, status, logs, cancellation, and durable output persistence. Research
+dependency installation remains an explicit argv declared by the job, not an infra-owned
+package manager.
+
+## Recorded job flow
+
+```text
+infra job submit jobs/dg-0004.json --worker <id>
+  -> validate the version 1 JSON specification
+  -> require provider RUNNING + locally READY worker (never create/bootstrap/destroy here)
+  -> install worker/job_runner.py at jobs.runner_path, verified by SHA-256
+  -> create <jobs.worker_root>/<job-id>/{source,inputs,outputs,logs,state}
+  -> clone/fetch/checkout spec.source.commit; verify HEAD == commit; require a clean tree
+  -> materialize declared inputs from S3 through presigned GET (Phase 5)
+       -> required input failure aborts before the command starts
+  -> start the command detached in the worker's own session
+       -> verify HEAD and clean tree again before setup and command argv
+       -> stdout/stderr -> logs/job.log, exit code -> state/finished.json
+
+infra job status <job-id>
+  -> read worker evidence (state files recording the commit verified at launch) over direct SSH
+  -> persist declared outputs through presigned PUT + controller size verification
+  -> SUCCEEDED only when the command exited 0 and every required output is persisted
+  -> CANCELLED when a cancellation was recorded and the command did not exit 0
+  -> FAILED with the exit code, stage, and timeout flag preserved
+
+infra job logs <job-id>      -> bounded tail of logs/job.log (or the local copy)
+infra job cancel <job-id>    -> terminate the job's process group only; never the worker
+```
+
+The controller keeps one durable non-secret document per job beneath
+`~/.local/state/wavcse-infra/jobs/<job-id>.json` plus a bounded local log copy. Provider
+state and the worker's own files remain authoritative; a local record is never upgraded to
+`SUCCEEDED` from a stale assumption.
 
 ## Implemented modules
 
@@ -82,7 +115,27 @@ or job execution.
 - `storage/transfer.py` presigns, streams that module over direct SSH stdin with the URL
   on the same stream, parses the worker result strictly, and verifies uploaded objects.
 - `redaction.py` removes authorization values, known secret assignments, and URL
-  query strings from user-facing external errors.
+  query strings from user-facing external errors, and provides the shared
+  `contains_bearer_material` check used by manifests and job specifications.
+- `jobs/models.py` defines the version 1 job specification, the explicit job state
+  machine, and the durable job record; it rejects branches, short prefixes, shell command
+  strings, traversal paths, reserved environment names, and bearer values.
+- `jobs/state.py` stores one atomic, non-secret JSON document per job plus a bounded local
+  log copy beneath `~/.local/state/wavcse-infra/jobs/`.
+- `jobs/execution.py` installs the reviewed worker runner (digest-verified), drives
+  `prepare`/`start`/`inspect`/`logs`/`cancel` over direct SSH, and parses the runner's
+  schema-versioned protocol strictly. Descriptors, including secret values, travel on
+  stdin and never in an argument list.
+- `jobs/collect.py` maps declared inputs/outputs to worker paths inside the job workspace
+  and refuses any path that escapes it.
+- `jobs/submit.py` enforces worker preconditions, resolves declared secrets from the
+  controller environment, materializes inputs, verifies the commit, starts the job, and
+  records FAILED with evidence when a phase fails.
+- `jobs/status.py` reconciles job state from worker evidence, persists declared outputs,
+  captures a bounded local log copy, and implements idempotent cancellation.
+- `worker/job_runner.py` is the stdlib-only, Python 3.10-compatible worker program: it
+  materializes the exact commit, supervises detached execution with a timeout, reports
+  status, tails logs, and terminates only its own process group.
 - `controller/bootstrap.sh` converges supported Ubuntu controllers on required tools
   and the locked project environment, then delegates controller agent installation.
 - `controller/install-agents.sh` installs pinned, verified OMP, Codex CLI, and AGF
@@ -209,6 +262,8 @@ Missing optional provider fields remain `None`; the parser does not invent metad
 
 ## Deferred architecture
 
-Exact-commit checkout/execution, research environments, MLflow execution, jobs, and
-scheduling remain deferred. S3 remains the artifact transport; direct SSH carries only
-the small transfer program and its presigned URL on stdin, never artifact bytes.
+Research dependency installation beyond an explicit declared argv, multi-worker
+scheduling, resume/checkpoint orchestration, multipart artifact upload, and automatic
+worker provisioning remain deferred. S3 remains the artifact transport; direct SSH carries
+only small reviewed programs, their descriptors, and presigned URLs on stdin, never
+artifact bytes.

@@ -581,3 +581,150 @@ cryptographic confirmation happens only where the bytes are read. Artifact integ
 therefore rests on the creation step being trustworthy, which is why manifests validate
 digest form, forbid bearer material, and require a full Git commit ID rather than a
 branch name when a generator commit is recorded.
+
+## ADR-017: Recorded jobs execute a verified commit and prove it per phase
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+
+### Context
+
+Phase 6 must make a recorded experiment reproducible. A specification could name a
+branch, a tag, a short prefix, or a working tree, and any of those would identify
+different bytes at different times. The controller also cannot observe what actually ran
+unless the machine that executed the job reports it independently.
+
+### Decision
+
+Require a full 40- or 64-character commit object ID in a version 1 JSON job
+specification, and make the worker resolve, check out, and verify it:
+
+```text
+spec.source.commit
+  -> git clone --no-checkout --filter=blob:none --no-tags --depth 1
+  -> git fetch --depth 1 origin <commit>   (fallback: full fetch, then require the object)
+  -> git checkout --detach --force <commit>
+  -> git rev-parse HEAD  ==  spec.source.commit   (hard failure otherwise)
+  -> git status --porcelain must be empty
+```
+
+The controller requires the executing worker to report `HEAD` back, and compares it with
+the requested commit before starting the command; the worker repeats the comparison at
+start time. A mismatch is fatal on both sides, and the durable record stores the reported
+executed commit. Source materialization is anonymous HTTPS only, so a disposable worker
+never receives a GitHub credential or key.
+
+### Alternatives considered
+
+- Branch, tag, or `HEAD` references: rejected because they move and cannot identify an
+  experiment.
+- Trusting the controller's clone and shipping a working tree: rejected because the
+  worker would then execute unverified bytes and GitHub would stop being the source of
+  truth for the run.
+- Recording the requested commit as executed: rejected because the run would then claim
+  provenance it never proved.
+- Private-source credentials on the worker: rejected; the wavCSE repository is reachable
+  anonymously over HTTPS, and a read-only mechanism would be needed before supporting a
+  private remote.
+
+### Consequences
+
+A commit that has not been pushed cannot be executed; the failure names that explicitly.
+Dirty in-place debugging on a worker is impossible in Phase 6. Git LFS blobs are
+deliberately not fetched (`GIT_LFS_SKIP_SMUDGE=1`), so a job that needs large LFS content
+must materialize it as a declared S3 input instead.
+
+## ADR-018: Detached workered execution without a daemon or tmux
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+
+### Context
+
+A recorded GPU job can run for hours. If the job were a child of the SSH session, closing
+the terminal or losing the connection would kill it, and job status would be unknown. The
+controller is stoppable, so nothing durable may live only in a controller-side process
+either. Phase 4 installs only stable Ubuntu prerequisites and no process multiplexer; the
+architecture forbids adding a worker daemon.
+
+### Decision
+
+Install one reviewed, stdlib-only Python file (`worker/job_runner.py`) on the worker at
+`jobs.runner_path`, verified by SHA-256 and written atomically, and drive it with one
+bounded SSH command per phase. `start` launches a supervisor in a new session
+(`start_new_session=True`) with the job's environment, stdout/stderr appended to
+`logs/job.log`, and no controlling terminal, so the job survives SSH disconnection and
+controller exit. Each stage runs in its own process group so a timeout or cancellation can
+terminate the whole tree without signalling the supervisor or anything else.
+
+Status, logs, and cancellation are read from the worker's own recorded files
+(`state/pid.json`, `state/finished.json`, `state/cancelled.json`, `logs/job.log`). No
+tmux, no daemon, no message queue, and no controller-side long-running process.
+
+### Alternatives considered
+
+- tmux on workers: rejected because Phase 4 does not install it, adding it would grow the
+  worker bootstrap contract, and a session multiplexer is not needed to detach one job.
+- `nohup`/`setsid` around a shell string: rejected because the exit status, timeout, and
+  cancellation logic would become an un-reviewed shell program rather than a tested one.
+- A worker-side job service or queue: rejected as a daemon, explicitly out of scope.
+- Keeping the job as an SSH child: rejected because a dropped connection would kill a
+  multi-hour experiment and destroy its status.
+
+### Consequences
+
+Because the runner is installed at a path, a running job keeps executing the reviewed code
+it started with, and reinstalling an identical digest is a no-op. Cancellation verifies
+the recorded `/proc/<pid>/stat` process start time and process-group identity before
+signalling; a pidfd pins the PID during signalling, and the supervisor command line is
+checked too. A worker that disappears leaves the job
+record with `worker_absent` and an explicitly unknown outcome instead of a false
+`RUNNING`.
+
+## ADR-019: wavCSE keeps MLflow ownership; Phase 6 supplies provenance and secrets by name
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+
+### Context
+
+wavCSE already creates MLflow runs (`improvements/mlflow_utils.py`, driven by each run
+script) and loads `MLFLOW_TRACKING_*` from a gitignored `.env`. Writing MLflow runs from
+`wavcse-infra` would duplicate and then compete with the research layer, and inventing a
+second tracking mechanism is forbidden. At the same time, a real research run needs its
+tracking credentials on the worker, and the repository forbids sending controller
+credentials to workers.
+
+### Decision
+
+`wavcse-infra` never writes to MLflow and never creates a run. Phase 6 supplies the
+non-secret provenance environment the specification already documents (`INFRA_PROVIDER`,
+`INFRA_WORKER_ID`, `INFRA_GPU`, `INFRA_GPU_COUNT`, `INFRA_GIT_COMMIT`, `INFRA_JOB_ID`,
+`INFRA_WORKER_NAME`) for wavCSE to log, and records the same facts locally.
+
+Job tracking credentials are referenced by *name* only, in
+`runtime.environment_secrets`. At submit time the controller resolves those names from its
+own process environment and sends the values inside the descriptor JSON on the SSH stdin
+stream. They are never written to the specification, local state, logs, command lines, or
+worker files. Reserved name families (`AWS_`, `RUNPOD_`, `WAVCSE_`, `INFRA_`, `SSH_`, and
+anything containing `PRIVATE_KEY`) are rejected, so a specification cannot request a
+controller credential.
+
+### Alternatives considered
+
+- Creating MLflow runs in `wavcse-infra`: rejected as a competing layer that would
+  misattribute research metadata.
+- Copying a controller `.env` or credential file to the worker: rejected because workers
+  are less trusted and must not receive durable controller credentials.
+- Putting the tracking token in the job specification or local state: rejected because
+  specifications and state are reviewable, persisted artifacts.
+- Passing secrets as remote argv: rejected because process argument lists are visible to
+  other processes on the worker.
+
+### Consequences
+
+A job that needs MLflow reporting declares `runtime.environment_secrets` and the operator
+exports those variables in the submitting shell. Missing values fail before any record is
+created. The worker holds the values only in process memory for the life of the job, which
+matches the existing threat assumption that a compromised worker may expose short-lived
+values delivered to it.

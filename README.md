@@ -11,7 +11,7 @@ repository.
 
 ## Delivery status
 
-The repository currently implements Phases 0–5 of the v1 specification:
+The repository currently implements Phases 0–6 of the v1 specification:
 
 - a typed `infra` CLI and layered TOML/environment configuration;
 - Ruff, pytest, ShellCheck, and shfmt validation;
@@ -39,10 +39,28 @@ The repository currently implements Phases 0–5 of the v1 specification:
   materialization, optional expected-checksum enforcement, and controller-side size
   verification of the stored object;
 - provider-neutral worker/request/offer models and bounded retries for safe reads;
+- a versioned JSON job specification that rejects branches, short prefixes, shell command
+  strings, traversal paths, reserved environment names, and bearer values;
+- an explicit job state machine (`PENDING`, `PREPARING`, `RUNNING`, `SUCCEEDED`, `FAILED`,
+  `CANCELLED`) with frozen terminal states and durable non-secret records;
+- one reviewed, SHA-256-verified worker runner installed over SSH and driven one bounded
+  command per phase, with no worker daemon, tmux, or message queue;
+- exact-commit source materialization with detached checkout, `HEAD` verification on both
+  sides, a clean-tree requirement, and anonymous HTTPS-only access;
+- detached execution that survives SSH or controller interruption, with an enforced
+  timeout and a combined stdout/stderr log;
+- `infra job submit`, `status`, `logs`, and `cancel`, where cancellation targets only the
+  job's own verified process group and never the worker;
+- declared inputs materialized through Phase 5 presigned GET before the command starts,
+  and declared outputs persisted through presigned PUT plus controller size verification
+  before `SUCCEEDED` is recorded;
+- non-secret execution provenance handed to the research process as `INFRA_*` variables
+  while MLflow run creation stays owned by wavCSE;
 - initial architecture, security, operations, provider, and decision documentation.
 
-Phase 5 stops at artifact storage and worker transfer. Exact-commit wavCSE checkout,
-research environments, jobs, MLflow runs, and scheduling remain unimplemented.
+Phase 6 stops at single-job execution against an explicitly provided worker. Automatic
+provisioning, multi-worker scheduling, resume orchestration, and research dependency
+installation beyond an explicit declared argv remain unimplemented.
 
 ## Architecture
 
@@ -196,6 +214,10 @@ infra storage presign-upload <artifact> [--expires-in <seconds>] [--overwrite]
 infra storage verify <artifact> [--expected-size <bytes>] [--manifest <key> | --manifest-file <path>]
 infra storage download <artifact> <absolute-worker-path> --worker <exact-worker-id>
 infra storage upload <artifact> <absolute-worker-path> --worker <exact-worker-id> [--overwrite]
+infra job submit <job-spec.json> --worker <exact-worker-id> [--wait] [--wait-timeout <seconds>]
+infra job status <job-id> [--json]
+infra job logs <job-id> [--tail-bytes <n>] [--local]
+infra job cancel <job-id> [--json]
 ```
 
 Global `--config`, `--runpod-api-url`, `--runpod-timeout`, and `--verbose` options must
@@ -294,6 +316,61 @@ the object body is never downloaded back to the controller.
 Git stores code and small metadata, not generated tensors or archives. MLflow/DagsHub
 continues to own experiment metadata.
 
+## Recorded job model
+
+Phase 6 executes one versioned JSON job specification on one explicit worker the operator
+already created and bootstrapped. It never creates, starts, bootstraps, or destroys a
+worker, and it never reruns a failed job.
+
+A job names an anonymous `https://` repository plus a **full commit ID**. The worker
+clones, fetches that exact object, checks it out detached, requires a clean tree, and
+reports `HEAD`; the controller compares that report with the requested commit before the
+command starts. A mismatch is a hard failure, so a recorded experiment can never claim
+provenance it did not prove.
+
+```json
+{
+  "schema_version": 1,
+  "name": "dg-0004-seed-42",
+  "source": {
+    "repository": "https://github.com/Synergy-io/wavCSE.git",
+    "commit": "<full 40 or 64 character commit ID>"
+  },
+  "setup": {"argv": ["uv", "sync", "--locked"]},
+  "command": {"argv": ["uv", "run", "python", "-m", "improvements.run_improvements"]},
+  "runtime": {
+    "timeout_seconds": 21600,
+    "environment_secrets": ["MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_PASSWORD"]
+  },
+  "inputs": [{"artifact": "embeddings/wavcse-base-v1-minpool/voxceleb-minpooling.tar",
+              "destination": "voxceleb-minpooling.tar",
+              "manifest": "embeddings/wavcse-base-v1-minpool/voxceleb-minpooling.manifest.json"}],
+  "outputs": [{"path": "outputs/kfold_summary.json",
+               "artifact": "jobs/dg-0004-seed-42/kfold_summary.json"}]
+}
+```
+
+Commands are argv arrays; a shell command string is not representable and no shell is
+used. Declared secrets are referenced by name, resolved from the submitting shell, and
+delivered on the SSH stdin stream, so no value reaches a specification, a local record, a
+log line, or a process argument list. Each job runs in its own worker-side directory
+(`<jobs.worker_root>/<job-id>/{source,inputs,outputs,logs,state}`), detached in its own
+session so an SSH or controller interruption does not kill it.
+
+Status is derived from the worker's own evidence. `SUCCEEDED` requires the command to exit
+0 **and** every required declared output to be persisted through S3 with its stored size
+verified by the controller; a missing required input prevents the command from starting
+at all. Failures keep their exit code, stage, timeout flag, logs, and provenance, and
+optional outputs are still persisted for debugging. `infra job cancel` terminates only the
+job's own verified process group. The controller keeps one durable non-secret record and a
+bounded log copy per job beneath `~/.local/state/wavcse-infra/jobs/`.
+
+wavCSE owns MLflow; `wavcse-infra` never creates a run. Each job receives non-secret
+`INFRA_*` provenance variables for the research process to log itself.
+
+See [Operations](docs/OPERATIONS.md#recorded-job-operations) for the job specification
+reference, operator procedure, and the two Phase 6 integration tests.
+
 ## Security model
 
 - The controller is trusted and uses its EC2 IAM role through the normal AWS SDK
@@ -310,6 +387,15 @@ continues to own experiment metadata.
   `accept-new`; changed keys are rejected. Global host verification is never disabled.
 - Artifacts are verified with streaming SHA-256; an S3 ETag is never treated as a
   SHA-256 checksum.
+- Recorded jobs execute a verified commit: the worker must report `HEAD` equal to the
+  requested object ID, or the job fails before the command runs. Source access is
+  anonymous HTTPS only, and Git LFS content is not fetched.
+- Declared job secrets are delivered by name reference on the SSH stdin stream, never as
+  argv, environment dumps, files, or durable state; reserved `AWS_`/`RUNPOD_`/`WAVCSE_`/
+  `INFRA_`/`SSH_` names are rejected so a specification cannot request a controller
+  credential.
+- `infra job cancel` signals only the job's own process group after verifying the PID, and
+  Phase 6 never destroys a worker automatically.
 
 See [Security](docs/SECURITY.md) for the threat assumptions and IAM guidance.
 

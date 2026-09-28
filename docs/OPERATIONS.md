@@ -40,6 +40,10 @@ Supported environment variables:
 | `WAVCSE_INFRA_S3_BUCKET` | Private canonical artifact bucket |
 | `WAVCSE_INFRA_S3_PREFIX` | Bucket prefix, default `wavcse` |
 | `WAVCSE_INFRA_S3_PRESIGN_EXPIRY_SECONDS` | Default presigned URL lifetime, 60–604800 |
+| `WAVCSE_INFRA_JOBS_WORKER_ROOT` | Worker-side isolated job workspace root |
+| `WAVCSE_INFRA_JOBS_RUNNER_PATH` | Absolute worker path of the reviewed job runner |
+| `WAVCSE_INFRA_JOBS_DEFAULT_TIMEOUT_SECONDS` | Default job timeout when a spec omits one |
+| `WAVCSE_INFRA_JOBS_LOG_TAIL_BYTES` | Bound for the captured local log copy |
 | `WAVCSE_INFRA_WAVCSE_PATH` | Controller wavCSE checkout |
 | `WAVCSE_INFRA_SSH_PRIVATE_KEY` | Dedicated worker key path |
 | `WAVCSE_INFRA_SSH_KNOWN_HOSTS_FILE` | Isolated worker known-hosts file |
@@ -544,6 +548,317 @@ replace an existing destination unless `--overwrite` is supplied, and a
 
 These tests use a small object on purpose. Do not use them to move the real embedding
 set; materialize the approximately 20 GiB archives only when a job actually needs them.
+
+## Recorded job operations
+
+Phase 6 executes one versioned job specification on one explicit, already-READY worker.
+It never creates, bootstraps, starts, or destroys a worker, and it never reruns a failed
+job; a new attempt is a new job ID.
+
+### Job specification version 1
+
+Job specifications are JSON so the infrastructure keeps a dependency-free, exact parser.
+The repository deliberately does not add a YAML dependency for this format.
+
+```json
+{
+  "schema_version": 1,
+  "name": "dg-0004-seed-42",
+  "source": {
+    "repository": "https://github.com/Synergy-io/wavCSE.git",
+    "commit": "<full 40 or 64 character commit ID>"
+  },
+  "setup": {"argv": ["uv", "sync", "--locked"]},
+  "command": {
+    "argv": ["uv", "run", "python", "-m", "improvements.run_improvements", "--model", "gbc"],
+    "working_directory": "improvements"
+  },
+  "runtime": {
+    "timeout_seconds": 21600,
+    "environment": {"PYTHONUNBUFFERED": "1"},
+    "environment_secrets": ["MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_PASSWORD"]
+  },
+  "inputs": [
+    {
+      "artifact": "embeddings/wavcse-base-v1-minpool/voxceleb-minpooling.tar",
+      "destination": "voxceleb-minpooling.tar",
+      "manifest": "embeddings/wavcse-base-v1-minpool/voxceleb-minpooling.manifest.json"
+    }
+  ],
+  "outputs": [
+    {"path": "outputs/kfold_summary.json", "artifact": "jobs/dg-0004-seed-42/kfold_summary.json"}
+  ],
+  "tracking": {"metadata": {"study": "DG-0004", "seed": "42"}}
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `source.repository` | Anonymous `https://` remote only; SSH remotes and credential-bearing URLs are rejected |
+| `source.commit` | Full immutable commit ID; branches, tags, short prefixes, and `HEAD` are rejected |
+| `setup.argv` | Optional reviewed environment preparation, run in the checkout before the command |
+| `command.argv` | Required argument vector. A shell command string is not representable |
+| `command.working_directory` | Optional relative subdirectory of the verified checkout |
+| `runtime.timeout_seconds` | Optional bound; defaults to `jobs.default_timeout_seconds` |
+| `runtime.environment` | Non-secret literal variables; credential-shaped and reserved names are rejected |
+| `runtime.environment_secrets` | Names resolved from the submitting shell; values are never persisted |
+| `inputs[].artifact` / `destination` / `manifest` / `sha256` | Phase 5 key and workspace-relative path; required inputs need a manifest or SHA-256 |
+| `outputs[].path` / `artifact` / `required` / `overwrite` | Worker path, S3 key, whether it gates success, replacement opt-in |
+| `tracking.metadata` | Non-secret pass-through labels; bearer values are rejected |
+
+Unknown fields, duplicate declarations, absolute or `..` paths, and path escapes are
+rejected before any worker is contacted. Output paths may not target `source/` or
+`state/`; upload also rejects symlink components. Required inputs without a manifest
+or SHA-256 are rejected because size alone does not identify their content.
+
+### Operator procedure
+
+```bash
+# 1. Export any tracking credentials the job references (values stay in this shell).
+export MLFLOW_TRACKING_USERNAME='...'
+export MLFLOW_TRACKING_PASSWORD='...'
+
+# 2. Confirm the worker is RUNNING and READY (bootstrap it first if not).
+infra worker show <exact-worker-id>
+infra worker health <exact-worker-id>
+
+# 3. Submit against that exact worker. --wait is optional.
+infra job submit jobs/dg-0004-seed-42.json --worker <exact-worker-id>
+
+# 4. Inspect it. status reconciles with the worker and persists declared outputs.
+infra job status <job-id>
+infra job logs <job-id> --tail-bytes 65536
+
+# 5. Cancel a run you no longer want. This kills only the job process tree.
+infra job cancel <job-id>
+```
+
+`infra job status` exits 1 when the job is `FAILED`, and 0 for `RUNNING`, `SUCCEEDED`, or
+`CANCELLED`. `--json` renders the complete durable record.
+
+### Job state machine
+
+```text
+PENDING -> PREPARING -> RUNNING -> SUCCEEDED
+   |           |           |
+   +-----------+-----------+-> FAILED
+   |           |           |
+   +-----------+-----------+-> CANCELLED
+```
+
+Terminal states are frozen: a retry is a new job ID. `SUCCEEDED` requires the command to
+exit 0 *and* every required declared output to be persisted and size-verified at the
+controller. A scientific failure is a failure: its exit code, stage, timeout flag, logs,
+and provenance are preserved, and optional outputs are still persisted for debugging.
+The executed commit is verified at launch; the research command and setup must be
+trusted not to replace source code during their own execution.
+
+### Local state and logs
+
+```text
+~/.local/state/wavcse-infra/jobs/<job-id>.json   durable non-secret record
+~/.local/state/wavcse-infra/jobs/<job-id>.log    bounded copy of the job's own output
+```
+
+Remote state lives in the job workspace on the worker:
+
+```text
+<jobs.worker_root>/<job-id>/
+├── source/           detached checkout of the verified commit
+├── inputs/           materialized Phase 5 artifacts
+├── outputs/          declared experiment outputs
+├── logs/job.log      combined stdout/stderr
+└── state/            pid, finished, cancelled, and non-secret descriptor copies
+```
+
+Logs are worker-side; the local copy is written when a job reaches a terminal state and is
+bounded by `jobs.log_tail_bytes`. Durable logs beyond that must be declared as outputs.
+
+### Provenance and MLflow ownership
+
+wavCSE owns MLflow. `wavcse-infra` never creates a run. Each job receives the non-secret
+variables `INFRA_PROVIDER`, `INFRA_WORKER_ID`, `INFRA_GPU`, `INFRA_GPU_COUNT`,
+`INFRA_GIT_COMMIT`, `INFRA_JOB_ID`, and `INFRA_WORKER_NAME` so the research process can
+log its own provenance, and the durable record keeps the same facts locally. See
+[ADR-019](DECISIONS.md#adr-019-wavcse-keeps-mlflow-ownership-phase-6-supplies-provenance-and-secrets-by-name).
+
+### Operator test 3 — first recorded job (paid, tiny)
+
+This is the minimal paid Phase 6 test. It is deliberately not training: it proves the
+exact commit, input materialization, execution, logs, status, output persistence, and that
+the worker survives. Manually create exactly one cheap worker using the Phase 3
+`infra worker create` cost guard with an explicit GPU and maximum price, then bootstrap
+it to READY using the Phase 4 procedure. Keep that worker alive for both tests.
+Other prerequisites are a configured bucket and the `KEY`/`SHA`/`SIZE` values printed
+by operator test 1.
+
+The job runs `python3` directly, so no research environment is needed. A real wavCSE run
+would instead declare `"setup": {"argv": ["uv", "sync", "--locked"]}` and a
+`uv run python -m improvements...` command.
+
+The runner also provides `WAVCSE_JOB_ID`, `WAVCSE_JOB_COMMIT`, `WAVCSE_JOB_DIRECTORY`, and
+`WAVCSE_JOB_LOG` to the job, which is how a command addresses its own `inputs/` and
+`outputs/` directories; job specifications may not set those names themselves.
+
+```bash
+cd ~/projects/wavcse-infra
+COMMIT="$(git -C ~/projects/wavCSE rev-parse HEAD)"        # a commit you have pushed
+WORKER_ID="<exact-ready-worker-id>"
+INPUT_KEY="scratch/phase5-probe-<value printed by operator test 1>.txt"
+INPUT_SHA="<SHA printed by operator test 1>"
+INPUT_SIZE="<SIZE printed by operator test 1>"
+OUTPUT_KEY="scratch/phase6-probe-$(date +%s%N).json"
+JOB_SPEC="$(mktemp /tmp/wavcse-phase6-job.XXXXXX.json)"
+JOB_RESULT="$(mktemp /tmp/wavcse-phase6-result.XXXXXX.json)"
+test -z "$(git -C ~/projects/wavCSE status --porcelain)"
+git -C ~/projects/wavCSE cat-file -e "${COMMIT}^{commit}"
+
+python3 - "$COMMIT" "$INPUT_KEY" "$INPUT_SHA" "$INPUT_SIZE" "$OUTPUT_KEY" >"${JOB_SPEC}" <<'JSON'
+import json, sys
+commit, input_key, input_sha, input_size, output_key = sys.argv[1:6]
+print(json.dumps({
+    "schema_version": 1,
+    "name": "phase6-probe",
+    "source": {"repository": "https://github.com/Synergy-io/wavCSE.git", "commit": commit},
+    "command": {"argv": [
+        "python3", "-c",
+        "import hashlib,json,os,pathlib,subprocess,sys;"
+        "root=pathlib.Path(os.environ['WAVCSE_JOB_DIRECTORY']);"
+        "head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip();"
+        "assert head==os.environ['INFRA_GIT_COMMIT'];"
+        "data=(root/sys.argv[1]).read_bytes();"
+        "target=root/sys.argv[2]; target.parent.mkdir(parents=True,exist_ok=True);"
+        "target.write_text(json.dumps({'bytes':len(data),"
+        "'sha256':hashlib.sha256(data).hexdigest(),"
+        "'job':os.environ['INFRA_JOB_ID'],"
+        "'worker':os.environ['INFRA_WORKER_ID'],"
+        "'commit':head}));"
+        "print('phase6 probe ok', os.path.basename(sys.argv[1]))",
+        "inputs/probe.txt", "outputs/probe.json"]},
+    "inputs": [{"artifact": input_key, "destination": "probe.txt",
+                "sha256": input_sha, "size_bytes": int(input_size)}],
+    "outputs": [{"path": "outputs/probe.json", "artifact": output_key}],
+    "tracking": {"metadata": {"test": "phase6-probe"}},
+}, indent=2))
+JSON
+
+infra job submit "${JOB_SPEC}" --worker "${WORKER_ID}" --wait --wait-timeout 900 --json > "${JOB_RESULT}"
+```
+
+The worker verifies the declared SHA-256 and size before materializing the input.
+Alternatively, use the Phase 5 sidecar manifest as the input's verification source.
+
+Read the returned job ID, verify the durable object's contents through a short-lived
+presigned GET, and confirm the worker is still READY. The URL stays on a pipe and is
+never printed or placed in a process argument.
+
+```bash
+JOB_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["job_id"])' "${JOB_RESULT}")"
+python3 - "${JOB_RESULT}" "${COMMIT}" <<'PY'
+import json, sys
+record = json.load(open(sys.argv[1]))
+assert record["state"] == "SUCCEEDED"
+assert record["requested_commit"] == record["executed_commit"] == sys.argv[2]
+assert record["exit_code"] == 0 and record["outputs"][0]["persisted"]
+PY
+infra job logs "${JOB_ID}"
+infra job status "${JOB_ID}" --json
+infra storage verify "${OUTPUT_KEY}"
+OUT_FILE="$(mktemp /tmp/wavcse-phase6-output.XXXXXX.json)"
+infra storage presign-download "${OUTPUT_KEY}" | python3 -c 'import sys,urllib.request;open(sys.argv[1],"wb").write(urllib.request.urlopen(sys.stdin.readline().strip()).read())' "${OUT_FILE}"
+python3 - "${OUT_FILE}" "${COMMIT}" "${INPUT_SHA}" "${INPUT_SIZE}" "${JOB_ID}" "${WORKER_ID}" "${JOB_RESULT}" <<'PY'
+import hashlib, json, sys
+output, commit, input_sha, input_size, job_id, worker_id, result = sys.argv[1:8]
+data = json.load(open(output))
+assert data == {"bytes": int(input_size), "sha256": input_sha,
+                "job": job_id, "worker": worker_id, "commit": commit}
+assert hashlib.sha256(open(output, "rb").read()).hexdigest() == json.load(open(result))["outputs"][0]["sha256"]
+PY
+infra worker health "${WORKER_ID}"     # the worker must still be alive
+```
+
+Expected: state `SUCCEEDED`, `Executed commit` and the persisted JSON `commit` equal to
+`COMMIT`, the log containing
+`phase6 probe ok probe.txt`, the output object present in S3, and the worker still
+`READY`. The worker is not stopped or destroyed by any of this.
+
+### Operator test 4 — deterministic job failure
+
+Prove that a scientific failure stays a failure:
+
+```bash
+FAIL_SPEC="$(mktemp /tmp/wavcse-phase6-fail.XXXXXX.json)"
+FAIL_RESULT="$(mktemp /tmp/wavcse-phase6-failure-result.XXXXXX.json)"
+FAIL_OUTPUT_KEY="scratch/phase6-failure-$(date +%s%N).json"
+python3 - "${COMMIT}" "${FAIL_OUTPUT_KEY}" >"${FAIL_SPEC}" <<'JSON'
+import json, sys
+print(json.dumps({
+    "schema_version": 1,
+    "name": "phase6-probe-failure",
+    "source": {"repository": "https://github.com/Synergy-io/wavCSE.git", "commit": sys.argv[1]},
+    "command": {"argv": ["python3", "-c",
+        "import json,os,pathlib,sys;"
+        "root=pathlib.Path(os.environ['WAVCSE_JOB_DIRECTORY']);"
+        "(root/'outputs/failure.json').write_text(json.dumps({'exit':9}));"
+        "print('intentional failure');sys.exit(9)"]},
+    "outputs": [{"path": "outputs/failure.json", "artifact": sys.argv[2],
+                 "required": False}],
+}, indent=2))
+JSON
+
+if infra job submit "${FAIL_SPEC}" --worker "${WORKER_ID}" --wait --wait-timeout 600 --json > "${FAIL_RESULT}"; then
+  echo "Unexpected success" >&2
+  exit 1
+fi
+FAIL_JOB_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["job_id"])' "${FAIL_RESULT}")"
+python3 - "${FAIL_RESULT}" <<'PY'
+import json, sys
+record = json.load(open(sys.argv[1]))
+assert record["state"] == "FAILED" and record["exit_code"] == 9
+assert record["outputs"][0]["persisted"]
+PY
+infra job logs "${FAIL_JOB_ID}"
+infra job status "${FAIL_JOB_ID}" --json || test "$?" -eq 1
+infra storage verify "${FAIL_OUTPUT_KEY}"
+FAIL_OUT_FILE="$(mktemp /tmp/wavcse-phase6-failure-output.XXXXXX.json)"
+infra storage presign-download "${FAIL_OUTPUT_KEY}" | python3 -c 'import sys,urllib.request;open(sys.argv[1],"wb").write(urllib.request.urlopen(sys.stdin.readline().strip()).read())' "${FAIL_OUT_FILE}"
+python3 - "${FAIL_OUT_FILE}" "${FAIL_RESULT}" <<'PY'
+import hashlib, json, sys
+assert json.load(open(sys.argv[1])) == {"exit": 9}
+assert hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest() == json.load(open(sys.argv[2]))["outputs"][0]["sha256"]
+PY
+infra worker health "${WORKER_ID}"
+```
+
+Expected: `State: FAILED`, `Exit code: 9`, the log containing `intentional failure`,
+`state_reason` naming the exit code, the optional debug output persisted, submit exiting
+1, and the worker still alive and `READY`.
+
+### Job failure handling
+
+- `does not exist` / `is <state>; a recorded job requires a RUNNING worker`: start the
+  worker explicitly, then re-check readiness.
+- `local readiness is X, not READY`: run `infra worker bootstrap <worker-id>`.
+- `these secret environment variables ... are not set`: export them in the submitting
+  shell; nothing was recorded.
+- `the remote does not contain commit`: push the exact commit to GitHub.
+- `required input ... could not be materialized`: verify the Phase 5 key, manifest, and
+  declared size/digest; nothing was started.
+- `refusing to run a different revision`: stop and inspect; the worker reported a commit
+  that is not the one requested.
+- `required outputs were not persisted`: the command succeeded but a declared output is
+  missing on the worker or could not be uploaded. The object key may already exist from a
+  partial attempt; add `"overwrite": true` to that output only after inspecting it.
+- `worker ... no longer exists`: the job outcome is unknown and recorded as such. The
+  local record and any captured log copy are preserved.
+- `Warning: worker ... could not be inspected`: transient; the job may still be running.
+  Retry `infra job status` before drawing a conclusion.
+- `refusing to signal process ...`: the recorded PID no longer matches this job; nothing
+  was killed. Inspect the worker session manually.
+- `No such file or directory` for the runner path: the worker filesystem was reset or the
+  worker was rebuilt. `infra job submit` installs the reviewed runner, so submit a new job
+  after re-bootstrapping (`infra worker bootstrap <worker-id>`); the previous job's outcome
+  is unrecoverable and should be recorded as unknown.
 
 ## Controller reconstruction
 

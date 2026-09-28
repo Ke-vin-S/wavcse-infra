@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -19,6 +20,8 @@ from wavcse_infra.doctor import CheckStatus, DoctorReport, run_doctor
 from wavcse_infra.errors import (
     ConfigurationError,
     InfraError,
+    JobError,
+    JobSpecError,
     ProviderError,
     ProviderNotFoundError,
     SshEndpointUnavailableError,
@@ -26,6 +29,19 @@ from wavcse_infra.errors import (
     StorageError,
     StorageObjectNotFoundError,
 )
+from wavcse_infra.jobs.collect import resolve_output_source
+from wavcse_infra.jobs.context import JobContext
+from wavcse_infra.jobs.execution import JobExecutor
+from wavcse_infra.jobs.models import (
+    JobRecord,
+    JobSpec,
+    JobState,
+    load_job_spec,
+    validate_job_id,
+)
+from wavcse_infra.jobs.state import JobStateStore
+from wavcse_infra.jobs.status import JobCoordinator
+from wavcse_infra.jobs.submit import JobSubmitter
 from wavcse_infra.models import (
     CloudType,
     Worker,
@@ -62,9 +78,11 @@ app = typer.Typer(
 config_app = typer.Typer(help="Validate controller configuration.", no_args_is_help=True)
 worker_app = typer.Typer(help="Manage RunPod GPU workers.", no_args_is_help=True)
 storage_app = typer.Typer(help="Inspect and transfer canonical S3 artifacts.", no_args_is_help=True)
+job_app = typer.Typer(help="Submit and inspect recorded exact-commit jobs.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 app.add_typer(worker_app, name="worker")
 app.add_typer(storage_app, name="storage")
+app.add_typer(job_app, name="job")
 
 
 @dataclass(frozen=True)
@@ -1049,6 +1067,348 @@ def upload_artifact(
     _print_transfer_result(outcome.result)
     typer.echo("Controller verification of the stored object follows.")
     _print_storage_verification(outcome.verification, bucket=settings.storage.bucket or "-")
+
+
+@job_app.command("submit")
+def submit_job(
+    context: typer.Context,
+    job_spec: Annotated[
+        Path,
+        typer.Argument(
+            help="Version 1 JSON job specification file.",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ],
+    worker: Annotated[
+        str, typer.Option("--worker", help="Exact RunPod worker ID that executes the job.")
+    ],
+    wait: Annotated[
+        bool, typer.Option("--wait", help="Block until the job reaches a terminal state.")
+    ] = False,
+    wait_timeout: Annotated[
+        float | None,
+        typer.Option("--wait-timeout", min=1.0, help="Bounded wait in seconds with --wait."),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Submit one recorded job to an explicit existing READY worker.
+
+    The worker must already exist and be READY. Phase 6 never creates, bootstraps,
+    starts, or destroys a worker implicitly, and it never reruns a failed job.
+    """
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        spec = _load_job_spec_file(job_spec)
+        with RunPodClient.from_settings(settings) as client:
+            job_context = _job_context(client, settings)
+            record = JobSubmitter(job_context).submit(spec, worker_id=worker)
+            if wait:
+                result = JobCoordinator(job_context).wait(
+                    record.job_id,
+                    timeout_seconds=(
+                        wait_timeout
+                        if wait_timeout is not None
+                        else _default_wait_timeout(spec, settings)
+                    ),
+                )
+                _print_warning(result.warning)
+                record = result.record
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except JobSpecError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _job_failure(exc, job_id=None)
+    _print_job(record, json_output=json_output)
+    if record.state in {JobState.FAILED, JobState.CANCELLED}:
+        raise typer.Exit(code=1)
+
+
+@job_app.command("status")
+def status_job(
+    context: typer.Context,
+    job_id: Annotated[str, typer.Argument(help="Local job ID returned by `infra job submit`.")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Reconcile one job with real worker evidence and report its durable state."""
+
+    settings = _load_cli_settings(_context(context))
+    canonical = _canonical_job_id(job_id)
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            job_context = _job_context(client, settings)
+            result = JobCoordinator(job_context).refresh(canonical)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _job_failure(exc, job_id=canonical)
+    _print_warning(result.warning)
+    record = result.record
+    _print_job(record, json_output=json_output)
+    if record.state is JobState.FAILED:
+        raise typer.Exit(code=1)
+
+
+@job_app.command("logs")
+def logs_job(
+    context: typer.Context,
+    job_id: Annotated[str, typer.Argument(help="Local job ID returned by `infra job submit`.")],
+    tail_bytes: Annotated[
+        int | None,
+        typer.Option(
+            "--tail-bytes",
+            min=1,
+            max=16 * 1024 * 1024,
+            help="Maximum trailing bytes to read; defaults to jobs.log_tail_bytes.",
+        ),
+    ] = None,
+    local: Annotated[
+        bool,
+        typer.Option(
+            "--local",
+            help="Print the bounded local copy captured at finalization instead of the worker.",
+        ),
+    ] = False,
+) -> None:
+    """Print a job's combined stdout/stderr log without any protocol framing."""
+
+    settings = _load_cli_settings(_context(context))
+    canonical = _canonical_job_id(job_id)
+    store = _job_store()
+    if local:
+        text = store.read_log(canonical)
+        if text is None:
+            _job_failure(
+                JobError(
+                    f"No local log copy exists for job {canonical}; it is captured only when a "
+                    "job is finalized by `infra job status`"
+                ),
+                job_id=canonical,
+            )
+        typer.echo(text, nl=False)
+        return
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            job_context = _job_context(client, settings)
+            text = JobCoordinator(job_context).logs(canonical, tail_bytes=tail_bytes)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _job_log_fallback(store, canonical, exc)
+    typer.echo(text, nl=False)
+
+
+@job_app.command("cancel")
+def cancel_job(
+    context: typer.Context,
+    job_id: Annotated[str, typer.Argument(help="Local job ID returned by `infra job submit`.")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Cancel one running job process on its worker; the worker itself is untouched."""
+
+    settings = _load_cli_settings(_context(context))
+    canonical = _canonical_job_id(job_id)
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            job_context = _job_context(client, settings)
+            record = JobCoordinator(job_context).cancel(canonical)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _job_failure(exc, job_id=canonical)
+    if json_output:
+        _print_job(record, json_output=True)
+        return
+    if record.state is JobState.CANCELLED:
+        typer.echo(
+            f"Job {record.job_id} cancelled on RunPod worker {record.worker_id}; the worker "
+            "was not stopped or destroyed."
+        )
+    elif record.state is JobState.RUNNING:
+        if record.cancellation_requested_at is not None:
+            typer.echo(
+                f"Cancellation was requested for job {record.job_id}; the worker has not "
+                "reported a final outcome yet. Run `infra job status` again."
+            )
+        else:
+            typer.echo(f"Job {record.job_id} is still RUNNING; no cancellation was applied.")
+    else:
+        typer.echo(f"Job {record.job_id} is already {record.state.value}; nothing was cancelled.")
+    _print_job(record, json_output=False)
+
+
+def _load_job_spec_file(path: Path) -> JobSpec:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigurationError(f"Could not read job specification {path}: {redact(exc)}") from exc
+    return load_job_spec(text, source=str(path))
+
+
+def _canonical_job_id(job_id: str) -> str:
+    try:
+        return validate_job_id(job_id)
+    except JobSpecError as exc:
+        _configuration_failure(exc)
+
+
+def _job_store() -> JobStateStore:
+    return JobStateStore()
+
+
+def _optional_storage(settings: Settings) -> S3Storage | None:
+    try:
+        return S3Storage.from_settings(settings)
+    except ConfigurationError:
+        return None
+
+
+def _job_context(client: RunPodClient, settings: Settings) -> JobContext:
+    """Assemble the shared job collaborators for one CLI invocation."""
+
+    state_store = _state_store()
+    executor = SshExecutor(settings.ssh)
+    waiter = WorkerSshWaiter(client, executor, state_store, settings.ssh)
+    return JobContext(
+        provider=client,
+        worker_state=state_store,
+        job_store=_job_store(),
+        executor=JobExecutor(waiter, executor, settings.ssh, settings.jobs),
+        transfer=WorkerArtifactTransfer(waiter, executor, settings.ssh),
+        storage=_optional_storage(settings),
+        jobs_config=settings.jobs,
+        environ=os.environ,
+    )
+
+
+def _default_wait_timeout(spec: JobSpec, settings: Settings) -> float:
+    """Bound `--wait` by the job's own timeout plus a small finalization allowance."""
+
+    job_timeout = (
+        spec.runtime.timeout_seconds
+        if spec.runtime.timeout_seconds is not None
+        else settings.jobs.default_timeout_seconds
+    )
+    return float(job_timeout) + 300.0
+
+
+def _print_warning(warning: str | None) -> None:
+    if warning:
+        typer.echo(f"Warning: {redact(warning)}", err=True)
+
+
+def _print_job(record: JobRecord, *, json_output: bool) -> None:
+    if json_output:
+        _print_json(record.model_dump(mode="json"))
+        return
+    fields = (
+        ("Job ID", record.job_id),
+        ("Name", record.name),
+        ("State", record.state.value),
+        ("Worker", record.worker_id),
+        ("Provider", record.provenance.provider),
+        ("Requested commit", record.requested_commit),
+        ("Executed commit", record.executed_commit),
+        ("Exit code", record.exit_code),
+        ("Worker PID", record.pid),
+        ("Job directory", record.job_directory),
+        ("Log path", record.log_path),
+        ("Log bytes", record.log_bytes),
+        ("Created", record.created_at.isoformat()),
+        ("Started", record.started_at.isoformat() if record.started_at else None),
+        ("Finished", record.finished_at.isoformat() if record.finished_at else None),
+        ("Remote status", record.remote_status),
+        ("Reason", record.state_reason),
+        ("Failure", record.failure_reason),
+        ("Worker absent", "yes" if record.worker_absent else "no"),
+        ("GPU", ", ".join(record.provenance.gpu_models) or None),
+        ("GPU count", record.provenance.gpu_count),
+        ("Bootstrap version", record.provenance.worker_bootstrap_version),
+        ("Infra version", record.provenance.infra_version),
+        ("MLflow owner", record.provenance.mlflow_owner),
+    )
+    for label, value in fields:
+        typer.echo(f"{label}: {value if value is not None else '-'}")
+    for job_input in record.inputs:
+        status = "materialized" if job_input.materialized else "NOT MATERIALIZED"
+        typer.echo(
+            f"Input: {job_input.artifact} -> inputs/{job_input.destination} "
+            f"({status}"
+            + (f", {job_input.size_bytes} bytes" if job_input.size_bytes is not None else "")
+            + (f", {job_input.sha256}" if job_input.sha256 else "")
+            + ")"
+            + (f" [{job_input.failure_reason}]" if job_input.failure_reason else "")
+        )
+    for output in record.outputs:
+        status = "persisted" if output.persisted else "NOT PERSISTED"
+        typer.echo(
+            f"Output: {output.path} -> {output.artifact} ({status}"
+            + (f", {output.size_bytes} bytes" if output.size_bytes is not None else "")
+            + (f", {output.sha256}" if output.sha256 else "")
+            + (f", required={output.required}" if output.required else ", optional")
+            + ")"
+            + (f" [{output.failure_reason}]" if output.failure_reason else "")
+        )
+    if record.spec.outputs:
+        typer.echo(
+            "Local output paths: "
+            + ", ".join(
+                resolve_output_source(record.job_directory, output)
+                for output in record.spec.outputs
+            )
+        )
+
+
+def _job_failure(exc: Exception, *, job_id: str | None) -> Never:
+    """Report an infrastructure failure and name the recorded job when one is known."""
+
+    prefix = f"Job {job_id}: " if job_id else ""
+    typer.echo(f"{prefix}{redact(exc)}", err=True)
+    if job_id and not _job_store().path_for(job_id).exists():
+        typer.echo(
+            f"No local record exists for job {job_id}; list durable records under "
+            f"{_job_store().directory}",
+            err=True,
+        )
+    raise typer.Exit(code=1) from exc
+
+
+def _job_log_fallback(store: JobStateStore, job_id: str, exc: Exception) -> Never:
+    """Print the locally captured log copy when the remote log cannot be read."""
+
+    typer.echo(f"Job {job_id}: {redact(exc)}", err=True)
+    local = store.read_log(job_id)
+    if local is None:
+        typer.echo(
+            "No local log copy was captured either; it is written only when a job reaches a "
+            "terminal state, and remote logs live on the worker.",
+            err=True,
+        )
+    else:
+        typer.echo(
+            "Remote log unavailable; showing the bounded local copy captured at finalization.",
+            err=True,
+        )
+        typer.echo(local, nl=False)
+    raise typer.Exit(code=1) from exc
 
 
 def _context(context: typer.Context) -> CliContext:

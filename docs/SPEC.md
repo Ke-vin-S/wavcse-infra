@@ -414,6 +414,13 @@ Research metadata may include:
 
 The infrastructure layer should pass metadata through but should not interpret research semantics unnecessarily.
 
+Implementation note (Phase 6): job specifications are version 1 JSON documents rather than
+YAML, because the infrastructure keeps a stdlib-only parser and does not add a YAML
+dependency for this format. The versioned specification, the explicit state machine, and
+the exact-commit verification contract are documented in
+[Operations](OPERATIONS.md#recorded-job-operations) and decided in
+[ADR-017](DECISIONS.md#adr-017-recorded-jobs-execute-a-verified-commit-and-prove-it-per-phase).
+
 # 17. Job submission
 
 Example:
@@ -445,6 +452,13 @@ Conceptual behavior:
 The first version may require the caller to specify a worker explicitly.
 
 Automatic scheduling is not required for initial v1.
+
+Implementation note (Phase 6): `infra job submit <job-spec.json> --worker <id>` requires
+an existing, locally READY worker and refuses to create, bootstrap, or start one. A
+required input that fails size or checksum verification prevents the command from
+starting. Submission records FAILED with the failing phase and evidence instead of
+silently discarding the attempt, and `infra job status` reconciles against the worker's
+own recorded state before reporting anything.
 
 # 18. Experiment scheduling
 
@@ -480,6 +494,13 @@ Infrastructure should ensure useful runtime metadata can be supplied to wavCSE, 
     INFRA_JOB_ID=...
 
 wavCSE may log these into MLflow.
+
+Implementation note (Phase 6): `wavcse-infra` never creates or writes an MLflow run. It
+supplies the non-secret `INFRA_*` variables above to the executed process and records the
+same facts (provider, worker, GPU, verified commit, job ID, timings, exit code, outputs) in
+its own durable job record. The research process's own tracking credentials are referenced
+by name only in the job specification and delivered on the SSH stdin stream; see
+[ADR-019](DECISIONS.md#adr-019-wavcse-keeps-mlflow-ownership-phase-6-supplies-provenance-and-secrets-by-name).
 
 # 20. Operational state
 

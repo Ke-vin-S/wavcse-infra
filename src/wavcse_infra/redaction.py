@@ -14,6 +14,19 @@ _SIGNED_PARAMETER_PATTERN = re.compile(
     r"(?i)\b(x-amz-(?:signature|credential|security-token)|awsaccesskeyid)"
     r"(\s*[:=]\s*)[^\s&;,]+"
 )
+# Bearer material that must never be persisted in local state or manifests, even when it
+# appears inside otherwise harmless free text.
+_BEARER_MATERIAL_PATTERN = re.compile(
+    r"(?i)(?:x-amz-(?:signature|credential|security-token|algorithm)|"
+    r"aws(?:accesskeyid|_access_key_id|_secret_access_key|_session_token)|"
+    r"runpod_api_key|authorization\s*[:=]|https?://\S+\?)"
+)
+
+
+def contains_bearer_material(text: str) -> bool:
+    """Return whether text carries a presigned URL, credential, or authorization value."""
+
+    return _BEARER_MATERIAL_PATTERN.search(text) is not None
 
 
 def redact(text: object) -> str:

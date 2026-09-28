@@ -84,6 +84,28 @@ It must never contain the RunPod key, authorization headers, SSM values, AWS
 credentials, private keys, or complete environment data. RunPod remains authoritative;
 the local file is not permission to delete a different or similarly named Pod.
 
+### Recorded jobs
+
+Job records and bounded log copies live beneath `~/.local/state/wavcse-infra/jobs/`. A
+record contains the normalized non-secret specification, the requested and independently
+verified executed commit, worker/GPU provenance, declared input and output outcomes,
+timestamps, exit code, and failure reason. It never contains the RunPod token, AWS
+credentials, private keys, presigned URLs, or the values of
+`runtime.environment_secrets`.
+
+Job tracking credentials are referenced by name only. At submit time the controller
+resolves them from its own process environment and sends the values on the SSH stdin
+stream inside the descriptor JSON, so they never appear in a process argument list, a
+durable record, a log line, or a worker file. Job environment entries may not use the
+reserved families `AWS_`, `RUNPOD_`, `WAVCSE_`, `INFRA_`, or `SSH_`, nor any name
+containing `PRIVATE_KEY`, so a specification cannot request a controller credential. A
+literal environment entry may not look like a credential by name or carry bearer-shaped
+content.
+
+The local log copy is produced from the job's own stdout/stderr. It is bounded by
+`jobs.log_tail_bytes` and is not scrubbed: a job that prints its own credentials has
+printed them. Infrastructure-produced text and errors are redacted as everywhere else.
+
 ### SSH
 
 Worker access uses the dedicated private key configured by `ssh.private_key`. Commands
@@ -226,6 +248,32 @@ The trust model is therefore: a digest is only as trustworthy as the producer th
 recorded it. A worker-reported digest after upload is producer-claimed evidence, the
 stored size is provider-verified evidence, and cryptographic confirmation requires
 something that actually reads the bytes.
+
+## Job execution and source integrity
+
+A recorded job executes an anonymous HTTPS checkout of a full Git commit. The worker
+receives no GitHub credential, deploy key, or token; the controller never copies a
+credential to a worker for source access. The worker resolves the commit, checks it out
+detached, requires a clean tree, and compares `HEAD` with the requested object ID; the
+controller requires the worker's reported commit to match before the command starts. A
+mismatch aborts the job on both sides, and the durable record stores the verified commit.
+The runner checks HEAD and cleanliness again immediately before setup and before the
+research command. A trusted research command can still change its own checkout or load
+external code after launch; `executed_commit` attests to the verified checkout at the
+command boundary, not to every instruction the command later runs.
+
+The reviewed worker runner is installed at `jobs.runner_path` after SHA-256 verification
+against the digest of the module in this repository, written through a same-directory
+temporary file. Only that reviewed path is executed, and only its installed digest is
+reused, so a running job keeps the code it started with. Job descriptors, including
+secret values, are delivered on the SSH stdin stream and never as argv.
+
+`infra job cancel` terminates the job's own process group after verifying its recorded
+Linux process start time and group identity; a pidfd pins the PID during signalling,
+and the supervisor command line is also checked.
+Cancellation never touches provider lifecycle: it cannot stop, start, or destroy a
+worker, and it refuses an unverifiable PID instead of signalling it. Phase 6 never
+destroys a worker automatically, including after a failed or cancelled job.
 
 ## Logging and redaction
 

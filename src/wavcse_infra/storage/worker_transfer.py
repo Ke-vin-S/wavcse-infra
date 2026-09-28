@@ -38,6 +38,7 @@ import hashlib
 import os
 import re
 import secrets
+import stat
 import sys
 import urllib.error
 import urllib.parse
@@ -206,16 +207,15 @@ def upload(
     source: str,
     *,
     if_none_match: bool = False,
+    allowed_root: str | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, str]:
     """Stream one local artifact to a presigned PUT URL and report its digest."""
 
     validate_presigned_url(url)
     origin = validate_worker_path(source, label="upload source")
-    if not os.path.isfile(origin):
-        raise TransferInputError(f"upload source is not a regular file: {origin!r}")
     try:
-        with open(origin, "rb") as body:
+        with _open_upload_source(origin, allowed_root) as body:
             size = os.fstat(body.fileno()).st_size
             if size > MAX_SINGLE_PUT_BYTES:
                 raise TransferInputError(
@@ -246,6 +246,35 @@ def upload(
     return {"path": origin, "size_bytes": str(size), "sha256": digest}
 
 
+def _open_upload_source(origin: str, allowed_root: str | None):
+    """Open a job output through directory fds, rejecting every symlink component."""
+
+    if allowed_root is None:
+        if not os.path.isfile(origin):
+            raise TransferInputError(f"upload source is not a regular file: {origin!r}")
+        return open(origin, "rb")
+    root = validate_worker_path(allowed_root, label="upload allowed root")
+    relative = os.path.relpath(origin, root)
+    parts = relative.split(os.sep)
+    if relative in {"", "."} or any(part in {"", ".", ".."} for part in parts):
+        raise TransferInputError("upload source must stay inside the allowed job workspace")
+    directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        source_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+            os.close(source_fd)
+            raise TransferInputError("upload source is not a regular file")
+        return os.fdopen(source_fd, "rb")
+    finally:
+        os.close(directory_fd)
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -271,7 +300,12 @@ def main(
                 overwrite=options.overwrite,
             )
         else:
-            fields = upload(presigned, options.source, if_none_match=WAVCSE_IF_NONE_MATCH)
+            fields = upload(
+                presigned,
+                options.source,
+                if_none_match=WAVCSE_IF_NONE_MATCH,
+                allowed_root=options.allowed_root,
+            )
     except TransferError as exc:
         err.write(f"{ERROR_KEY}\t{_safe_text(exc)}\n")
         return 1
@@ -336,6 +370,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
     send = subcommands.add_parser(UPLOAD_OPERATION, help="Upload one local artifact.")
     send.add_argument("--source", required=True, help="Absolute source file path.")
+    send.add_argument("--allowed-root", help="Confine a job output to this workspace.")
     return parser
 
 

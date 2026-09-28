@@ -155,3 +155,27 @@ class ArtifactSizeMismatchError(ArtifactTransferError):
 
 class ArtifactChecksumMismatchError(ArtifactTransferError):
     """Raised when an artifact does not match its expected SHA-256 digest."""
+
+
+class JobError(InfraError):
+    """Base class for sanitized job specification and execution failures."""
+
+
+class JobSpecError(JobError):
+    """Raised when a versioned job specification cannot be used as written."""
+
+
+class JobStateError(JobError):
+    """Raised when durable local job state cannot be read or transitioned safely."""
+
+
+class JobPreconditionError(JobError):
+    """Raised when an explicit worker cannot accept a recorded job yet."""
+
+
+class JobExecutionError(JobError):
+    """Raised when a remote job phase fails in a way the operator must fix."""
+
+
+class JobCancellationError(JobError):
+    """Raised when a running job process cannot be cancelled safely."""

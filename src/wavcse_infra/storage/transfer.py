@@ -209,6 +209,7 @@ class WorkerArtifactTransfer:
         storage: S3Storage,
         source: str,
         key: str,
+        allowed_root: str | None = None,
         overwrite: bool = False,
         expires_in_seconds: int | None = None,
         wait_timeout_seconds: float | None = None,
@@ -221,11 +222,15 @@ class WorkerArtifactTransfer:
         presigned = storage.presign_upload(
             key, expires_in_seconds=expires_in_seconds, overwrite=overwrite
         )
+        arguments = ["--source", source]
+        if allowed_root is not None:
+            _worker_path(allowed_root, label="upload allowed root")
+            arguments.extend(("--allowed-root", allowed_root))
         result = self._execute(
             worker_id,
             presigned,
             UPLOAD_OPERATION,
-            ["--source", source],
+            arguments,
             wait_timeout_seconds=wait_timeout_seconds,
             command_timeout_seconds=command_timeout_seconds,
         )

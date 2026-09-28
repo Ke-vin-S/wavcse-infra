@@ -16,6 +16,7 @@ from typing import Any, Final, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from wavcse_infra.errors import StorageKeyError, StorageVerificationError
+from wavcse_infra.redaction import contains_bearer_material
 from wavcse_infra.storage.keys import validate_object_key
 
 MANIFEST_SCHEMA_VERSION: Final = 1
@@ -26,12 +27,6 @@ DEFAULT_POOLING_STRATEGY: Final = "minpooling"
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
-# Bearer material that must never be persisted in a manifest, even in free text.
-_BEARER_PATTERN = re.compile(
-    r"(?i)(?:x-amz-(?:signature|credential|security-token|algorithm)|"
-    r"aws(?:accesskeyid|_access_key_id|_secret_access_key|_session_token)|"
-    r"runpod_api_key|authorization\s*[:=]|https?://\S+\?)"
-)
 
 
 class ArtifactManifest(BaseModel):
@@ -108,7 +103,7 @@ class ArtifactManifest(BaseModel):
         """Refuse to persist presigned URL or credential material in any text field."""
 
         for location, text in _text_values(self.model_dump(mode="json")):
-            if _BEARER_PATTERN.search(text):
+            if contains_bearer_material(text):
                 raise ValueError(
                     f"{location} contains presigned URL or credential material; manifests "
                     "must never store bearer values"

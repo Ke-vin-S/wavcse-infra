@@ -30,6 +30,16 @@ bucket = "CHANGE_ME"
 prefix = "wavcse"
 presign_expiry_seconds = 3600
 
+[jobs]
+# Worker-side isolated job workspace; each job gets <worker_root>/<job-id>/.
+worker_root = "/workspace/wavcse-jobs"
+# Where the reviewed worker-side job runner is installed on a bootstrapped worker.
+runner_path = "/root/.local/state/wavcse-worker/job_runner.py"
+# Bounded default execution timeout when a job spec omits runtime.timeout_seconds.
+default_timeout_seconds = 86400
+# Bounded local log copy captured when a job is finalized.
+log_tail_bytes = 262144
+
 [ssh]
 private_key = "~/.ssh/wavcse_worker"
 known_hosts_file = "~/.local/state/wavcse-infra/known_hosts"

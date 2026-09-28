@@ -239,6 +239,40 @@ RunPod state and local readiness are separate. The local progression is `NOT_REA
 `FAILED`. Stop/destroy returns a tracked worker to `NOT_READY`. Re-running bootstrap is
 the supported recovery path after a partial failure or version mismatch.
 
+## Recorded job execution over RunPod SSH
+
+Phase 6 installs one reviewed, stdlib-only Python file at `jobs.runner_path` (default
+`/root/.local/state/wavcse-worker/job_runner.py`, matching the `root` account used by
+RunPod's direct SSH endpoint). Installation streams the module over direct SSH stdin,
+writes it through a same-directory temporary file, and verifies its SHA-256 against the
+digest computed from this repository; an identical installed digest is reported as
+`unchanged` and nothing is rewritten. A non-root worker user needs `jobs.runner_path`
+overridden, because the install path must be writable by the SSH account.
+
+Each job phase is one bounded SSH command (`python3 <runner> prepare|start|inspect|logs|cancel`)
+with a JSON descriptor on stdin. The descriptor for `start` includes declared secret
+values, so no job data ever appears in a remote process argument list.
+
+`start` launches a supervisor with `start_new_session=True` and no controlling terminal,
+appending stdout/stderr to `<job>/logs/job.log`. Detaching is what makes a multi-hour run
+survive controller or SSH interruption, and it is why Phase 6 needs neither tmux on the
+worker nor a worker daemon. Each stage (setup, then the command) runs in its own process
+group, so a timeout or `infra job cancel` can terminate the entire job tree without
+signalling the supervisor or any other process. Before signalling, cancellation verifies
+the recorded Linux process start time and process-group identity that the PID still
+belongs to this job; a pidfd pins the PID while signalling, and the supervisor command
+line is also checked. An unverifiable PID is refused rather than killed.
+
+Status comes from the worker's own files: `state/pid.json`, `state/finished.json`,
+`state/cancelled.json`, and the log size. RunPod remains authoritative for the Pod; the
+local readiness that gate submission still comes from Phase 4 bootstrap/health, and Phase 6
+never bootstraps, starts, or destroys a Pod.
+
+Source checkout uses the anonymous HTTPS remote with `--filter=blob:none`, a targeted
+`git fetch --depth 1 origin <commit>` (falling back to a full fetch), detached checkout,
+`rev-parse HEAD` verification, and a clean-tree requirement. Git LFS smudge is disabled,
+so LFS-tracked content is not fetched on the worker.
+
 ## Stop, storage, and destroy costs
 
 RunPod reports Pod `cost` as zero while status is `EXITED`, but that is the current
@@ -316,8 +350,10 @@ query strings pass through central redaction.
   unqualified REST catalog availability is not evidence of direct-SSH compatibility.
 - Trust-on-first-use cannot authenticate the first SSH host key. Later changed keys fail
   closed in the dedicated known-hosts file.
-- No artifact transfer, exact-commit execution, research environment, or job management
-  is implemented.
+- Exact-commit job execution requires the worker's `python3` (installed by
+  `infra worker bootstrap`) and a writable `jobs.runner_path` for the SSH account.
+- Phase 6 does not install research dependencies, provision workers automatically,
+  schedule across workers, or resume a partially completed run.
 - No normal test or CI job calls the live API or performs a paid mutation.
 
 ## Official references
