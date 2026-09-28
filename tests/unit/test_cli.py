@@ -196,6 +196,40 @@ def test_worker_show_supports_normalized_json(monkeypatch, tmp_path: Path) -> No
     assert "fake-token" not in result.stdout
 
 
+def test_worker_show_displays_proxy_endpoint_without_inventing_direct_endpoint(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    proxy = WorkerConnectionInfo(
+        provider_worker_id="pod-123",
+        kind="proxy",
+        host="ssh.runpod.io",
+        port=22,
+        username="pod-123-route",
+    )
+    worker = _worker().model_copy(
+        update={
+            "public_ip": None,
+            "ssh_port": None,
+            "ssh_direct": None,
+            "ssh_proxy": proxy,
+        }
+    )
+    _install_fakes(monkeypatch, tmp_path, FakeClient(worker=worker))
+
+    result = runner.invoke(
+        app,
+        ["worker", "show", "pod-123"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Public IP: -" in result.stdout
+    assert "SSH port: -" in result.stdout
+    assert "SSH direct endpoint: -" in result.stdout
+    assert "SSH proxy endpoint: pod-123-route@ssh.runpod.io:22" in result.stdout
+
+
 def test_worker_show_marks_tracked_worker_absent_on_provider_404(
     monkeypatch,
     tmp_path: Path,

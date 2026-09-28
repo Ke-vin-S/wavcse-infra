@@ -145,6 +145,10 @@ Current v2 Pod responses expose an `ssh` object with either or both of:
   running, and container port `22/tcp` is exposed. The external port is not assumed to
   be 22.
 
+`infra worker show` renders both normalized endpoint kinds explicitly. A Pod may show no
+public IP or direct SSH port while still exposing a usable `ssh.proxy`; configured
+`22/tcp` alone does not prove that the host supports a public IP or direct mapping.
+
 `infra worker wait-ssh` repeatedly calls exact `GET /pods/{id}`, prefers `ssh.direct`,
 falls back to `ssh.proxy`, and runs an authenticated remote `true`. It does not equate
 RunPod `RUNNING` with SSH readiness. Missing IP/port metadata, startup connection
@@ -167,20 +171,25 @@ avoiding an undocumented guess between the two names.
 
 ## Bootstrap, GPU health, and readiness
 
-`infra worker bootstrap <id>` streams `worker/bootstrap.sh` to `bash -s` over SSH; it
-does not require SCP/SFTP. The script is non-interactive and idempotent: on a supported
-Ubuntu image it installs missing CA certificates, curl, Git, Python, uv, tar/gzip, and
-basic process/filesystem utilities, creates `/workspace`, then atomically writes the
-expected version to `~/.local/state/wavcse-worker/bootstrap-version`. It does not clone
+`infra worker bootstrap <id>` carries the small reviewed `worker/bootstrap.sh` content in
+the SSH exec command and runs it with `bash -c`; it does not require SCP/SFTP or depend on
+exec-channel stdin forwarding. The script is non-interactive and idempotent: on a
+supported Ubuntu image it installs missing CA certificates, curl, Git, Python, uv,
+tar/gzip, and basic process/filesystem utilities, creates `/workspace`, then atomically
+writes the expected version to `~/.local/state/wavcse-worker/bootstrap-version`. A
+successful exit is accepted only with the expected completion marker. It does not clone
 wavCSE or install PyTorch, research dependencies, OMP, Codex, or AGF.
 
-The subsequent health script reports the bootstrap marker, Git/Python/uv versions,
-available bytes at the selected workspace path, and `nvidia-smi` facts: GPU count,
-model, MiB, driver, and CUDA compatibility version. A valid NVIDIA GPU is required for
-Phase 4 `READY`. AMD and other accelerators are reported as unsupported rather than
-being tested with the wrong tool. Less than roughly 20 GiB free produces a warning
-because the planned embeddings alone are approximately that size; it does not invent a
-larger readiness minimum.
+The subsequent health script emits a versioned, tab-delimited schema on stdout and keeps
+remote stderr separate for diagnostics. The parser requires exactly one supported schema
+declaration and validates every protocol row; a bounded, redacted stdout/stderr excerpt is
+included when parsing fails. The protocol reports the bootstrap marker, Git/Python/uv
+versions, available bytes at the selected workspace path, and `nvidia-smi` facts: GPU
+count, model, MiB, driver, and CUDA compatibility version. A valid NVIDIA GPU is required
+for Phase 4 `READY`. AMD and other accelerators are reported as unsupported rather than
+being tested with the wrong tool. Less than roughly 20 GiB free produces a warning because
+the planned embeddings alone are approximately that size; it does not invent a larger
+readiness minimum.
 
 RunPod state and local readiness are separate. The local progression is `NOT_READY` →
 `SSH_READY` → `BOOTSTRAPPED` → `GPU_HEALTHY` → `READY`; a required failed check records
@@ -241,8 +250,10 @@ query strings pass through central redaction.
 - Availability is a current catalog signal, not a capacity guarantee.
 - Worker bootstrap currently supports Ubuntu images with `apt-get` and NVIDIA health
   through `nvidia-smi`; it will not mark AMD workers READY.
-- Proxy SSH does not support SCP/SFTP. wavcse-infra uses stdin for its small scripts and
-  deliberately leaves data transport to the later S3 phase.
+- Proxy SSH does not support SCP/SFTP, and live behavior showed that successful exec
+  channels may not forward stdin reliably. wavcse-infra carries only its small reviewed
+  bootstrap/health scripts in the quoted SSH exec command and deliberately leaves data
+  transport to the later S3 phase.
 - Trust-on-first-use cannot authenticate the first SSH host key. Later changed keys fail
   closed in the dedicated known-hosts file.
 - No artifact transfer, exact-commit execution, research environment, or job management

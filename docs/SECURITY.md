@@ -105,9 +105,11 @@ so a first-connection network attacker remains a risk. A mismatch fails closed a
 requires the operator to inspect the exact Pod endpoint before changing the entry. The
 user's normal `~/.ssh/known_hosts` and global SSH configuration are not weakened.
 
-Bootstrap scripts are streamed through SSH stdin and contain no credentials. The
-worker stores only a non-secret bootstrap-version marker. Normal workers do not receive
-OMP, Codex, AGF, controller authentication stores, or permanent cloud credentials.
+Bootstrap and health scripts contain no credentials. Their small reviewed content is
+shell-quoted as one SSH exec argument so proxy execution does not depend on stdin; provider
+fields remain separate positional arguments. The worker stores only a non-secret
+bootstrap-version marker. Normal workers do not receive OMP, Codex, AGF, controller
+authentication stores, or permanent cloud credentials.
 
 ### Controller agent tools
 

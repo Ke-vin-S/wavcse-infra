@@ -97,8 +97,9 @@ class StateRecorder:
 
 
 class Executor:
-    def __init__(self, health_output: str) -> None:
+    def __init__(self, health_output: str, *, health_stderr: str = "") -> None:
         self.health_output = health_output
+        self.health_stderr = health_stderr
         self.calls: list[tuple[tuple[str, ...], str | None, float | None]] = []
 
     def run_checked(
@@ -111,7 +112,41 @@ class Executor:
     ) -> SshCommandResult:
         assert connection.provider_worker_id == "pod-123"
         self.calls.append((remote_argv, input_text, timeout_seconds))
-        stdout = self.health_output if "nvidia-smi" in (input_text or "") else "complete\n"
+        is_health = "nvidia-smi" in " ".join(remote_argv)
+        stdout = (
+            self.health_output if is_health else f"wavcse_bootstrap_complete\t{BOOTSTRAP_VERSION}\n"
+        )
+        return SshCommandResult(
+            exit_code=0,
+            stdout=stdout,
+            stderr=self.health_stderr if is_health else "",
+        )
+
+
+class ProxyDropsStdinExecutor:
+    """Model a successful RunPod proxy exec channel that does not forward stdin."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], str | None]] = []
+
+    def run_checked(
+        self,
+        connection: WorkerConnectionInfo,
+        remote_argv: tuple[str, ...],
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> SshCommandResult:
+        del timeout_seconds
+        assert connection.kind == "proxy"
+        self.calls.append((remote_argv, input_text))
+        if input_text is not None:
+            return SshCommandResult(exit_code=0, stdout="", stderr="")
+        stdout = (
+            _health_output()
+            if "nvidia-smi" in " ".join(remote_argv)
+            else f"wavcse_bootstrap_complete\t{BOOTSTRAP_VERSION}\n"
+        )
         return SshCommandResult(exit_code=0, stdout=stdout, stderr="")
 
 
@@ -142,16 +177,36 @@ def test_bootstrap_runs_versioned_script_then_health_and_reaches_ready(tmp_path:
     assert report.gpu.cuda_version == "12.8"
     assert report.disk_available_bytes == 53687091200
     assert waiter.calls == [("pod-123", 20)]
-    assert executor.calls[0][0] == ("bash", "-s", "--", BOOTSTRAP_VERSION)
-    assert "set -Eeuo pipefail" in (executor.calls[0][1] or "")
+    assert executor.calls[0][0][:2] == ("bash", "-c")
+    assert "set -Eeuo pipefail" in executor.calls[0][0][2]
+    assert executor.calls[0][0][3:] == ("wavcse-bootstrap.sh", BOOTSTRAP_VERSION)
+    assert executor.calls[0][1] is None
     assert executor.calls[0][2] == 120
-    assert executor.calls[1][0] == (
-        "bash",
-        "-s",
-        "--",
+    assert executor.calls[1][0][:2] == ("bash", "-c")
+    assert "wavcse_health_schema" in executor.calls[1][0][2]
+    assert executor.calls[1][0][3:] == (
+        "wavcse-health-check.sh",
         BOOTSTRAP_VERSION,
         "/workspace",
     )
+    assert executor.calls[1][1] is None
+    assert [event[0] for event in state.events] == ["bootstrapped", "gpu", "health"]
+
+
+def test_bootstrap_does_not_depend_on_proxy_forwarding_stdin(tmp_path: Path) -> None:
+    proxy = _connection().model_copy(
+        update={"kind": "proxy", "host": "ssh.runpod.io", "port": 22, "username": "pod-route"}
+    )
+    worker = _worker().model_copy(update={"ssh_direct": None, "ssh_proxy": proxy})
+    waiter = Waiter(worker)
+    waiter.result = SshWaitResult(worker=worker, connection=proxy)
+    executor = ProxyDropsStdinExecutor()
+    state = StateRecorder()
+
+    report = WorkerBootstrapper(waiter, executor, state, _config(tmp_path)).bootstrap("pod-123")
+
+    assert report.ready
+    assert all(input_text is None for _, input_text in executor.calls)
     assert [event[0] for event in state.events] == ["bootstrapped", "gpu", "health"]
 
 
@@ -170,6 +225,85 @@ def test_bootstrap_failure_does_not_run_health_or_mark_ready(tmp_path: Path) -> 
         bootstrapper.bootstrap("pod-123")
 
     assert state.events == []
+
+
+def test_bootstrap_requires_explicit_remote_completion_marker(tmp_path: Path) -> None:
+    class MissingMarkerExecutor(Executor):
+        def run_checked(self, *args: object, **kwargs: object) -> SshCommandResult:
+            del args, kwargs
+            return SshCommandResult(exit_code=0, stdout="", stderr="proxy diagnostic")
+
+    state = StateRecorder()
+    bootstrapper = WorkerBootstrapper(
+        Waiter(), MissingMarkerExecutor(_health_output()), state, _config(tmp_path)
+    )
+
+    with pytest.raises(WorkerBootstrapError, match="without completion marker") as captured:
+        bootstrapper.bootstrap("pod-123")
+
+    assert "proxy diagnostic" in str(captured.value)
+    assert state.events == []
+
+
+def test_remote_health_nonzero_does_not_mark_ready(tmp_path: Path) -> None:
+    class HealthFailureExecutor(Executor):
+        def run_checked(
+            self,
+            connection: WorkerConnectionInfo,
+            remote_argv: tuple[str, ...],
+            **kwargs: object,
+        ) -> SshCommandResult:
+            if "nvidia-smi" in " ".join(remote_argv):
+                raise SshCommandError("health script exited 7: driver unavailable")
+            return super().run_checked(connection, remote_argv, **kwargs)
+
+    state = StateRecorder()
+    bootstrapper = WorkerBootstrapper(
+        Waiter(), HealthFailureExecutor(_health_output()), state, _config(tmp_path)
+    )
+
+    with pytest.raises(WorkerHealthError, match="health script exited 7"):
+        bootstrapper.bootstrap("pod-123")
+
+    assert [event[0] for event in state.events] == ["bootstrapped"]
+
+
+def test_health_parse_failure_does_not_mark_ready_and_reports_streams(tmp_path: Path) -> None:
+    state = StateRecorder()
+    executor = Executor("not a health protocol\n", health_stderr="remote health diagnostic")
+    bootstrapper = WorkerBootstrapper(Waiter(), executor, state, _config(tmp_path))
+
+    with pytest.raises(WorkerHealthError, match="without schema version 1") as captured:
+        bootstrapper.bootstrap("pod-123")
+
+    assert "remote stdout='not a health protocol'" in str(captured.value)
+    assert "remote stderr='remote health diagnostic'" in str(captured.value)
+    assert [event[0] for event in state.events] == ["bootstrapped"]
+
+
+def test_health_parse_diagnostics_are_redacted(tmp_path: Path) -> None:
+    secret = "remote-secret-that-must-not-escape"
+    executor = Executor(
+        "not a health protocol\n",
+        health_stderr=f"Authorization: Bearer {secret}",
+    )
+
+    with pytest.raises(WorkerHealthError) as captured:
+        WorkerBootstrapper(Waiter(), executor, StateRecorder(), _config(tmp_path)).health("pod-123")
+
+    assert secret not in str(captured.value)
+    assert "<redacted>" in str(captured.value)
+
+
+def test_health_stderr_diagnostics_do_not_corrupt_stdout_protocol(tmp_path: Path) -> None:
+    report = WorkerBootstrapper(
+        Waiter(),
+        Executor(_health_output(), health_stderr="non-fatal remote diagnostic"),
+        StateRecorder(),
+        _config(tmp_path),
+    ).health("pod-123")
+
+    assert report.ready
 
 
 def test_health_with_no_visible_gpu_is_failed_and_never_ready(tmp_path: Path) -> None:
@@ -250,11 +384,45 @@ def test_non_nvidia_worker_is_never_treated_as_ready(tmp_path: Path) -> None:
     assert state.events == []
 
 
-def test_health_parser_rejects_malformed_protocol() -> None:
+def test_health_parser_accepts_valid_schema_v1() -> None:
+    report = parse_health_output(
+        SshWaitResult(worker=_worker(), connection=_connection()),
+        _health_output(),
+    )
+
+    assert report.ready
+
+
+def test_health_parser_allows_only_preamble_before_valid_protocol() -> None:
+    report = parse_health_output(
+        SshWaitResult(worker=_worker(), connection=_connection()),
+        "RunPod proxy session ready\n" + _health_output(),
+    )
+
+    assert report.ready
+
+
+def test_health_parser_rejects_missing_schema_version() -> None:
     with pytest.raises(WorkerHealthError, match="without schema version 1"):
         parse_health_output(
             SshWaitResult(worker=_worker(), connection=_connection()),
             HEALTHY_OUTPUT,
+        )
+
+
+def test_health_parser_rejects_unsupported_schema_version() -> None:
+    with pytest.raises(WorkerHealthError, match="unsupported health schema version 2"):
+        parse_health_output(
+            SshWaitResult(worker=_worker(), connection=_connection()),
+            _health_output().replace("wavcse_health_schema\t1", "wavcse_health_schema\t2"),
+        )
+
+
+def test_health_parser_rejects_malformed_protocol_field() -> None:
+    with pytest.raises(WorkerHealthError, match="malformed health output"):
+        parse_health_output(
+            SshWaitResult(worker=_worker(), connection=_connection()),
+            _health_output() + "malformed-field\n",
         )
 
 
@@ -267,6 +435,7 @@ def test_worker_scripts_are_strict_idempotent_and_contain_no_controller_secrets(
     assert "dpkg-query" in bootstrap
     assert "command -v uv" in bootstrap
     assert "mktemp" in bootstrap and "bootstrap-version" in bootstrap
+    assert "wavcse_bootstrap_complete" in bootstrap
     assert "nvidia-smi --query-gpu" in health
     for forbidden in (
         "RUNPOD_API_KEY",

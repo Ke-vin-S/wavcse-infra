@@ -224,6 +224,32 @@ def test_worker_with_no_published_ssh_endpoint_normalizes_cleanly() -> None:
     assert worker.ssh_port is None
 
 
+def test_proxy_only_endpoint_is_preserved_without_inventing_public_ip() -> None:
+    proxy = {
+        "host": "ssh.runpod.io",
+        "port": 22,
+        "username": "pod-123-route",
+    }
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json=_pod_payload(ssh={"proxy": proxy, "direct": None}),
+            request=request,
+        )
+    )
+
+    with RunPodClient(_config(), transport=transport) as client:
+        worker = client.get_worker("pod-123")
+
+    assert worker.public_ip is None
+    assert worker.ssh_port is None
+    assert worker.ssh_direct is None
+    assert worker.ssh_proxy is not None
+    assert worker.ssh_proxy.host == "ssh.runpod.io"
+    assert worker.ssh_proxy.port == 22
+    assert worker.ssh_proxy.username == "pod-123-route"
+
+
 def test_malformed_ssh_endpoint_is_rejected_as_provider_response_error() -> None:
     malformed = _pod_payload(
         ssh={"direct": {"host": "bad host", "port": 30222, "username": "root"}}

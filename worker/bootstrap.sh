@@ -85,4 +85,4 @@ chmod 0600 "${marker_temporary}"
 mv -f -- "${marker_temporary}" "${VERSION_FILE}"
 marker_temporary=""
 
-printf 'wavcse worker bootstrap %s complete\n' "${BOOTSTRAP_VERSION}"
+printf 'wavcse_bootstrap_complete\t%s\n' "${BOOTSTRAP_VERSION}"

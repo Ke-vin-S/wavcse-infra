@@ -21,12 +21,22 @@ from wavcse_infra.models import (
     WorkerHealthReport,
     WorkerReadinessState,
 )
+from wavcse_infra.redaction import redact
 from wavcse_infra.state import WorkerStateStore
-from wavcse_infra.workers.ssh import SshExecutor, SshWaitResult, WorkerSshWaiter
+from wavcse_infra.workers.ssh import (
+    SshCommandResult,
+    SshExecutor,
+    SshWaitResult,
+    WorkerSshWaiter,
+)
 
 BOOTSTRAP_VERSION = "1"
+_BOOTSTRAP_COMPLETION_KEY = "wavcse_bootstrap_complete"
+_HEALTH_SCHEMA_KEY = "wavcse_health_schema"
+_HEALTH_SCHEMA_VERSION = "1"
 _DEFAULT_DISK_PATH = "/workspace"
 _EMBEDDING_SIZE_BYTES = 20 * 1024**3
+_DIAGNOSTIC_LIMIT = 500
 
 
 class WorkerBootstrapper:
@@ -56,10 +66,9 @@ class WorkerBootstrapper:
         ready = self._waiter.wait(worker_id, timeout_seconds=wait_timeout_seconds)
         _require_supported_accelerator(ready.worker)
         try:
-            self._executor.run_checked(
+            result = self._executor.run_checked(
                 ready.connection,
-                ("bash", "-s", "--", BOOTSTRAP_VERSION),
-                input_text=load_worker_script("bootstrap.sh"),
+                _script_command("bootstrap.sh", BOOTSTRAP_VERSION),
                 timeout_seconds=(
                     self._config.bootstrap_timeout_seconds
                     if command_timeout_seconds is None
@@ -70,6 +79,7 @@ class WorkerBootstrapper:
             raise WorkerBootstrapError(
                 f"Bootstrap failed on RunPod worker {worker_id}: {exc}"
             ) from exc
+        _require_bootstrap_completion(worker_id, result)
         self._state.mark_bootstrapped(worker_id, BOOTSTRAP_VERSION)
         return self._health(ready, command_timeout_seconds=command_timeout_seconds)
 
@@ -96,8 +106,7 @@ class WorkerBootstrapper:
         try:
             result = self._executor.run_checked(
                 ready.connection,
-                ("bash", "-s", "--", BOOTSTRAP_VERSION, disk_path),
-                input_text=load_worker_script("health-check.sh"),
+                _script_command("health-check.sh", BOOTSTRAP_VERSION, disk_path),
                 timeout_seconds=(
                     self._config.command_timeout_seconds
                     if command_timeout_seconds is None
@@ -108,7 +117,10 @@ class WorkerBootstrapper:
             raise WorkerHealthError(
                 f"Health inspection failed on RunPod worker {ready.worker.id}: {exc}"
             ) from exc
-        report = parse_health_output(ready, result.stdout)
+        try:
+            report = parse_health_output(ready, result.stdout)
+        except WorkerHealthError as exc:
+            raise WorkerHealthError(f"{exc}; {_remote_diagnostics(result)}") from exc
         if report.gpu is not None and report.gpu.count > 0:
             self._state.mark_gpu_healthy(ready.worker.id)
         self._state.record_health(report)
@@ -127,16 +139,50 @@ def load_worker_script(name: str) -> str:
     return packaged_script.read_text(encoding="utf-8")
 
 
+def _script_command(name: str, *arguments: str) -> tuple[str, ...]:
+    """Carry a small trusted script in the exec request, not proxy-fragile stdin."""
+
+    return (
+        "bash",
+        "-c",
+        load_worker_script(name),
+        f"wavcse-{name}",
+        *arguments,
+    )
+
+
+def _require_bootstrap_completion(worker_id: str, result: SshCommandResult) -> None:
+    expected = f"{_BOOTSTRAP_COMPLETION_KEY}\t{BOOTSTRAP_VERSION}"
+    if expected not in result.stdout.splitlines():
+        raise WorkerBootstrapError(
+            f"Bootstrap command on RunPod worker {worker_id} exited successfully without "
+            f"completion marker version {BOOTSTRAP_VERSION}; {_remote_diagnostics(result)}"
+        )
+
+
 def parse_health_output(ready: SshWaitResult, output: str) -> WorkerHealthReport:
     """Parse the small tab-separated worker protocol into normalized health data."""
 
     lines = output.splitlines()
-    try:
-        protocol_start = lines.index("wavcse_health_schema\t1")
-    except ValueError as exc:
+    schema_lines = [
+        (index, line.partition("\t")[2])
+        for index, line in enumerate(lines)
+        if line.partition("\t")[0] == _HEALTH_SCHEMA_KEY
+    ]
+    if not schema_lines:
         raise WorkerHealthError(
             f"Worker {ready.worker.id} returned health output without schema version 1"
-        ) from exc
+        )
+    if len(schema_lines) != 1:
+        raise WorkerHealthError(
+            f"Worker {ready.worker.id} returned multiple health schema declarations"
+        )
+    protocol_start, schema_version = schema_lines[0]
+    if schema_version != _HEALTH_SCHEMA_VERSION:
+        raise WorkerHealthError(
+            f"Worker {ready.worker.id} returned unsupported health schema version "
+            f"{schema_version or 'missing'}"
+        )
 
     values: dict[str, str] = {}
     for line in lines[protocol_start + 1 :]:
@@ -225,6 +271,22 @@ def parse_health_output(ready: SshWaitResult, output: str) -> WorkerHealthReport
         gpu=gpu,
         checks=checks,
     )
+
+
+def _remote_diagnostics(result: SshCommandResult) -> str:
+    return "; ".join(
+        (
+            _stream_diagnostic("stdout", result.stdout),
+            _stream_diagnostic("stderr", result.stderr),
+        )
+    )
+
+
+def _stream_diagnostic(name: str, value: str) -> str:
+    cleaned = redact(value.strip())
+    if not cleaned:
+        return f"remote {name}=<empty>"
+    return f"remote {name}={cleaned[:_DIAGNOSTIC_LIMIT]!r}"
 
 
 def _parse_nvidia_gpu(values: dict[str, str]) -> WorkerGpuInfo | None:

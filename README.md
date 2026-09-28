@@ -26,7 +26,7 @@ The repository currently implements Phases 0–4 of the v1 specification:
 - conservative ambiguous-create reconciliation without automatic POST retries;
 - atomic non-secret local worker state beneath `~/.local/state/wavcse-infra/`;
 - normalized direct/proxy RunPod SSH discovery and bounded authenticated readiness;
-- idempotent streamed worker bootstrap plus version, tool, disk, and NVIDIA GPU health;
+- idempotent SSH-exec worker bootstrap plus version, tool, disk, and NVIDIA GPU health;
 - a separate local readiness model in which provider `RUNNING` does not imply `READY`;
 - provider-neutral worker/request/offer models and bounded retries for safe reads;
 - initial architecture, security, operations, provider, and decision documentation.
@@ -187,8 +187,8 @@ appear before the command name.
 Phase 3 implements the Pod-resource lifecycle: discover an exact current GPU offer,
 enforce availability and price limits, print and confirm a creation plan, create once,
 persist the provider ID, and poll to a bounded provider state. Phase 4 then discovers a
-current direct or proxy SSH endpoint, waits for an authenticated no-op, streams an
-idempotent bootstrap script over stdin, and runs normalized health checks. A Pod can be
+current direct or proxy SSH endpoint, waits for an authenticated no-op, carries each
+small reviewed script in the SSH exec command, and runs normalized health checks. A Pod can be
 RunPod `RUNNING` while its local readiness remains `NOT_READY`, `SSH_READY`,
 `BOOTSTRAPPED`, `GPU_HEALTHY`, or `FAILED`; only all required checks produce `READY`.
 

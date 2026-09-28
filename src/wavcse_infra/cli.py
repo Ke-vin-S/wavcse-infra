@@ -26,6 +26,7 @@ from wavcse_infra.errors import (
 from wavcse_infra.models import (
     CloudType,
     Worker,
+    WorkerConnectionInfo,
     WorkerCreationPlan,
     WorkerHealthReport,
     WorkerSpec,
@@ -697,12 +698,21 @@ def _print_worker(worker: Worker) -> None:
         ("Datacenter", worker.datacenter),
         ("Public IP", worker.public_ip),
         ("SSH port", worker.ssh_port),
+        ("SSH direct endpoint", _format_connection(worker.ssh_direct)),
+        ("SSH proxy endpoint", _format_connection(worker.ssh_proxy)),
         ("Exposed ports", ", ".join(worker.exposed_ports) or None),
         ("Created", worker.created_at.isoformat() if worker.created_at else None),
         ("Last started", worker.last_started_at.isoformat() if worker.last_started_at else None),
     )
     for label, value in fields:
         typer.echo(f"{label}: {value if value is not None else '-'}")
+
+
+def _format_connection(connection: WorkerConnectionInfo | None) -> str | None:
+    if connection is None:
+        return None
+    host = f"[{connection.host}]" if ":" in connection.host else connection.host
+    return f"{connection.username}@{host}:{connection.port}"
 
 
 def _print_creation_plan(plan: WorkerCreationPlan) -> None:

@@ -57,8 +57,9 @@ research dependency installation, or job execution.
 - `workers/ssh.py` invokes system OpenSSH with an explicit identity, isolated
   known-hosts file, bounded timeouts, captured streams, and provider-refreshed endpoint
   readiness polling.
-- `workers/bootstrap.py` streams reviewed Bash scripts over SSH stdin, parses normalized
-  health facts, and gates local readiness without changing provider lifecycle state.
+- `workers/bootstrap.py` carries reviewed Bash scripts as SSH exec-command arguments,
+  parses normalized health facts, and gates local readiness without changing provider
+  lifecycle state. This avoids depending on stdin forwarding through RunPod's proxy.
 - `worker/bootstrap.sh` and `worker/health-check.sh` are the idempotent worker-side
   setup and inspection contracts packaged with the CLI.
 - `redaction.py` removes authorization values, known secret assignments, and URL
@@ -133,7 +134,7 @@ RUNNING
   -> refresh ssh.direct / ssh.proxy from GET /pods/{id}
   -> authenticated SSH no-op
   -> SSH_READY
-  -> versioned idempotent bootstrap over stdin
+  -> versioned idempotent bootstrap through SSH exec
   -> BOOTSTRAPPED
   -> disk/tool/nvidia-smi health
   -> GPU_HEALTHY
