@@ -33,6 +33,8 @@ from wavcse_infra.models import Worker, WorkerConnectionInfo, WorkerState
 from wavcse_infra.redaction import redact
 from wavcse_infra.state import WorkerStateStore
 
+_SSH_PROBE_MARKER = "wavcse_ssh_probe_complete\t1"
+
 
 class WorkerReader(Protocol):
     """Provider read surface needed while waiting for SSH."""
@@ -74,7 +76,31 @@ class SshExecutor:
         connection: WorkerConnectionInfo,
         remote_argv: Sequence[str],
     ) -> tuple[str, ...]:
-        """Build an auditable local argv without consulting user SSH configuration."""
+        """Build an auditable, non-interactive argv for a true SSH endpoint."""
+
+        if connection.kind != "direct":
+            raise SshEndpointUnavailableError(
+                f"RunPod worker {connection.provider_worker_id} only has the basic SSH proxy; "
+                "that gateway requires a PTY and cannot run reliable non-interactive commands. "
+                "Automation requires a public IP with a mapped 22/tcp direct SSH endpoint."
+            )
+        arguments = list(self._base_argv(connection, tty_flag="-T"))
+        if remote_argv:
+            arguments.append(shlex.join(remote_argv))
+        return tuple(arguments)
+
+    def interactive_argv(self, connection: WorkerConnectionInfo) -> tuple[str, ...]:
+        """Build an interactive argv for either direct SSH or RunPod's PTY proxy."""
+
+        return self._base_argv(connection, tty_flag="-tt")
+
+    def _base_argv(
+        self,
+        connection: WorkerConnectionInfo,
+        *,
+        tty_flag: str,
+    ) -> tuple[str, ...]:
+        """Build common explicit OpenSSH arguments without user configuration."""
 
         private_key = self._validated_private_key()
         known_hosts = self._prepare_known_hosts()
@@ -113,12 +139,10 @@ class SshExecutor:
             "HashKnownHosts=yes",
             "-o",
             "LogLevel=ERROR",
-            "-T",
+            tty_flag,
             "--",
             destination,
         ]
-        if remote_argv:
-            arguments.append(shlex.join(remote_argv))
         return tuple(arguments)
 
     def run(
@@ -186,14 +210,36 @@ class SshExecutor:
             raise _command_failure(connection, result)
         return result
 
-    def probe(self, connection: WorkerConnectionInfo) -> None:
-        """Verify authentication and remote command execution with a no-op."""
+    def run_interactive(self, connection: WorkerConnectionInfo) -> int:
+        """Attach the caller's terminal to an interactive worker session."""
 
-        self.run_checked(
+        command = self.interactive_argv(connection)
+        try:
+            completed = self._runner(command, check=False, shell=False)
+        except FileNotFoundError as exc:
+            raise SshConfigurationError(
+                "OpenSSH client was not found on PATH; install the `ssh` command"
+            ) from exc
+        except OSError as exc:
+            raise SshConnectionError(
+                f"Could not start OpenSSH for worker {connection.provider_worker_id}: {redact(exc)}"
+            ) from exc
+        return completed.returncode
+
+    def probe(self, connection: WorkerConnectionInfo) -> None:
+        """Prove that a direct endpoint executed a non-interactive remote command."""
+
+        result = self.run_checked(
             connection,
-            ("true",),
+            ("printf", "%s\\n", _SSH_PROBE_MARKER),
             timeout_seconds=self._config.connect_timeout_seconds + 5,
         )
+        if _SSH_PROBE_MARKER not in result.stdout.splitlines():
+            detail = redact(result.stdout.strip() or result.stderr.strip() or "no remote detail")
+            raise SshConnectionError(
+                f"SSH to worker {connection.provider_worker_id} returned exit 0 without the "
+                f"automation probe marker; remote output: {detail[:500]}"
+            )
 
     def _validated_private_key(self) -> Path:
         private_key = self._config.private_key
@@ -309,10 +355,19 @@ class WorkerSshWaiter:
                 if worker.state is WorkerState.RUNNING:
                     connections = worker_connections(worker)
                     if not connections:
-                        last_failure = (
-                            "RunPod has not published an SSH endpoint; ensure the Pod was "
-                            "created with --start-ssh and the account has a registered public key"
-                        )
+                        if worker.ssh_proxy is not None:
+                            last_failure = (
+                                "RunPod published only its basic PTY proxy; automation requires "
+                                "a public IP with a mapped 22/tcp direct SSH endpoint. "
+                                "--start-ssh and exposing 22/tcp do not by themselves guarantee "
+                                "a public IP on Community Cloud"
+                            )
+                        else:
+                            last_failure = (
+                                "RunPod has not published a direct SSH endpoint; ensure the Pod "
+                                "has a public IP, mapped 22/tcp, sshd, and the registered "
+                                "public key"
+                            )
                     else:
                         endpoint_failures: list[str] = []
                         for connection in connections:
@@ -350,17 +405,15 @@ class WorkerSshWaiter:
 
 
 def select_worker_connection(worker: Worker) -> WorkerConnectionInfo | None:
-    """Prefer mapped direct SSH and fall back to RunPod's command-only proxy."""
+    """Prefer direct SSH for an interactive shell, with the PTY proxy as fallback."""
 
     return worker.ssh_direct or worker.ssh_proxy
 
 
 def worker_connections(worker: Worker) -> tuple[WorkerConnectionInfo, ...]:
-    """Return current endpoints in direct-then-proxy attempt order."""
+    """Return endpoints capable of reliable non-interactive automation."""
 
-    return tuple(
-        connection for connection in (worker.ssh_direct, worker.ssh_proxy) if connection is not None
-    )
+    return (worker.ssh_direct,) if worker.ssh_direct is not None else ()
 
 
 def _command_failure(

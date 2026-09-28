@@ -25,8 +25,10 @@ The repository currently implements Phases 0–4 of the v1 specification:
   maximum-hourly-price guard;
 - conservative ambiguous-create reconciliation without automatic POST retries;
 - atomic non-secret local worker state beneath `~/.local/state/wavcse-infra/`;
-- normalized direct/proxy RunPod SSH discovery and bounded authenticated readiness;
-- idempotent SSH-exec worker bootstrap plus version, tool, disk, and NVIDIA GPU health;
+- normalized direct/proxy RunPod SSH discovery with separate interactive and automation
+  modes and bounded authenticated direct-SSH readiness;
+- idempotent stdin-streamed worker bootstrap plus version, tool, disk, and NVIDIA GPU
+  health;
 - a separate local readiness model in which provider `RUNNING` does not imply `READY`;
 - provider-neutral worker/request/offer models and bounded retries for safe reads;
 - initial architecture, security, operations, provider, and decision documentation.
@@ -147,6 +149,7 @@ The TOML contains only the non-secret SSM parameter name:
 [runpod]
 api_key_parameter = "/wavcse-infra/runpod/api-key"
 api_url = "https://api.runpod.io/v2"
+graphql_url = "https://api.runpod.io/graphql"
 ```
 
 The key itself remains in an SSM `SecureString`. Boto3 reads it with decryption through
@@ -169,9 +172,11 @@ infra config validate
 infra doctor
 infra worker list
 infra worker show <worker-id>
-infra worker gpu-types --cloud COMMUNITY --gpu-count 1
-infra worker create --gpu <exact-type-id> --cloud COMMUNITY --image <image> --max-price <usd-hour>
+infra worker gpu-types --cloud COMMUNITY --gpu-count 1 --require-direct-ssh
+infra worker create --gpu <exact-type-id> --cloud COMMUNITY --image <image> --start-ssh --require-direct-ssh --max-price <usd-hour>
 infra worker wait-ssh <exact-worker-id>
+infra worker ssh <exact-worker-id>
+infra worker exec <exact-worker-id> -- <command> [args...]
 infra worker bootstrap <exact-worker-id>
 infra worker health <exact-worker-id>
 infra worker stop <exact-worker-id>
@@ -187,10 +192,13 @@ appear before the command name.
 Phase 3 implements the Pod-resource lifecycle: discover an exact current GPU offer,
 enforce availability and price limits, print and confirm a creation plan, create once,
 persist the provider ID, and poll to a bounded provider state. Phase 4 then discovers a
-current direct or proxy SSH endpoint, waits for an authenticated no-op, carries each
-small reviewed script in the SSH exec command, and runs normalized health checks. A Pod can be
+current direct SSH endpoint, proves remote execution with a completion marker, streams
+each small reviewed script over stdin, and runs normalized health checks. A Pod can be
 RunPod `RUNNING` while its local readiness remains `NOT_READY`, `SSH_READY`,
 `BOOTSTRAPPED`, `GPU_HEALTHY`, or `FAILED`; only all required checks produce `READY`.
+Automation always disables PTY allocation and requires the mapped public-IP direct SSH
+endpoint. The RunPod basic proxy is reserved for `infra worker ssh`, which forces a PTY;
+it is never accepted by exec, bootstrap, health, or readiness probing.
 
 Start, stop, and destroy use exact provider IDs. Create and destroy require confirmation
 unless `--yes` is supplied; that flag never bypasses validation or `--max-price`.

@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from wavcse_infra.config import DEFAULT_RUNPOD_API_URL, load_settings, resolved_config_path
+from wavcse_infra.config import (
+    DEFAULT_RUNPOD_API_URL,
+    DEFAULT_RUNPOD_GRAPHQL_URL,
+    load_settings,
+    resolved_config_path,
+)
 from wavcse_infra.errors import ConfigurationError
 
 EXAMPLE_CONFIG = Path(__file__).resolve().parents[2] / "config" / "infra.example.toml"
@@ -15,6 +20,7 @@ def test_defaults_are_safe_and_do_not_require_secrets(
     settings = load_settings(environ={})
 
     assert str(settings.runpod.api_url).rstrip("/") == DEFAULT_RUNPOD_API_URL
+    assert str(settings.runpod.graphql_url).rstrip("/") == DEFAULT_RUNPOD_GRAPHQL_URL
     assert settings.runpod.api_key is None
     assert settings.runpod.api_key_parameter is None
     assert settings.storage.bucket is None
@@ -78,6 +84,7 @@ def test_committed_example_is_valid_and_contains_no_secret_fields() -> None:
 
     assert settings.aws.region == "us-east-1"
     assert str(settings.runpod.api_url).rstrip("/") == DEFAULT_RUNPOD_API_URL
+    assert str(settings.runpod.graphql_url).rstrip("/") == DEFAULT_RUNPOD_GRAPHQL_URL
     assert settings.runpod.api_key_parameter == "/wavcse-infra/runpod/api-key"
     assert settings.storage.bucket is None
     assert settings.storage.prefix == "wavcse"

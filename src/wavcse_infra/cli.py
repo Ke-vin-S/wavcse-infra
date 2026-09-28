@@ -21,6 +21,7 @@ from wavcse_infra.errors import (
     InfraError,
     ProviderError,
     ProviderNotFoundError,
+    SshEndpointUnavailableError,
     StateError,
 )
 from wavcse_infra.models import (
@@ -30,13 +31,14 @@ from wavcse_infra.models import (
     WorkerCreationPlan,
     WorkerHealthReport,
     WorkerSpec,
+    WorkerState,
 )
 from wavcse_infra.providers.runpod import RunPodClient
 from wavcse_infra.redaction import redact
 from wavcse_infra.state import WorkerRecord, WorkerStateStore
 from wavcse_infra.workers.bootstrap import WorkerBootstrapper
 from wavcse_infra.workers.lifecycle import WorkerLifecycle
-from wavcse_infra.workers.ssh import SshExecutor, WorkerSshWaiter
+from wavcse_infra.workers.ssh import SshExecutor, WorkerSshWaiter, select_worker_connection
 
 app = typer.Typer(
     name="infra",
@@ -222,6 +224,13 @@ def list_gpu_types(
         list[str] | None,
         typer.Option("--data-center", help="Restrict displayed availability to an exact ID."),
     ] = None,
+    require_direct_ssh: Annotated[
+        bool,
+        typer.Option(
+            "--require-direct-ssh",
+            help="Show only capacity that the RunPod scheduler confirms supports a public IP.",
+        ),
+    ] = False,
     json_output: Annotated[
         bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
     ] = False,
@@ -235,15 +244,24 @@ def list_gpu_types(
                 cloud,
                 gpu_count,
                 data_center_ids=tuple(data_center or ()),
+                require_public_ip=require_direct_ssh,
             )
     except ConfigurationError as exc:
         _configuration_failure(exc)
     except ProviderError as exc:
         _provider_failure(exc)
+    if require_direct_ssh:
+        offers.sort(
+            key=lambda offer: (
+                offer.total_price_per_hour is None,
+                offer.total_price_per_hour or Decimal("Infinity"),
+                offer.gpu_type_id,
+            )
+        )
     if json_output:
         _print_json([offer.model_dump(mode="json") for offer in offers])
         return
-    typer.echo("GPU TYPE ID\tVRAM\tAVAILABILITY\tMAX COUNT\tPRICE/GPU-HR\tTOTAL/HR")
+    typer.echo("GPU TYPE ID\tVRAM\tAVAILABILITY\tPUBLIC IP\tMAX COUNT\tPRICE/GPU-HR\tTOTAL/HR")
     for offer in offers:
         typer.echo(
             "\t".join(
@@ -251,6 +269,7 @@ def list_gpu_types(
                     offer.gpu_type_id,
                     f"{offer.memory_gb} GB" if offer.memory_gb is not None else "-",
                     offer.availability.value,
+                    "YES" if offer.public_ip_capable is True else "-",
                     str(offer.maximum_gpu_count) if offer.maximum_gpu_count is not None else "-",
                     _money(offer.price_per_gpu_hour),
                     _money(offer.total_price_per_hour),
@@ -311,6 +330,13 @@ def create_worker(
         bool,
         typer.Option("--start-ssh", help="Ask RunPod to inject registered SSH keys and port 22."),
     ] = False,
+    require_direct_ssh: Annotated[
+        bool,
+        typer.Option(
+            "--require-direct-ssh",
+            help=("Require scheduler placement on public-IP capacity; also requires --start-ssh."),
+        ),
+    ] = False,
     max_price: Annotated[
         str | None,
         typer.Option("--max-price", help="Maximum accepted total GPU price in USD/hour."),
@@ -341,6 +367,7 @@ def create_worker(
             data_center_ids=tuple(data_center or ()),
             interruptible=interruptible,
             start_ssh=start_ssh,
+            require_direct_ssh=require_direct_ssh,
         )
     except ValidationError as exc:
         _configuration_failure(exc)
@@ -401,6 +428,84 @@ def wait_for_worker_ssh(
     typer.echo(f"Host: {result.connection.host}")
     typer.echo(f"Port: {result.connection.port}")
     typer.echo(f"Username: {result.connection.username}")
+
+
+@worker_app.command("ssh")
+def ssh_worker(
+    context: typer.Context,
+    worker_id: Annotated[str, typer.Argument(help="Exact RunPod worker ID.")],
+) -> None:
+    """Open an interactive PTY session, using the RunPod proxy only as fallback."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            worker = client.get_worker(worker_id)
+        _observe_state(worker)
+        if worker.state is not WorkerState.RUNNING:
+            raise SshEndpointUnavailableError(
+                f"RunPod worker {worker_id} is {worker.state.value}; an interactive SSH "
+                "session requires provider state RUNNING"
+            )
+        connection = select_worker_connection(worker)
+        if connection is None:
+            raise SshEndpointUnavailableError(
+                f"RunPod worker {worker_id} has no published SSH endpoint"
+            )
+        exit_code = SshExecutor(settings.ssh).run_interactive(connection)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    if exit_code != 0:
+        raise typer.Exit(code=exit_code)
+
+
+@worker_app.command(
+    "exec",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def exec_worker(
+    context: typer.Context,
+    worker_id: Annotated[str, typer.Argument(help="Exact RunPod worker ID.")],
+    wait_timeout: Annotated[
+        float | None,
+        typer.Option("--wait-timeout", min=0.1, help="Direct SSH readiness timeout."),
+    ] = None,
+    command_timeout: Annotated[
+        float | None,
+        typer.Option("--command-timeout", min=0.1, help="Remote command timeout."),
+    ] = None,
+) -> None:
+    """Run one argv-based command over direct, non-interactive SSH."""
+
+    remote_argv = tuple(context.args)
+    if not remote_argv:
+        raise typer.BadParameter("a remote command is required after `--`")
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            executor, waiter = _ssh_access(client, settings)
+            ready = waiter.wait(worker_id, timeout_seconds=wait_timeout)
+            result = executor.run(
+                ready.connection,
+                remote_argv,
+                timeout_seconds=command_timeout,
+            )
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    if result.stdout:
+        typer.echo(result.stdout, nl=False)
+    if result.stderr:
+        typer.echo(result.stderr, err=True, nl=False)
+    if result.exit_code != 0:
+        raise typer.Exit(code=result.exit_code)
 
 
 @worker_app.command("bootstrap")
@@ -633,6 +738,16 @@ def _worker_access(
     )
 
 
+def _ssh_access(
+    client: RunPodClient,
+    settings: Settings,
+) -> tuple[SshExecutor, WorkerSshWaiter]:
+    state_store = _state_store()
+    executor = SshExecutor(settings.ssh)
+    waiter = WorkerSshWaiter(client, executor, state_store, settings.ssh)
+    return executor, waiter
+
+
 def _reconcile_state(workers: list[Worker]) -> None:
     try:
         _state_store().reconcile(workers)
@@ -736,6 +851,11 @@ def _print_creation_plan(plan: WorkerCreationPlan) -> None:
         ("Data centers", ", ".join(spec.data_center_ids) if spec.data_center_ids else "any"),
         ("Interruptible", "yes" if spec.interruptible else "no (on-demand)"),
         ("Start SSH", "yes" if spec.start_ssh else "no"),
+        ("Require direct SSH", "yes" if spec.require_direct_ssh else "no"),
+        (
+            "Public-IP-capable offer",
+            "yes" if offer.public_ip_capable is True else "not confirmed",
+        ),
     )
     typer.echo("RunPod creation plan")
     for label, value in fields:

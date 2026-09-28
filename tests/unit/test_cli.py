@@ -24,7 +24,7 @@ from wavcse_infra.models import (
 )
 from wavcse_infra.providers import runpod as runpod_provider
 from wavcse_infra.state import WorkerStateStore
-from wavcse_infra.workers.ssh import SshWaitResult
+from wavcse_infra.workers.ssh import SshCommandResult, SshWaitResult
 
 runner = CliRunner()
 
@@ -62,6 +62,7 @@ class FakeClient:
         self.worker = worker or _worker()
         self.offer = offer or _offer()
         self.create_calls = 0
+        self.created_specs: list[WorkerSpec] = []
         self.destroy_calls = 0
 
     def __enter__(self):
@@ -83,10 +84,13 @@ class FakeClient:
         gpu_count: int,
         *,
         data_center_ids=(),
+        require_public_ip: bool = False,
     ) -> list[GpuOffer]:
         assert cloud_type is CloudType.COMMUNITY
         assert gpu_count == 1
         assert data_center_ids == ()
+        if require_public_ip:
+            return [self.offer.model_copy(update={"public_ip_capable": True})]
         return [self.offer]
 
     def get_gpu_offer(
@@ -96,15 +100,19 @@ class FakeClient:
         gpu_count: int,
         *,
         data_center_ids=(),
+        require_public_ip: bool = False,
     ) -> GpuOffer:
         assert gpu_type == "NVIDIA RTX A5000"
         assert cloud_type is CloudType.COMMUNITY
         assert gpu_count == 1
         assert data_center_ids == ()
+        if require_public_ip:
+            assert self.offer.public_ip_capable is True
         return self.offer
 
     def create_worker(self, spec: WorkerSpec) -> Worker:
         self.create_calls += 1
+        self.created_specs.append(spec)
         assert spec.name == "wavcse-training-abc123"
         return self.worker
 
@@ -261,7 +269,24 @@ def test_gpu_types_renders_current_offer(monkeypatch, tmp_path: Path) -> None:
         env={"RUNPOD_API_KEY": "fake-token"},
     )
     assert result.exit_code == 0
-    assert "NVIDIA RTX A5000\t24 GB\tHIGH\t2\t$0.1600\t$0.1600" in result.stdout
+    assert "NVIDIA RTX A5000\t24 GB\tHIGH\t-\t2\t$0.1600\t$0.1600" in result.stdout
+
+
+def test_gpu_types_can_filter_public_ip_capable_capacity(monkeypatch, tmp_path: Path) -> None:
+    _install_fakes(monkeypatch, tmp_path, FakeClient())
+    result = runner.invoke(
+        app,
+        [
+            "worker",
+            "gpu-types",
+            "--cloud",
+            "COMMUNITY",
+            "--require-direct-ssh",
+        ],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+    assert result.exit_code == 0, result.output
+    assert "NVIDIA RTX A5000\t24 GB\tHIGH\tYES\t2\t$0.1600\t$0.1600" in result.stdout
 
 
 def test_create_yes_prints_plan_and_bypasses_confirmation(monkeypatch, tmp_path: Path) -> None:
@@ -290,6 +315,62 @@ def test_create_yes_prints_plan_and_bypasses_confirmation(monkeypatch, tmp_path:
     assert "Provider list price/hour: $0.1600" in result.stdout
     assert "RunPod worker created and reached RUNNING" in result.stdout
     assert client.create_calls == 1
+
+
+def test_create_direct_ssh_constraint_reaches_provider(monkeypatch, tmp_path: Path) -> None:
+    compatible = _offer().model_copy(update={"public_ip_capable": True})
+    client = FakeClient(offer=compatible)
+    _install_fakes(monkeypatch, tmp_path, client)
+    monkeypatch.setattr(cli, "_infra_worker_name", lambda prefix: "wavcse-training-abc123")
+    result = runner.invoke(
+        app,
+        [
+            "worker",
+            "create",
+            "--gpu",
+            "NVIDIA RTX A5000",
+            "--cloud",
+            "COMMUNITY",
+            "--image",
+            "runpod/pytorch:example",
+            "--start-ssh",
+            "--require-direct-ssh",
+            "--max-price",
+            "0.20",
+            "--yes",
+        ],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+    assert result.exit_code == 0, result.output
+    assert client.created_specs[0].require_direct_ssh is True
+
+
+def test_create_direct_ssh_requires_start_ssh_before_provider_call(
+    monkeypatch, tmp_path: Path
+) -> None:
+    client = FakeClient()
+    _install_fakes(monkeypatch, tmp_path, client)
+    result = runner.invoke(
+        app,
+        [
+            "worker",
+            "create",
+            "--gpu",
+            "NVIDIA RTX A5000",
+            "--cloud",
+            "COMMUNITY",
+            "--image",
+            "runpod/pytorch:example",
+            "--require-direct-ssh",
+            "--max-price",
+            "0.20",
+            "--yes",
+        ],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+    assert result.exit_code == 2
+    assert "require_direct_ssh requires start_ssh" in result.stderr
+    assert client.create_calls == 0
 
 
 def test_create_confirmation_rejection_makes_no_mutation(monkeypatch, tmp_path: Path) -> None:
@@ -465,6 +546,85 @@ def test_wait_ssh_command_reports_normalized_mapped_endpoint(monkeypatch, tmp_pa
     assert '"kind": "direct"' in result.stdout
     assert '"port": 30222' in result.stdout
     assert "fake-token" not in result.stdout
+
+
+def test_ssh_command_uses_proxy_only_for_interactive_pty(monkeypatch, tmp_path: Path) -> None:
+    proxy = WorkerConnectionInfo(
+        provider_worker_id="pod-123",
+        kind="proxy",
+        host="ssh.runpod.io",
+        port=22,
+        username="pod-123-route",
+    )
+    worker = _worker().model_copy(update={"ssh_proxy": proxy, "ssh_direct": None})
+    _install_fakes(monkeypatch, tmp_path, FakeClient(worker=worker))
+    connections: list[WorkerConnectionInfo] = []
+
+    class Executor:
+        def __init__(self, settings: object) -> None:
+            del settings
+
+        def run_interactive(self, connection: WorkerConnectionInfo) -> int:
+            connections.append(connection)
+            return 0
+
+    monkeypatch.setattr(cli, "SshExecutor", Executor)
+    result = runner.invoke(
+        app,
+        ["worker", "ssh", "pod-123"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [connection.kind for connection in connections] == ["proxy"]
+
+
+def test_exec_command_uses_direct_noninteractive_transport_and_preserves_streams(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _install_fakes(monkeypatch, tmp_path, FakeClient())
+    calls: list[tuple[tuple[str, ...], float | None]] = []
+
+    class Waiter:
+        def wait(self, worker_id: str, *, timeout_seconds: float | None = None):
+            assert (worker_id, timeout_seconds) == ("pod-123", 15)
+            return SshWaitResult(worker=_worker(), connection=_connection())
+
+    class Executor:
+        def run(
+            self,
+            connection: WorkerConnectionInfo,
+            remote_argv: tuple[str, ...],
+            *,
+            timeout_seconds: float | None = None,
+        ) -> SshCommandResult:
+            assert connection.kind == "direct"
+            calls.append((remote_argv, timeout_seconds))
+            return SshCommandResult(0, "command stdout\n", "command stderr\n")
+
+    monkeypatch.setattr(cli, "_ssh_access", lambda client, settings: (Executor(), Waiter()))
+    result = runner.invoke(
+        app,
+        [
+            "worker",
+            "exec",
+            "pod-123",
+            "--wait-timeout",
+            "15",
+            "--command-timeout",
+            "20",
+            "--",
+            "echo",
+            "hello world",
+        ],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(("echo", "hello world"), 20)]
+    assert result.stdout == "command stdout\n"
+    assert result.stderr == "command stderr\n"
 
 
 def test_bootstrap_command_reports_ready_health(monkeypatch, tmp_path: Path) -> None:

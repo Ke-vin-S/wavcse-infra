@@ -154,6 +154,7 @@ class GpuOffer(BaseModel):
     availability: Availability
     price_per_gpu_hour: Decimal | None = Field(default=None, ge=0)
     total_price_per_hour: Decimal | None = Field(default=None, ge=0)
+    public_ip_capable: bool | None = None
     data_centers: tuple[GpuDataCenterAvailability, ...] = ()
 
 
@@ -175,6 +176,7 @@ class WorkerSpec(BaseModel):
     data_center_ids: tuple[str, ...] = ()
     interruptible: bool = False
     start_ssh: bool = False
+    require_direct_ssh: bool = False
 
     @model_validator(mode="after")
     def validate_image_and_storage(self) -> WorkerSpec:
@@ -188,6 +190,8 @@ class WorkerSpec(BaseModel):
             raise ValueError("volume_gb must be 0 or at least 10 GB")
         if any(not data_center_id.strip() for data_center_id in self.data_center_ids):
             raise ValueError("data center IDs must not be empty")
+        if self.require_direct_ssh and not self.start_ssh:
+            raise ValueError("require_direct_ssh requires start_ssh")
         return self
 
 

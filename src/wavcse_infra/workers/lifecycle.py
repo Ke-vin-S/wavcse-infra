@@ -44,6 +44,7 @@ class WorkerProvider(Protocol):
         gpu_count: int,
         *,
         data_center_ids: Sequence[str] = (),
+        require_public_ip: bool = False,
     ) -> GpuOffer: ...
 
     def create_worker(self, spec: WorkerSpec) -> Worker: ...
@@ -105,7 +106,13 @@ class WorkerLifecycle:
             spec.cloud_type,
             spec.gpu_count,
             data_center_ids=spec.data_center_ids,
+            require_public_ip=spec.require_direct_ssh,
         )
+        if spec.require_direct_ssh and offer.public_ip_capable is not True:
+            raise ResourceUnavailableError(
+                f"RunPod reports no confirmed public-IP-capable {spec.cloud_type.value} "
+                f"capacity for {spec.gpu_count} x {spec.gpu_type}"
+            )
         if offer.maximum_gpu_count is not None and offer.maximum_gpu_count < spec.gpu_count:
             raise ResourceUnavailableError(
                 f"RunPod {spec.cloud_type.value} cloud supports at most "

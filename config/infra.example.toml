@@ -15,6 +15,7 @@ wavcse = "~/projects/wavCSE"
 
 [runpod]
 api_url = "https://api.runpod.io/v2"
+graphql_url = "https://api.runpod.io/graphql"
 api_key_parameter = "/wavcse-infra/runpod/api-key"
 request_timeout_seconds = 10.0
 max_read_attempts = 3

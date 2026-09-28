@@ -322,6 +322,124 @@ def test_gpu_discovery_marks_unsupported_count_and_missing_datacenter_unavailabl
     assert wrong_dc.availability is Availability.NONE
 
 
+def test_public_ip_gpu_discovery_uses_graphql_scheduler_filter_and_compatible_price() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/graphql"
+        body = json.loads(request.content)
+        assert "PublicIpOffers" in body["query"]
+        assert body["variables"] == {
+            "gpu": {"id": "NVIDIA RTX A5000"},
+            "price": {
+                "gpuCount": 1,
+                "secureCloud": False,
+                "supportPublicIp": True,
+                "dataCenterId": "EU-RO-1,US-KS-2",
+            },
+        }
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "gpuTypes": [
+                        {
+                            "id": "NVIDIA RTX A5000",
+                            "displayName": "RTX A5000",
+                            "memoryInGb": 24,
+                            "lowestPrice": {
+                                "uninterruptablePrice": "0.18",
+                                "stockStatus": "HIGH",
+                                "supportPublicIp": True,
+                                "maxGpuCount": 2,
+                                "availableGpuCounts": [1, 2],
+                            },
+                        }
+                    ]
+                }
+            },
+            request=request,
+        )
+
+    with RunPodClient(_config(), transport=httpx.MockTransport(handler)) as client:
+        offer = client.get_gpu_offer(
+            "NVIDIA RTX A5000",
+            CloudType.COMMUNITY,
+            1,
+            data_center_ids=("EU-RO-1", "US-KS-2"),
+            require_public_ip=True,
+        )
+
+    assert offer.public_ip_capable is True
+    assert offer.availability is Availability.HIGH
+    assert offer.price_per_gpu_hour == Decimal("0.18")
+    assert offer.total_price_per_hour == Decimal("0.18")
+
+
+def test_public_ip_gpu_discovery_fails_closed_when_no_compatible_offer() -> None:
+    payload = {
+        "data": {
+            "gpuTypes": [
+                {
+                    "id": "NVIDIA RTX A5000",
+                    "displayName": "RTX A5000",
+                    "memoryInGb": 24,
+                    "lowestPrice": None,
+                }
+            ]
+        }
+    }
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json=payload, request=request)
+    )
+
+    with RunPodClient(_config(), transport=transport) as client:
+        offer = client.get_gpu_offer(
+            "NVIDIA RTX A5000",
+            CloudType.COMMUNITY,
+            1,
+            require_public_ip=True,
+        )
+
+    assert offer.public_ip_capable is None
+    assert offer.availability is Availability.NONE
+    assert offer.total_price_per_hour is None
+
+
+def test_public_ip_gpu_discovery_accepts_nullable_available_counts() -> None:
+    payload = {
+        "data": {
+            "gpuTypes": [
+                {
+                    "id": "NVIDIA RTX A5000",
+                    "displayName": "RTX A5000",
+                    "memoryInGb": 24,
+                    "lowestPrice": {
+                        "uninterruptablePrice": "0.18",
+                        "stockStatus": "HIGH",
+                        "supportPublicIp": None,
+                        "maxGpuCount": 1,
+                        "availableGpuCounts": None,
+                    },
+                }
+            ]
+        }
+    }
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json=payload, request=request)
+    )
+
+    with RunPodClient(_config(), transport=transport) as client:
+        offers = client.list_gpu_offers(
+            CloudType.COMMUNITY,
+            1,
+            require_public_ip=True,
+        )
+
+    assert len(offers) == 1
+    assert offers[0].public_ip_capable is True
+    assert offers[0].availability is Availability.HIGH
+
+
 @pytest.mark.parametrize(
     ("native_status", "expected_state"),
     [
@@ -393,6 +511,66 @@ def test_create_constructs_template_and_network_volume_request() -> None:
 
     with RunPodClient(_config(), transport=httpx.MockTransport(handler)) as client:
         client.create_worker(spec)
+
+
+def test_create_direct_ssh_uses_graphql_public_ip_placement_constraint() -> None:
+    spec = _spec(require_direct_ssh=True)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/graphql"
+        body = json.loads(request.content)
+        assert "CreatePublicIpPod" in body["query"]
+        assert body["variables"]["input"] == {
+            "name": "wavcse-training-abc123",
+            "cloudType": "COMMUNITY",
+            "gpuTypeId": "NVIDIA RTX A5000",
+            "gpuCount": 1,
+            "containerDiskInGb": 30,
+            "volumeMountPath": "/workspace",
+            "startSsh": True,
+            "supportPublicIp": True,
+            "ports": "22/tcp",
+            "imageName": "runpod/pytorch:example",
+            "dataCenterId": "EU-RO-1",
+            "volumeInGb": 20,
+        }
+        return httpx.Response(
+            200,
+            json={"data": {"podFindAndDeployOnDemand": {"id": "pod-public-ip"}}},
+            request=request,
+        )
+
+    with RunPodClient(_config(), transport=httpx.MockTransport(handler)) as client:
+        worker = client.create_worker(spec)
+
+    assert worker.id == "pod-public-ip"
+    assert worker.state is WorkerState.PROVISIONING
+    assert worker.exposed_ports == ("22/tcp",)
+
+
+def test_create_direct_ssh_graphql_capacity_rejection_is_not_retried() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "data": {"podFindAndDeployOnDemand": None},
+                "errors": [{"message": "No instances available with public IP"}],
+            },
+            request=request,
+        )
+
+    with (
+        RunPodClient(_config(), transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ProviderValidationError, match="No instances available with public IP"),
+    ):
+        client.create_worker(_spec(require_direct_ssh=True))
+
+    assert calls == 1
 
 
 def test_create_api_validation_rejection_is_actionable_and_not_retried() -> None:

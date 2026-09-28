@@ -1,4 +1,4 @@
-"""RunPod REST API v2 client and provider response normalization."""
+"""RunPod REST v2/GraphQL client and provider response normalization."""
 
 from __future__ import annotations
 
@@ -43,6 +43,31 @@ _RETRYABLE_STATUS_CODES = frozenset({429})
 _AMBIGUOUS_MUTATION_STATUS_CODES = frozenset({408, 429})
 _MAX_RETRY_DELAY_SECONDS = 30.0
 _LIST_PAGE_SIZE = 1000
+
+_PUBLIC_IP_OFFERS_QUERY = """
+query PublicIpOffers($gpu: GpuTypeFilter, $price: GpuLowestPriceInput!) {
+  gpuTypes(input: $gpu) {
+    id
+    displayName
+    memoryInGb
+    lowestPrice(input: $price) {
+      uninterruptablePrice
+      stockStatus
+      supportPublicIp
+      maxGpuCount
+      availableGpuCounts
+    }
+  }
+}
+"""
+
+_CREATE_PUBLIC_IP_POD_MUTATION = """
+mutation CreatePublicIpPod($input: PodFindAndDeployOnDemandInput!) {
+  podFindAndDeployOnDemand(input: $input) {
+    id
+  }
+}
+"""
 
 
 class _WireModel(BaseModel):
@@ -140,6 +165,47 @@ class _GpuList(_WireModel):
     gpus: list[_GpuType]
 
 
+class _GraphqlError(_WireModel):
+    message: str = Field(min_length=1)
+
+
+class _GraphqlLowestPrice(_WireModel):
+    uninterruptable_price: Decimal | None = Field(default=None, alias="uninterruptablePrice", ge=0)
+    stock_status: str | None = Field(default=None, alias="stockStatus")
+    support_public_ip: bool | None = Field(default=None, alias="supportPublicIp")
+    max_gpu_count: int | None = Field(default=None, alias="maxGpuCount", ge=0)
+    available_gpu_counts: list[int] | None = Field(default=None, alias="availableGpuCounts")
+
+
+class _GraphqlGpuType(_WireModel):
+    id: str = Field(min_length=1)
+    display_name: str | None = Field(default=None, alias="displayName")
+    memory_gb: int | None = Field(default=None, alias="memoryInGb", ge=0)
+    lowest_price: _GraphqlLowestPrice | None = Field(default=None, alias="lowestPrice")
+
+
+class _GraphqlOfferData(_WireModel):
+    gpu_types: list[_GraphqlGpuType] = Field(alias="gpuTypes")
+
+
+class _GraphqlOfferResponse(_WireModel):
+    data: _GraphqlOfferData | None = None
+    errors: list[_GraphqlError] = Field(default_factory=list)
+
+
+class _GraphqlCreatedPod(_WireModel):
+    id: str = Field(min_length=1)
+
+
+class _GraphqlCreateData(_WireModel):
+    pod: _GraphqlCreatedPod | None = Field(default=None, alias="podFindAndDeployOnDemand")
+
+
+class _GraphqlCreateResponse(_WireModel):
+    data: _GraphqlCreateData | None = None
+    errors: list[_GraphqlError] = Field(default_factory=list)
+
+
 class RunPodClient:
     """RunPod v2 client with safe read retries and conservative mutations."""
 
@@ -188,6 +254,16 @@ class RunPodClient:
             timeout=httpx.Timeout(config.request_timeout_seconds),
             transport=transport,
         )
+        self._graphql_url = str(config.graphql_url)
+        self._graphql_client = httpx.Client(
+            headers={
+                "Authorization": f"Bearer {resolved_api_key.get_secret_value()}",
+                "Accept": "application/json",
+                "User-Agent": "wavcse-infra/0.1",
+            },
+            timeout=httpx.Timeout(config.request_timeout_seconds),
+            transport=transport,
+        )
 
     def __enter__(self) -> RunPodClient:
         return self
@@ -197,6 +273,7 @@ class RunPodClient:
 
     def close(self) -> None:
         self._client.close()
+        self._graphql_client.close()
 
     def list_workers(self) -> list[Worker]:
         """Return every standalone Pod visible to the configured account."""
@@ -241,8 +318,16 @@ class RunPodClient:
         gpu_count: int,
         *,
         data_center_ids: Sequence[str] = (),
+        require_public_ip: bool = False,
     ) -> list[GpuOffer]:
         """Return current Pod prices and availability for a cloud/count selection."""
+
+        if require_public_ip:
+            return self._list_public_ip_offers(
+                cloud_type,
+                gpu_count,
+                data_center_ids=data_center_ids,
+            )
 
         params = _catalog_params(cloud_type, gpu_count)
         payload = self._get_json(
@@ -268,12 +353,23 @@ class RunPodClient:
         gpu_count: int,
         *,
         data_center_ids: Sequence[str] = (),
+        require_public_ip: bool = False,
     ) -> GpuOffer:
         """Return one exact GPU type's current price and availability."""
 
         normalized_gpu_type = gpu_type.strip()
         if not normalized_gpu_type:
             raise ProviderValidationError("RunPod GPU type ID must not be empty")
+        if require_public_ip:
+            offers = self._list_public_ip_offers(
+                cloud_type,
+                gpu_count,
+                data_center_ids=data_center_ids,
+                gpu_type=normalized_gpu_type,
+            )
+            if not offers:
+                raise ProviderNotFoundError(f"RunPod GPU type {normalized_gpu_type} was not found")
+            return offers[0]
         payload = self._get_json(
             f"catalog/gpus/{quote(normalized_gpu_type, safe='')}",
             operation=f"show GPU type {normalized_gpu_type}",
@@ -296,6 +392,8 @@ class RunPodClient:
                 "RunPod REST API v2 does not expose interruptible Pod creation; "
                 "omit --interruptible to create an on-demand Pod"
             )
+        if spec.require_direct_ssh:
+            return self._create_public_ip_worker(spec)
         try:
             response = self._client.post("pods", json=_create_payload(spec))
         except httpx.TransportError as exc:
@@ -313,6 +411,142 @@ class RunPodClient:
             return _parse_pod(response.json(), operation="create Pod")
         except (ValueError, ProviderResponseError) as exc:
             return self._reconcile_ambiguous_create(spec, cause=exc)
+
+    def _list_public_ip_offers(
+        self,
+        cloud_type: CloudType,
+        gpu_count: int,
+        *,
+        data_center_ids: Sequence[str],
+        gpu_type: str | None = None,
+    ) -> list[GpuOffer]:
+        if gpu_count < 1:
+            raise ProviderValidationError("RunPod GPU count must be at least 1")
+        variables: dict[str, Any] = {
+            "gpu": {"id": gpu_type} if gpu_type is not None else {},
+            "price": {
+                "gpuCount": gpu_count,
+                "secureCloud": cloud_type is CloudType.SECURE,
+                "supportPublicIp": True,
+            },
+        }
+        if data_center_ids:
+            variables["price"]["dataCenterId"] = ",".join(data_center_ids)
+        payload = self._graphql_json(
+            _PUBLIC_IP_OFFERS_QUERY,
+            variables,
+            operation="list public-IP-capable GPU offers",
+        )
+        try:
+            response = _GraphqlOfferResponse.model_validate(payload)
+        except ValidationError as exc:
+            raise ProviderResponseError(
+                "RunPod public-IP GPU discovery returned an unexpected response: "
+                f"{_validation_summary(exc)}"
+            ) from exc
+        if response.errors:
+            raise ProviderValidationError(
+                f"RunPod rejected public-IP GPU discovery: {_graphql_error_detail(response.errors)}"
+            )
+        if response.data is None:
+            raise ProviderResponseError("RunPod public-IP GPU discovery returned no data")
+        offers = [
+            _normalize_public_ip_offer(gpu, cloud_type, gpu_count)
+            for gpu in response.data.gpu_types
+        ]
+        if gpu_type is not None:
+            return offers
+        return [
+            offer
+            for offer in offers
+            if offer.public_ip_capable is True
+            and offer.availability not in {Availability.NONE, Availability.UNKNOWN}
+        ]
+
+    def _create_public_ip_worker(self, spec: WorkerSpec) -> Worker:
+        variables = {"input": _graphql_create_input(spec)}
+        try:
+            response = self._graphql_client.post(
+                self._graphql_url,
+                json={"query": _CREATE_PUBLIC_IP_POD_MUTATION, "variables": variables},
+            )
+        except httpx.TransportError as exc:
+            return self._reconcile_ambiguous_create(spec, cause=exc)
+        if response.status_code >= 500 or response.status_code in _AMBIGUOUS_MUTATION_STATUS_CODES:
+            return self._reconcile_ambiguous_create(
+                spec,
+                cause=ProviderOperationAmbiguousError(
+                    f"RunPod public-IP create returned HTTP {response.status_code}"
+                ),
+            )
+        _raise_for_provider_status(response, "create public-IP Pod")
+        try:
+            parsed = _GraphqlCreateResponse.model_validate(response.json())
+        except (ValueError, ValidationError) as exc:
+            return self._reconcile_ambiguous_create(spec, cause=exc)
+        if parsed.data is not None and parsed.data.pod is not None:
+            return Worker(
+                id=parsed.data.pod.id,
+                name=spec.name,
+                state=WorkerState.PROVISIONING,
+                native_status="CREATED",
+                gpu_type=spec.gpu_type,
+                gpu_count=spec.gpu_count,
+                cloud_type=spec.cloud_type,
+                exposed_ports=("22/tcp",),
+                image=spec.image,
+                template_id=spec.template_id,
+                container_disk_gb=spec.container_disk_gb,
+                volume_gb=spec.volume_gb,
+                volume_mount_path=spec.volume_mount_path,
+                network_volume_id=spec.network_volume_id,
+            )
+        if parsed.errors:
+            raise ProviderValidationError(
+                "RunPod rejected public-IP Pod creation before allocating a Pod: "
+                f"{_graphql_error_detail(parsed.errors)}"
+            )
+        return self._reconcile_ambiguous_create(
+            spec,
+            cause=ProviderResponseError("RunPod public-IP create returned no Pod ID"),
+        )
+
+    def _graphql_json(
+        self,
+        query: str,
+        variables: Mapping[str, Any],
+        *,
+        operation: str,
+    ) -> Any:
+        attempts = self._config.max_read_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self._graphql_client.post(
+                    self._graphql_url, json={"query": query, "variables": variables}
+                )
+            except httpx.TransportError as exc:
+                if attempt == attempts:
+                    raise ProviderUnavailableError(
+                        f"RunPod {operation} failed after {attempts} attempt(s): {redact(exc)}"
+                    ) from exc
+                self._backoff(attempt)
+                continue
+            if _is_retryable(response.status_code):
+                if attempt == attempts:
+                    raise ProviderUnavailableError(
+                        f"RunPod {operation} failed after {attempts} attempt(s): "
+                        f"HTTP {response.status_code}"
+                    )
+                self._backoff(attempt)
+                continue
+            _raise_for_provider_status(response, operation)
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise ProviderResponseError(
+                    f"RunPod {operation} returned invalid JSON (HTTP {response.status_code})"
+                ) from exc
+        raise AssertionError("bounded RunPod GraphQL retry loop exited unexpectedly")
 
     def start_worker(self, worker_id: str) -> Worker:
         """Request a start transition exactly once."""
@@ -493,6 +727,33 @@ def _create_payload(spec: WorkerSpec) -> dict[str, Any]:
     return payload
 
 
+def _graphql_create_input(spec: WorkerSpec) -> dict[str, Any]:
+    """Build the documented GraphQL placement request for public-IP capacity."""
+
+    payload: dict[str, Any] = {
+        "name": spec.name,
+        "cloudType": spec.cloud_type.value,
+        "gpuTypeId": spec.gpu_type,
+        "gpuCount": spec.gpu_count,
+        "containerDiskInGb": spec.container_disk_gb,
+        "volumeMountPath": spec.volume_mount_path,
+        "startSsh": True,
+        "supportPublicIp": True,
+        "ports": "22/tcp",
+    }
+    if spec.image is not None:
+        payload["imageName"] = spec.image
+    if spec.template_id is not None:
+        payload["templateId"] = spec.template_id
+    if spec.data_center_ids:
+        payload["dataCenterId"] = ",".join(spec.data_center_ids)
+    if spec.volume_gb:
+        payload["volumeInGb"] = spec.volume_gb
+    if spec.network_volume_id is not None:
+        payload["networkVolumeId"] = spec.network_volume_id
+    return payload
+
+
 def _parse_pod(payload: Any, *, operation: str) -> Worker:
     try:
         return _normalize_pod(_Pod.model_validate(payload))
@@ -593,6 +854,49 @@ def _normalize_gpu_offer(
     )
 
 
+def _normalize_public_ip_offer(
+    gpu: _GraphqlGpuType,
+    cloud_type: CloudType,
+    gpu_count: int,
+) -> GpuOffer:
+    compatible = gpu.lowest_price
+    price = compatible.uninterruptable_price if compatible is not None else None
+    maximum = compatible.max_gpu_count if compatible is not None else None
+    availability = Availability.NONE
+    public_ip_capable: bool | None = None
+    if compatible is not None:
+        availability = _normalize_graphql_availability(compatible.stock_status)
+        public_ip_capable = compatible.support_public_ip
+        if (
+            public_ip_capable is None
+            and price is not None
+            and availability
+            not in {
+                Availability.NONE,
+                Availability.UNKNOWN,
+            }
+        ):
+            # The result exists only after applying supportPublicIp=true to lowestPrice.
+            # RunPod currently leaves the redundant result field null.
+            public_ip_capable = True
+        if compatible.available_gpu_counts and gpu_count not in compatible.available_gpu_counts:
+            availability = Availability.NONE
+        if compatible.support_public_ip is False:
+            availability = Availability.NONE
+    return GpuOffer(
+        gpu_type_id=gpu.id,
+        display_name=gpu.display_name or gpu.id,
+        memory_gb=gpu.memory_gb,
+        cloud_type=cloud_type,
+        gpu_count=gpu_count,
+        maximum_gpu_count=maximum,
+        availability=availability,
+        price_per_gpu_hour=price,
+        total_price_per_hour=(price * Decimal(gpu_count) if price is not None else None),
+        public_ip_capable=public_ip_capable,
+    )
+
+
 def _normalize_status(native_status: str | None) -> WorkerState:
     return {
         "PROVISIONING": WorkerState.PROVISIONING,
@@ -616,6 +920,15 @@ def _normalize_availability(native_availability: str | None) -> Availability:
         return Availability((native_availability or "").upper())
     except ValueError:
         return Availability.UNKNOWN
+
+
+def _normalize_graphql_availability(stock_status: str | None) -> Availability:
+    normalized = (stock_status or "").strip().upper().replace(" ", "_")
+    if normalized in {"AVAILABLE", "IN_STOCK"}:
+        return Availability.HIGH
+    if normalized in {"OUT_OF_STOCK", "UNAVAILABLE", "NONE"}:
+        return Availability.NONE
+    return _normalize_availability(normalized)
 
 
 def _best_availability(data_centers: Sequence[GpuDataCenterAvailability]) -> Availability:
@@ -685,3 +998,7 @@ def _validation_summary(exc: ValidationError) -> str:
     first_error = exc.errors(include_url=False, include_input=False)[0]
     location = ".".join(str(part) for part in first_error["loc"])
     return f"{location}: {first_error['msg']}"
+
+
+def _graphql_error_detail(errors: Sequence[_GraphqlError]) -> str:
+    return redact(errors[0].message.strip())[:500]

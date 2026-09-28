@@ -98,6 +98,7 @@ class FakeProvider:
         self.start_calls = 0
         self.stop_calls = 0
         self.destroy_calls = 0
+        self.require_public_ip_calls: list[bool] = []
 
     def get_gpu_offer(
         self,
@@ -106,11 +107,13 @@ class FakeProvider:
         gpu_count: int,
         *,
         data_center_ids: Sequence[str] = (),
+        require_public_ip: bool = False,
     ) -> GpuOffer:
         assert gpu_type == "NVIDIA RTX A5000"
         assert cloud_type is CloudType.COMMUNITY
         assert gpu_count == 1
         assert data_center_ids == ()
+        self.require_public_ip_calls.append(require_public_ip)
         return self.offer
 
     def create_worker(self, spec: WorkerSpec) -> Worker:
@@ -193,6 +196,18 @@ def test_plan_rejects_unavailable_explicit_gpu(tmp_path: Path) -> None:
 
     with pytest.raises(ResourceUnavailableError, match="no confirmed"):
         _lifecycle(provider, tmp_path).plan_create(_spec(), max_hourly_price=None)
+
+
+def test_plan_requires_confirmed_public_ip_capacity_before_create(tmp_path: Path) -> None:
+    provider = FakeProvider(offer=_offer(public_ip_capable=False))
+
+    with pytest.raises(ResourceUnavailableError, match="public-IP-capable"):
+        _lifecycle(provider, tmp_path).plan_create(
+            _spec(require_direct_ssh=True, start_ssh=True), max_hourly_price=None
+        )
+
+    assert provider.require_public_ip_calls == [True]
+    assert provider.create_calls == 0
 
 
 def test_create_persists_provider_id_and_polls_to_running(tmp_path: Path) -> None:

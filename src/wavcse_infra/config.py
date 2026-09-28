@@ -23,6 +23,7 @@ from wavcse_infra.errors import ConfigurationError
 
 DEFAULT_CONFIG_PATH = Path("~/.config/wavcse-infra/config.toml")
 DEFAULT_RUNPOD_API_URL = "https://api.runpod.io/v2"
+DEFAULT_RUNPOD_GRAPHQL_URL = "https://api.runpod.io/graphql"
 TEMPLATE_PLACEHOLDER = "CHANGE_ME"
 
 
@@ -75,9 +76,10 @@ class AwsConfig(FrozenModel):
 
 
 class RunPodConfig(FrozenModel):
-    """HTTP and bounded lifecycle settings for the RunPod REST API."""
+    """HTTP endpoints and bounded lifecycle settings for RunPod APIs."""
 
     api_url: AnyHttpUrl = AnyHttpUrl(DEFAULT_RUNPOD_API_URL)
+    graphql_url: AnyHttpUrl = AnyHttpUrl(DEFAULT_RUNPOD_GRAPHQL_URL)
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
     api_key_parameter: str | None = Field(default=None, min_length=1, max_length=2048)
     request_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
@@ -98,7 +100,7 @@ class RunPodConfig(FrozenModel):
             return value.strip() or None
         return value
 
-    @field_validator("api_url")
+    @field_validator("api_url", "graphql_url")
     @classmethod
     def reject_api_url_secrets(cls, value: AnyHttpUrl) -> AnyHttpUrl:
         """Prevent bearer-like values from being persisted inside endpoint URLs."""
@@ -160,6 +162,7 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "WAVCSE_INFRA_MLFLOW_URL": ("controller", "mlflow_url"),
     "WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER": ("runpod", "api_key_parameter"),
     "WAVCSE_INFRA_RUNPOD_API_URL": ("runpod", "api_url"),
+    "WAVCSE_INFRA_RUNPOD_GRAPHQL_URL": ("runpod", "graphql_url"),
     "WAVCSE_INFRA_RUNPOD_CREATE_RECONCILE_ATTEMPTS": (
         "runpod",
         "create_reconcile_attempts",

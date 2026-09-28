@@ -92,6 +92,9 @@ def test_ssh_argv_uses_mapped_port_identity_and_dedicated_known_hosts(tmp_path: 
     assert "StrictHostKeyChecking=accept-new" in argv
     assert f"UserKnownHostsFile={config.known_hosts_file}" in argv
     assert "GlobalKnownHostsFile=/dev/null" in argv
+    assert "-T" in argv
+    assert "-t" not in argv
+    assert "-tt" not in argv
     assert argv[-2] == "root@203.0.113.9"
     assert argv[-1] == "printf %s 'hello world'"
     assert config.known_hosts_file.stat().st_mode & 0o777 == 0o600
@@ -109,6 +112,7 @@ def test_ssh_run_is_argv_based_captures_streams_and_exit_code(tmp_path: Path) ->
     result = SshExecutor(_config(tmp_path), runner=runner).run(
         _connection(),
         ("false",),
+        input_text="stdin payload",
     )
 
     assert result.exit_code == 7
@@ -116,7 +120,62 @@ def test_ssh_run_is_argv_based_captures_streams_and_exit_code(tmp_path: Path) ->
     assert result.stderr == "standard error"
     assert calls[0][1]["shell"] is False
     assert calls[0][1]["capture_output"] is True
+    assert calls[0][1]["input"] == "stdin payload"
     assert calls[0][1]["timeout"] == 10
+
+
+def test_interactive_ssh_forces_pty_and_inherits_terminal(tmp_path: Path) -> None:
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def runner(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0)
+
+    proxy = _connection(
+        kind="proxy",
+        host="ssh.runpod.io",
+        port=22,
+        username="pod-123-route",
+    )
+    executor = SshExecutor(_config(tmp_path), runner=runner)
+
+    assert executor.run_interactive(proxy) == 0
+
+    argv, kwargs = calls[0]
+    assert "-tt" in argv
+    assert "-T" not in argv
+    assert argv[-1] == "pod-123-route@ssh.runpod.io"
+    assert "capture_output" not in kwargs
+    assert "input" not in kwargs
+    assert "timeout" not in kwargs
+
+
+def test_automation_rejects_runpod_pty_proxy(tmp_path: Path) -> None:
+    proxy = _connection(
+        kind="proxy",
+        host="ssh.runpod.io",
+        port=22,
+        username="pod-123-route",
+    )
+
+    with pytest.raises(SshEndpointUnavailableError, match="basic SSH proxy"):
+        SshExecutor(_config(tmp_path)).argv(proxy, ("true",))
+
+
+def test_probe_rejects_proxy_error_text_even_with_exit_zero(tmp_path: Path) -> None:
+    def runner(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="Error: Your SSH client doesn't support PTY\n",
+            stderr="",
+        )
+
+    with pytest.raises(SshConnectionError, match="without the automation probe marker") as error:
+        SshExecutor(_config(tmp_path), runner=runner).probe(_connection())
+
+    assert "doesn't support PTY" in str(error.value)
 
 
 def test_ssh_rejects_insecure_private_key_permissions(tmp_path: Path) -> None:
@@ -229,7 +288,7 @@ def test_wait_ssh_refreshes_endpoint_and_succeeds(tmp_path: Path) -> None:
     assert state.ssh_ready == [(result.worker, result.connection)]
 
 
-def test_wait_ssh_falls_back_to_proxy_when_direct_connection_is_not_ready(
+def test_wait_ssh_never_falls_back_to_proxy_for_automation(
     tmp_path: Path,
 ) -> None:
     proxy = _connection(
@@ -238,27 +297,29 @@ def test_wait_ssh_falls_back_to_proxy_when_direct_connection_is_not_ready(
         port=22,
         username="pod-123-route",
     )
-    worker = _worker().model_copy(update={"ssh_proxy": proxy})
+    worker = _worker(connection=False).model_copy(update={"ssh_proxy": proxy})
 
     class Provider:
         def get_worker(self, worker_id: str) -> Worker:
             assert worker_id == "pod-123"
             return worker
 
-    probes: list[str] = []
-
     class Executor:
         def probe(self, connection: WorkerConnectionInfo) -> None:
-            probes.append(connection.kind)
-            if connection.kind == "direct":
-                raise SshConnectionError("connection refused")
+            raise AssertionError(f"proxy must not be probed for automation: {connection}")
 
-    result = WorkerSshWaiter(Provider(), Executor(), StateRecorder(), _config(tmp_path)).wait(
-        "pod-123"
-    )
+    clock = Clock()
+    with pytest.raises(SshReadinessTimeoutError, match="only its basic PTY proxy"):
+        WorkerSshWaiter(
+            Provider(),
+            Executor(),
+            StateRecorder(),
+            _config(tmp_path),
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+        ).wait("pod-123", timeout_seconds=3)
 
-    assert probes == ["direct", "proxy"]
-    assert result.connection.kind == "proxy"
+    assert clock.value == 3
 
 
 def test_wait_ssh_times_out_with_last_missing_endpoint_failure(tmp_path: Path) -> None:
@@ -272,7 +333,7 @@ def test_wait_ssh_times_out_with_last_missing_endpoint_failure(tmp_path: Path) -
             raise AssertionError(f"unexpected probe: {connection}")
 
     clock = Clock()
-    with pytest.raises(SshReadinessTimeoutError, match="has not published an SSH endpoint"):
+    with pytest.raises(SshReadinessTimeoutError, match="direct SSH endpoint"):
         WorkerSshWaiter(
             Provider(),
             Executor(),
