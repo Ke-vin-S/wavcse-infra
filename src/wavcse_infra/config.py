@@ -22,7 +22,7 @@ from pydantic import (
 from wavcse_infra.errors import ConfigurationError
 
 DEFAULT_CONFIG_PATH = Path("~/.config/wavcse-infra/config.toml")
-DEFAULT_RUNPOD_API_URL = "https://rest.runpod.io/v1"
+DEFAULT_RUNPOD_API_URL = "https://api.runpod.io/v2"
 TEMPLATE_PLACEHOLDER = "CHANGE_ME"
 
 
@@ -75,7 +75,7 @@ class AwsConfig(FrozenModel):
 
 
 class RunPodConfig(FrozenModel):
-    """Safe read-path settings for the RunPod REST API."""
+    """HTTP and bounded lifecycle settings for the RunPod REST API."""
 
     api_url: AnyHttpUrl = AnyHttpUrl(DEFAULT_RUNPOD_API_URL)
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
@@ -83,6 +83,10 @@ class RunPodConfig(FrozenModel):
     request_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     max_read_attempts: int = Field(default=3, ge=1, le=10)
     retry_backoff_seconds: float = Field(default=0.5, ge=0, le=30)
+    lifecycle_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    poll_interval_seconds: float = Field(default=2.0, gt=0, le=60)
+    max_poll_interval_seconds: float = Field(default=10.0, gt=0, le=120)
+    create_reconcile_attempts: int = Field(default=3, ge=1, le=10)
 
     @field_validator("api_key_parameter", mode="before")
     @classmethod
@@ -149,6 +153,19 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "WAVCSE_INFRA_MLFLOW_URL": ("controller", "mlflow_url"),
     "WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER": ("runpod", "api_key_parameter"),
     "WAVCSE_INFRA_RUNPOD_API_URL": ("runpod", "api_url"),
+    "WAVCSE_INFRA_RUNPOD_CREATE_RECONCILE_ATTEMPTS": (
+        "runpod",
+        "create_reconcile_attempts",
+    ),
+    "WAVCSE_INFRA_RUNPOD_LIFECYCLE_TIMEOUT_SECONDS": (
+        "runpod",
+        "lifecycle_timeout_seconds",
+    ),
+    "WAVCSE_INFRA_RUNPOD_MAX_POLL_INTERVAL_SECONDS": (
+        "runpod",
+        "max_poll_interval_seconds",
+    ),
+    "WAVCSE_INFRA_RUNPOD_POLL_INTERVAL_SECONDS": ("runpod", "poll_interval_seconds"),
     "WAVCSE_INFRA_RUNPOD_READ_ATTEMPTS": ("runpod", "max_read_attempts"),
     "WAVCSE_INFRA_RUNPOD_RETRY_BACKOFF_SECONDS": ("runpod", "retry_backoff_seconds"),
     "WAVCSE_INFRA_RUNPOD_TIMEOUT_SECONDS": ("runpod", "request_timeout_seconds"),

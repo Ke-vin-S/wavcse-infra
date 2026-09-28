@@ -184,7 +184,7 @@ fields the application uses, plus native status for diagnostics.
 
 ## ADR-008: Use stable RunPod REST API v1 while REST API v2 is beta
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-012
 - **Date:** 2026-09-27
 
 ### Context
@@ -250,7 +250,7 @@ authentication, and avoid making artifact transport depend on SCP.
 
 ### Consequences
 
-Phase 2 may display the documented `publicIp` and `portMappings["22"]` data but does not
+Phase 3 may display normalized v2 `ssh.proxy` and `ssh.direct` endpoint data but does not
 claim SSH readiness. S3 remains the planned data path.
 
 ### Official source
@@ -358,3 +358,61 @@ binary directories stay on the login-shell PATH.
 - [OpenAI Codex authentication](https://developers.openai.com/codex/auth)
 - [AGF repository and install options](https://github.com/subinium/agf#install)
 - [AGF v0.15.1 release](https://github.com/subinium/agf/releases/tag/v0.15.1)
+
+## ADR-012: Migrate worker management to RunPod REST API v2
+
+- **Status:** Accepted; supersedes ADR-008
+- **Date:** 2026-09-28
+
+### Context
+
+Before Phase 3, RunPod's current official documentation was reviewed again. REST API v1
+is now deprecated and scheduled for retirement on November 15, 2026. REST API v2 is no
+longer described as public beta, covers Pod create/read/start/stop/delete, and adds a
+GPU catalog with count- and cloud-scoped availability and prices. Extending the v1 read
+client would create new lifecycle code on an endpoint family with a near-term retirement
+date and would still lack the v2 catalog needed for safe pre-creation plans.
+
+REST v2 currently does not include the v1 `interruptible` Pod-create property. It also
+does not publish a Pod-create idempotency key or provider-enforced unique-name field.
+
+### Decision
+
+Use `https://api.runpod.io/v2` for Phase 3 worker discovery and lifecycle operations.
+Keep the existing bearer credential resolver and provider boundary. Normalize v2 wire
+objects into the internal worker and GPU-offer models; do not introduce GraphQL.
+
+Use current catalog list prices and availability for the creation plan and client-side
+maximum-price guard. Reject interruptible requests explicitly instead of silently
+creating on-demand capacity. Generate a high-entropy exact Pod name, issue create once,
+and reconcile ambiguous responses by exact name without retrying the POST.
+
+### Alternatives considered
+
+- Continue with REST v1: rejected because it is deprecated, has a published retirement
+  date, and lacks the current REST catalog.
+- Mix v1 create with v2 discovery/lifecycle to retain interruptible Pods: rejected
+  because it splits one resource across incompatible request/response contracts and
+  depends on the retiring endpoint.
+- Use GraphQL for pricing or spot creation: rejected because the supported REST surface
+  covers the required on-demand lifecycle, and Phase 3 should not add a second API solely
+  to recover a field missing from v2.
+- Retry create after an exact-name list returns no match: rejected because Pod names are
+  not provider-enforced unique and list visibility may lag the create response.
+
+### Consequences
+
+Existing user configuration that pins `https://rest.runpod.io/v1` must be changed to
+`https://api.runpod.io/v2`. Phase 2 fixtures and normalization move to the v2 schema.
+The provider can safely discover current on-demand offers but cannot create spot Pods;
+that limitation remains visible. Maximum-price enforcement is a client preflight guard,
+not an atomic provider price reservation. Ambiguous create failures may require manual
+inspection, but the automation will not intentionally duplicate a paid Pod.
+
+### Official sources
+
+- [RunPod REST API v2 overview](https://docs.runpod.io/api-reference-v2/overview)
+- [RunPod migration guide](https://docs.runpod.io/api-reference-v2/migrate-from-v1)
+- [RunPod v2 OpenAPI schema](https://api.runpod.io/v2/openapi.json)
+- [RunPod v2 GPU catalog](https://docs.runpod.io/api-reference-v2/catalog/list-gpu-types)
+- [RunPod v2 create Pod](https://docs.runpod.io/api-reference-v2/pods/create-a-pod)

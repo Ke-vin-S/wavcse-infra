@@ -14,11 +14,15 @@ github_url = "https://github.com"
 wavcse = "~/projects/wavCSE"
 
 [runpod]
-api_url = "https://rest.runpod.io/v1"
+api_url = "https://api.runpod.io/v2"
 api_key_parameter = "/wavcse-infra/runpod/api-key"
 request_timeout_seconds = 10.0
 max_read_attempts = 3
 retry_backoff_seconds = 0.5
+lifecycle_timeout_seconds = 300.0
+poll_interval_seconds = 2.0
+max_poll_interval_seconds = 10.0
+create_reconcile_attempts = 3
 
 [storage]
 bucket = "CHANGE_ME"

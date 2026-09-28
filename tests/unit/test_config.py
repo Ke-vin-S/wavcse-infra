@@ -74,6 +74,7 @@ def test_precedence_is_cli_then_environment_then_file_then_defaults(tmp_path: Pa
 [runpod]
 request_timeout_seconds = 20
 max_read_attempts = 2
+poll_interval_seconds = 2
 api_key_parameter = "/from-file"
 
 [storage]
@@ -87,6 +88,7 @@ prefix = "from-file"
         environ={
             "WAVCSE_INFRA_RUNPOD_TIMEOUT_SECONDS": "30",
             "WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER": "/from-environment",
+            "WAVCSE_INFRA_RUNPOD_POLL_INTERVAL_SECONDS": "4",
             "WAVCSE_INFRA_S3_PREFIX": "from-environment",
         },
         cli_overrides={"runpod.request_timeout_seconds": 40},
@@ -94,6 +96,7 @@ prefix = "from-file"
 
     assert settings.runpod.request_timeout_seconds == 40
     assert settings.runpod.max_read_attempts == 2
+    assert settings.runpod.poll_interval_seconds == 4
     assert settings.runpod.api_key_parameter == "/from-environment"
     assert settings.storage.prefix == "from-environment"
 

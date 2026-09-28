@@ -11,7 +11,7 @@ repository.
 
 ## Delivery status
 
-The repository currently implements Phases 0–2 of the v1 specification:
+The repository currently implements Phases 0–3 of the v1 specification:
 
 - a typed `infra` CLI and layered TOML/environment configuration;
 - Ruff, pytest, ShellCheck, and shfmt validation;
@@ -19,12 +19,17 @@ The repository currently implements Phases 0–2 of the v1 specification:
 - idempotent Ubuntu controller bootstrap and thin cloud-init;
 - reproducible controller-only installation of OMP, Codex CLI, and AGF;
 - `infra doctor` controller, credential-source, configuration, and connectivity checks;
-- read-only `infra worker list` and `infra worker show` RunPod operations;
-- provider-neutral worker models and bounded retries for safe provider reads;
+- normalized RunPod REST v2 list/show and GPU offer discovery;
+- explicit create/start/stop/destroy with bounded polling and exact-ID safeguards;
+- current provider price/availability plans, interactive confirmation, `--yes`, and a
+  maximum-hourly-price guard;
+- conservative ambiguous-create reconciliation without automatic POST retries;
+- atomic non-secret local worker state beneath `~/.local/state/wavcse-infra/`;
+- provider-neutral worker/request/offer models and bounded retries for safe reads;
 - initial architecture, security, operations, provider, and decision documentation.
 
-No implemented command can create, modify, or destroy a RunPod resource. Paid worker
-lifecycle operations remain unavailable pending a separate review.
+Phase 3 manages Pod resources only. SSH connections, worker bootstrap, artifact
+transfer, wavCSE checkout/execution, MLflow runs, and jobs remain unimplemented.
 
 ## Architecture
 
@@ -138,6 +143,7 @@ The TOML contains only the non-secret SSM parameter name:
 ```toml
 [runpod]
 api_key_parameter = "/wavcse-infra/runpod/api-key"
+api_url = "https://api.runpod.io/v2"
 ```
 
 The key itself remains in an SSM `SecureString`. Boto3 reads it with decryption through
@@ -160,6 +166,11 @@ infra config validate
 infra doctor
 infra worker list
 infra worker show <worker-id>
+infra worker gpu-types --cloud COMMUNITY --gpu-count 1
+infra worker create --gpu <exact-type-id> --cloud COMMUNITY --image <image> --max-price <usd-hour>
+infra worker stop <exact-worker-id>
+infra worker start <exact-worker-id>
+infra worker destroy <exact-worker-id>
 ```
 
 Global `--config`, `--runpod-api-url`, `--runpod-timeout`, and `--verbose` options must
@@ -167,11 +178,26 @@ appear before the command name.
 
 ## Worker lifecycle
 
-The planned lifecycle is create, wait for provider readiness, discover SSH, bootstrap,
-health-check, execute an exact committed wavCSE revision, persist requested outputs,
-and explicitly stop or destroy. Phase 2 only inspects existing workers. Creation,
-mutation, SSH access, job execution, and destruction remain intentionally unavailable
-pending review.
+Phase 3 implements the Pod-resource portion of the lifecycle: discover an exact current
+GPU offer, enforce availability and price limits, print and confirm a creation plan,
+create once, persist the provider ID, and poll to a bounded provider state. Start, stop,
+and destroy use exact provider IDs. Create and destroy require confirmation unless
+`--yes` is supplied; that flag never bypasses validation or `--max-price`.
+
+Every CLI-created Pod receives a high-entropy `wavcse-...` identity. If a create response
+is lost, the client reconciles by the complete identity and never blindly retries the
+paid POST. RunPod remains authoritative; local state is supplemental and contains no
+credentials.
+
+Stopping retains the Pod. Compute cost stops according to the provider status, but
+persistent or network storage can continue to incur charges. Destroying terminates the
+Pod after showing the exact target and does not delete separately managed network
+volumes.
+
+REST API v2 currently does not expose interruptible/spot Pod creation. The CLI rejects
+`--interruptible` instead of silently falling back to on-demand capacity. See
+[RunPod provider notes](docs/RUNPOD.md) and [Operations](docs/OPERATIONS.md) for the safe
+first-worker procedure and current limitations.
 
 Normal GPU workers do not install OMP, Codex, AGF, or other agent-development tooling.
 Any future development-worker profile must add that behavior explicitly without
@@ -217,4 +243,5 @@ make check
 ```
 
 CI runs the same non-live checks without AWS or RunPod credentials. Provider HTTP is
-mocked in tests and CI never creates paid infrastructure.
+mocked in tests; no normal test or validation command creates, starts, stops, or destroys
+paid infrastructure.

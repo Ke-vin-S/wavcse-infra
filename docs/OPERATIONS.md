@@ -30,6 +30,10 @@ Supported environment variables:
 | `WAVCSE_INFRA_CONFIG` | Alternate user TOML path |
 | `WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER` | Non-secret SSM parameter-name override |
 | `WAVCSE_INFRA_RUNPOD_API_URL` | RunPod REST base URL |
+| `WAVCSE_INFRA_RUNPOD_CREATE_RECONCILE_ATTEMPTS` | Exact-name checks after an ambiguous create |
+| `WAVCSE_INFRA_RUNPOD_LIFECYCLE_TIMEOUT_SECONDS` | Default create/start/stop/destroy wait timeout |
+| `WAVCSE_INFRA_RUNPOD_MAX_POLL_INTERVAL_SECONDS` | Maximum lifecycle polling delay |
+| `WAVCSE_INFRA_RUNPOD_POLL_INTERVAL_SECONDS` | Initial lifecycle polling delay |
 | `WAVCSE_INFRA_RUNPOD_TIMEOUT_SECONDS` | Per-request timeout |
 | `WAVCSE_INFRA_RUNPOD_READ_ATTEMPTS` | Total safe read attempts |
 | `WAVCSE_INFRA_RUNPOD_RETRY_BACKOFF_SECONDS` | Initial retry delay |
@@ -224,17 +228,27 @@ The installer downloads official installer scripts to a temporary file before
 execution; it does not use an opaque `curl | sudo bash` pipeline. It never runs login,
 writes provider credentials, or changes existing OMP/Codex authentication stores.
 
-## Routine read-only operations
+## RunPod worker operations
 
 ```bash
 infra doctor
 ```
 
-Inspect existing RunPod workers without changing provider state:
+Phase 3 requires the current REST v2 base URL. Controllers created from the older
+Phase 2 template must update their user-owned file explicitly:
+
+```toml
+[runpod]
+api_url = "https://api.runpod.io/v2"
+```
+
+Inspect existing RunPod workers and current offers without changing provider state:
 
 ```bash
 infra worker list
 infra worker show <worker-id>
+infra worker gpu-types --cloud COMMUNITY --gpu-count 1
+infra worker gpu-types --cloud SECURE --gpu-count 1 --json
 ```
 
 `infra doctor` reports the loaded configuration path, AWS region, S3 bucket, and worker
@@ -254,10 +268,10 @@ PASS S3 bucket: wavcse-research-artifacts
 PASS Worker SSH key: /home/ubuntu/.ssh/wavcse_worker
 ```
 
-`worker list` and `worker show` call only documented GET endpoints. The API token is
-resolved once per command from `RUNPOD_API_KEY` or the configured SSM parameter. The
-secret is never read from TOML or a CLI option. These commands do not change provider
-state.
+`worker list`, `worker show`, and `worker gpu-types` call only documented GET endpoints.
+The API token is resolved once per command from `RUNPOD_API_KEY` or the configured SSM
+parameter. The secret is never read from TOML or a CLI option. These commands do not
+change provider state.
 
 Validate SSM resolution after a fresh SSH login without an environment override:
 
@@ -269,6 +283,83 @@ infra worker list
 
 Doctor reports the source and may display the non-secret parameter name, but never the
 value, length, prefix, suffix, hash, or fingerprint.
+
+### Safe first-worker procedure
+
+1. Inspect Community Cloud offers for one GPU. Choose an exact type with confirmed
+   availability and note its displayed total hourly price:
+
+   ```bash
+   infra worker gpu-types --cloud COMMUNITY --gpu-count 1
+   ```
+
+2. Create one worker using that exact GPU ID, a deliberately selected image or template,
+   minimal storage, and a maximum price at or just above the displayed total:
+
+   ```bash
+   infra worker create \
+     --gpu '<exact-gpu-type-id>' \
+     --gpu-count 1 \
+     --cloud COMMUNITY \
+     --image '<reviewed-container-image>' \
+     --container-disk 20 \
+     --volume 0 \
+     --max-price '<maximum-total-usd-per-hour>'
+   ```
+
+   The command prints the generated infra identity, resource selection, storage,
+   availability, and current provider list price before prompting. Review the complete
+   plan, then answer `y`. For deliberate non-interactive automation, add `--yes`; it
+   does not bypass the maximum price or availability checks.
+
+3. Record the provider ID printed after the Pod reaches `RUNNING`, inspect it, and stop
+   or destroy it using only that exact ID:
+
+   ```bash
+   infra worker show <exact-worker-id>
+   infra worker stop <exact-worker-id>
+   infra worker start <exact-worker-id>
+   infra worker destroy <exact-worker-id>
+   ```
+
+   Create/start/stop/destroy waits are bounded. Override one command with
+   `--wait-timeout <seconds>` when needed.
+
+### Stop versus destroy
+
+`stop` retains the Pod and its persistent configuration. RunPod reports zero current
+compute cost for an exited Pod, but retained storage can still incur charges. Current
+RunPod documentation says host-local volume storage is charged while stopped and a
+network volume continues its independent storage charge. Container disk is erased on
+stop.
+
+`destroy` terminates the Pod resource permanently. It shows the exact ID, name, GPU,
+state, and known running price, then requires confirmation unless `--yes` is supplied.
+It never accepts a loose name or resolves a prefix. An already-absent ID is reported as
+such and does not cause another resource to be selected. Separately managed network
+volumes are not deleted by this command.
+
+### Local state and reconciliation
+
+Created-worker metadata is stored beneath:
+
+```text
+~/.local/state/wavcse-infra/workers.json
+```
+
+Writes are atomic and contain no credentials. Provider reads remain authoritative.
+`worker list` and `worker show` update known records while leaving unrelated account
+Pods unclaimed. Missing tracked Pods are marked absent locally.
+
+If create loses its response, the CLI checks for the exact generated infra name. It
+adopts one exact match, reports multiple matches, or fails safely after bounded checks.
+It never retries the paid create POST. On the uncertain/no-match result, run:
+
+```bash
+infra worker list
+```
+
+Inspect the generated identity shown in the error before issuing another create.
 
 ## Controller reconstruction
 
@@ -293,9 +384,19 @@ artifacts from S3, and experiment metadata from MLflow/DagsHub.
 - SSM AWS/network failure: verify the configured region, instance profile, IMDS access,
   and controller connectivity; do not create permanent AWS access keys.
 - RunPod 401/403 after successful resolution: rotate or correct the stored RunPod key;
-  do not print it.
+  for 403, also verify that the key has the required resource permission; do not print
+  the key.
+- REST v1 configuration error: change `runpod.api_url` to `https://api.runpod.io/v2`.
+- Invalid/unavailable GPU: rerun `infra worker gpu-types` with the intended cloud and
+  count; do not substitute a different resource implicitly.
+- Maximum price rejection: select a cheaper explicit offer or deliberately raise the
+  limit after reviewing current pricing. `--yes` cannot bypass the guard.
+- Ambiguous create: inspect `infra worker list` for the complete generated identity.
+  The CLI intentionally did not repeat the create request.
 - RunPod 404 on `worker show`: verify the immutable provider worker ID and account.
 - RunPod 429/5xx or transport failure: safe reads retry within the configured bound.
+- Lifecycle timeout: inspect the exact ID with `infra worker show`; the error includes
+  the last known provider state and does not imply the resource is absent.
 - AWS identity failure: verify an instance profile is attached and IMDS access is not
   blocked. Do not work around it by creating permanent access keys.
 - S3 failure: verify region, bucket, prefix, and role policy separately.
@@ -303,7 +404,8 @@ artifacts from S3, and experiment metadata from MLflow/DagsHub.
 - OMP/Codex/AGF check failure: run `make install-agents`, start a new login shell, and
   rerun `infra doctor`.
 
-No automated cleanup is present in Phases 0–2, and no paid resource is created.
+No normal test, CI job, or validation target performs a paid RunPod mutation. Operators
+must invoke lifecycle commands explicitly.
 
 ## Bootstrap implementation notes
 

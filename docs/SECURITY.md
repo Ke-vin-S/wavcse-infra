@@ -62,6 +62,24 @@ and process-list exposure. Resolved values are not persisted in configuration or
 state. HTTP authorization headers are never rendered. Provider and SSM failures expose
 only safe operation/status context; user-facing errors pass through redaction.
 
+Phase 3 uses REST API v2. Safe GET operations may retry; paid creation is sent once and
+is never automatically repeated. A lost create response is reconciled only against the
+complete generated infra identity. Start, stop, and destroy accept exact provider IDs;
+destroy never resolves names or prefixes. `--yes` skips the human confirmation only and
+does not disable cost, capacity, identity, or request validation.
+
+### Local operational state
+
+Created-worker metadata lives in `~/.local/state/wavcse-infra/workers.json`. The
+directory is mode `0700`, the JSON file is mode `0600`, and writes use a temporary file
+in the same directory followed by `fsync` and atomic replacement. The file may contain
+provider IDs, generated names, requested/observed GPU configuration, catalog or observed
+price, timestamps, lifecycle state, and provider-reported SSH endpoint coordinates.
+
+It must never contain the RunPod key, authorization headers, SSM values, AWS
+credentials, private keys, or complete environment data. RunPod remains authoritative;
+the local file is not permission to delete a different or similarly named Pod.
+
 ### SSH
 
 Future worker access will use a dedicated key. Private keys remain on the controller.
