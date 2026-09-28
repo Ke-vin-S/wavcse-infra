@@ -35,9 +35,14 @@ Controller IAM role
   -> controller verifies durable object
 ```
 
-Phase 4 extends the RunPod Pod lifecycle through SSH-ready, bootstrapped, GPU-healthy,
-and locally `READY`. It does not perform artifact transfer, repository checkout,
-research dependency installation, or job execution.
+Every storage key is resolved beneath the configured `storage.prefix`, so the
+controller can only address its own namespace. The presigned URL is transported on the
+direct SSH stdin stream rather than as a process argument, and worker-side code holds no
+AWS credential.
+
+Phase 5 adds canonical S3 access, version 1 artifact manifests, and worker artifact
+transfer. It does not perform repository checkout, research dependency installation,
+or job execution.
 
 ## Implemented modules
 
@@ -63,6 +68,19 @@ research dependency installation, or job execution.
   lifecycle state.
 - `worker/bootstrap.sh` and `worker/health-check.sh` are the idempotent worker-side
   setup and inspection contracts packaged with the CLI.
+- `storage/keys.py` is the single namespace rule: it canonicalizes the prefix and
+  rejects absolute, escaping, ambiguous, or repeated keys before any API call.
+- `storage/s3.py` owns Boto3 object operations (list, metadata, small-object read,
+  presign, verification) for one configured bucket and prefix, and redacts presigned
+  URLs unless a caller explicitly reveals one.
+- `storage/manifests.py` defines schema version 1 artifact manifests, their deterministic
+  JSON form, and the embedding archive key conventions.
+- `storage/worker_transfer.py` is the stdlib-only program executed on the worker: it
+  streams a presigned transfer, verifies size and SHA-256, materializes atomically, and
+  reports a tab-separated result. It is also importable, so the same code is unit-tested
+  on the controller.
+- `storage/transfer.py` presigns, streams that module over direct SSH stdin with the URL
+  on the same stream, parses the worker result strictly, and verifies uploaded objects.
 - `redaction.py` removes authorization values, known secret assignments, and URL
   query strings from user-facing external errors.
 - `controller/bootstrap.sh` converges supported Ubuntu controllers on required tools
@@ -106,6 +124,32 @@ config runpod.api_key_parameter
   -> SSM GetParameter(WithDecryption=True) via EC2 instance profile
   -> in-memory RunPod client credential
 ```
+
+## Artifact transfer flow
+
+```text
+infra storage download <key> <worker-path> --worker <id>
+  -> controller resolves <key> beneath storage.prefix
+  -> HEAD confirms the object exists
+  -> presigned GET, bounded lifetime, one object
+  -> direct SSH: `python3 - download ...` with stdin =
+       WAVCSE_PRESIGNED_URL = '<url>'
+       WAVCSE_IF_NONE_MATCH = False
+       <reviewed worker module source>
+  -> worker streams to <path>.wavcse-partial-<pid>-<random>
+  -> expected size/SHA-256 checked when supplied, then atomic materialization
+  -> tab-separated result parsed and validated at the controller
+
+infra storage upload <key> <worker-path> --worker <id>
+  -> HEAD confirms the key is free unless --overwrite
+  -> presigned PUT with signed If-None-Match: * unless --overwrite
+  -> worker hashes the bytes sent, reports size and digest
+  -> controller HEAD verifies the stored size
+```
+
+The URL never appears in a process argument list on either side; it travels only inside
+the encrypted SSH channel's stdin. `infra storage verify` and
+`infra storage presign-*` are controller-only and never touch a worker.
 
 ## Worker lifecycle flow
 
@@ -165,5 +209,6 @@ Missing optional provider fields remain `None`; the parser does not invent metad
 
 ## Deferred architecture
 
-S3 transfer, exact-commit checkout/execution, research environments, MLflow execution,
-jobs, and scheduling remain deferred. Direct SSH is not used as the artifact transport.
+Exact-commit checkout/execution, research environments, MLflow execution, jobs, and
+scheduling remain deferred. S3 remains the artifact transport; direct SSH carries only
+the small transfer program and its presigned URL on stdin, never artifact bytes.

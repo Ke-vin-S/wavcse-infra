@@ -402,6 +402,8 @@ infra storage list
 infra storage presign-download <artifact>
 infra storage presign-upload <artifact>
 infra storage verify <artifact>
+infra storage download <artifact> --worker <worker-id> <worker-path>
+infra storage upload <artifact> --worker <worker-id> <worker-path>
 
 infra job submit <job-spec>
 infra job status <job-id>

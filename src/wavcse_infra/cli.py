@@ -23,6 +23,8 @@ from wavcse_infra.errors import (
     ProviderNotFoundError,
     SshEndpointUnavailableError,
     StateError,
+    StorageError,
+    StorageObjectNotFoundError,
 )
 from wavcse_infra.models import (
     CloudType,
@@ -36,6 +38,17 @@ from wavcse_infra.models import (
 from wavcse_infra.providers.runpod import RunPodClient
 from wavcse_infra.redaction import redact
 from wavcse_infra.state import WorkerRecord, WorkerStateStore
+from wavcse_infra.storage.manifests import ArtifactManifest, load_manifest_json
+from wavcse_infra.storage.s3 import (
+    MAX_PRESIGN_EXPIRY_SECONDS,
+    MIN_PRESIGN_EXPIRY_SECONDS,
+    S3Storage,
+    StorageVerification,
+)
+from wavcse_infra.storage.transfer import (
+    ArtifactTransferResult,
+    WorkerArtifactTransfer,
+)
 from wavcse_infra.workers.bootstrap import WorkerBootstrapper
 from wavcse_infra.workers.lifecycle import WorkerLifecycle
 from wavcse_infra.workers.ssh import SshExecutor, WorkerSshWaiter, select_worker_connection
@@ -48,8 +61,10 @@ app = typer.Typer(
 )
 config_app = typer.Typer(help="Validate controller configuration.", no_args_is_help=True)
 worker_app = typer.Typer(help="Manage RunPod GPU workers.", no_args_is_help=True)
+storage_app = typer.Typer(help="Inspect and transfer canonical S3 artifacts.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 app.add_typer(worker_app, name="worker")
+app.add_typer(storage_app, name="storage")
 
 
 @dataclass(frozen=True)
@@ -694,6 +709,348 @@ def destroy_worker(
         typer.echo(f"RunPod worker {worker_id} was destroyed and is now absent.")
 
 
+@storage_app.command("list")
+def list_storage(
+    context: typer.Context,
+    prefix: Annotated[
+        str | None,
+        typer.Option(
+            "--prefix",
+            help="Restrict to a key prefix relative to the configured namespace.",
+        ),
+    ] = None,
+    limit: Annotated[
+        int, typer.Option("--limit", min=1, max=1000, help="Maximum objects to display.")
+    ] = 100,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """List objects inside the configured bucket prefix."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        storage = S3Storage.from_settings(settings)
+        objects = storage.list_objects(prefix or "", limit=limit)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except StorageError as exc:
+        _storage_failure(exc)
+    if json_output:
+        _print_json([stored.model_dump(mode="json") for stored in objects])
+        return
+    if not objects:
+        typer.echo(f"No objects found under s3://{storage.bucket}/{storage.prefix}/.")
+        return
+
+    typer.echo("SIZE\tLAST MODIFIED\tKEY")
+    for stored in objects:
+        typer.echo(
+            "\t".join(
+                (
+                    str(stored.size_bytes),
+                    stored.last_modified.isoformat() if stored.last_modified else "-",
+                    f"s3://{storage.bucket}/{stored.key}",
+                )
+            )
+        )
+
+
+@storage_app.command("presign-download")
+def presign_download(
+    context: typer.Context,
+    artifact: Annotated[
+        str,
+        typer.Argument(help="Artifact key relative to the configured namespace prefix."),
+    ],
+    expires_in: Annotated[
+        int | None,
+        typer.Option(
+            "--expires-in",
+            min=MIN_PRESIGN_EXPIRY_SECONDS,
+            max=MAX_PRESIGN_EXPIRY_SECONDS,
+            help="URL lifetime in seconds; defaults to storage.presign_expiry_seconds.",
+        ),
+    ] = None,
+) -> None:
+    """Print one time-limited GET URL for an exact stored object.
+
+    The URL is a bearer secret. It is written only to standard output as the explicitly
+    requested result of this command and is never recorded in logs or local state.
+    """
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        storage = S3Storage.from_settings(settings)
+        if storage.object_metadata(artifact) is None:
+            raise StorageObjectNotFoundError(
+                f"s3://{storage.bucket}/{storage.object_key(artifact)} does not exist; "
+                "list the namespace before presigning a download"
+            )
+        presigned = storage.presign_download(artifact, expires_in_seconds=expires_in)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except StorageError as exc:
+        _storage_failure(exc)
+    typer.echo(presigned.reveal())
+
+
+@storage_app.command("presign-upload")
+def presign_upload(
+    context: typer.Context,
+    artifact: Annotated[
+        str,
+        typer.Argument(help="Artifact key relative to the configured namespace prefix."),
+    ],
+    expires_in: Annotated[
+        int | None,
+        typer.Option(
+            "--expires-in",
+            min=MIN_PRESIGN_EXPIRY_SECONDS,
+            max=MAX_PRESIGN_EXPIRY_SECONDS,
+            help="URL lifetime in seconds; defaults to storage.presign_expiry_seconds.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Permit replacing an object that already exists at this key.",
+        ),
+    ] = False,
+) -> None:
+    """Print one time-limited PUT URL for an exact artifact key.
+
+    The URL is a bearer secret. It is written only to standard output as the explicitly
+    requested result of this command and is never recorded in logs or local state.
+    """
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        storage = S3Storage.from_settings(settings)
+        storage.require_writable(artifact, overwrite=overwrite)
+        presigned = storage.presign_upload(
+            artifact, expires_in_seconds=expires_in, overwrite=overwrite
+        )
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except StorageError as exc:
+        _storage_failure(exc)
+    typer.echo(presigned.reveal())
+    if presigned.if_none_match:
+        typer.echo("Send the signed HTTP header 'If-None-Match: *' with this PUT.", err=True)
+
+
+@storage_app.command("verify")
+def verify_artifact(
+    context: typer.Context,
+    artifact: Annotated[
+        str,
+        typer.Argument(help="Artifact key relative to the configured namespace prefix."),
+    ],
+    expected_size: Annotated[
+        int | None,
+        typer.Option("--expected-size", min=0, help="Required object size in bytes."),
+    ] = None,
+    manifest: Annotated[
+        str | None,
+        typer.Option("--manifest", help="Manifest object key stored in the namespace."),
+    ] = None,
+    manifest_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--manifest-file",
+            dir_okay=False,
+            help="Local manifest JSON to check against the stored object.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Verify stored existence, size, and manifest consistency without downloading.
+
+    This command deliberately makes no cryptographic claim about object content: S3
+    ETags are not SHA-256 digests, and the recorded digest is only confirmed when
+    something actually reads the bytes.
+    """
+
+    settings = _load_cli_settings(_context(context))
+    if manifest is not None and manifest_file is not None:
+        _configuration_failure(
+            ConfigurationError("--manifest and --manifest-file are mutually exclusive")
+        )
+    try:
+        storage = S3Storage.from_settings(settings)
+        artifact_manifest = (
+            storage.read_manifest(manifest)
+            if manifest is not None
+            else _load_manifest_file(manifest_file)
+        )
+        verification = storage.verify_object(
+            artifact,
+            expected_size=expected_size,
+            manifest=artifact_manifest,
+        )
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except StorageError as exc:
+        _storage_failure(exc)
+    if json_output:
+        _print_json(verification.model_dump(mode="json"))
+        return
+    _print_storage_verification(verification, bucket=storage.bucket)
+
+
+@storage_app.command("download")
+def download_artifact(
+    context: typer.Context,
+    artifact: Annotated[
+        str,
+        typer.Argument(help="Artifact key relative to the configured namespace prefix."),
+    ],
+    destination: Annotated[
+        str,
+        typer.Argument(help="Absolute destination path on the worker."),
+    ],
+    worker: Annotated[
+        str, typer.Option("--worker", help="Exact RunPod worker ID that receives the artifact.")
+    ],
+    expected_size: Annotated[
+        int | None,
+        typer.Option("--expected-size", min=0, help="Required object size in bytes."),
+    ] = None,
+    expected_sha256: Annotated[
+        str | None,
+        typer.Option("--expected-sha256", help="Required SHA-256 digest of the object."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Replace an existing destination file on the worker."),
+    ] = False,
+    expires_in: Annotated[
+        int | None,
+        typer.Option(
+            "--expires-in",
+            min=MIN_PRESIGN_EXPIRY_SECONDS,
+            max=MAX_PRESIGN_EXPIRY_SECONDS,
+            help="Presigned URL lifetime in seconds.",
+        ),
+    ] = None,
+    wait_timeout: Annotated[
+        float | None,
+        typer.Option("--wait-timeout", min=0.1, help="SSH readiness timeout in seconds."),
+    ] = None,
+    command_timeout: Annotated[
+        float | None,
+        typer.Option("--command-timeout", min=0.1, help="Transfer timeout in seconds."),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Materialize one S3 artifact on a READY worker through a presigned GET URL."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            result = _worker_transfer(client, settings).download(
+                worker,
+                storage=S3Storage.from_settings(settings),
+                key=artifact,
+                destination=destination,
+                expected_size=expected_size,
+                expected_sha256=expected_sha256,
+                overwrite=overwrite,
+                expires_in_seconds=expires_in,
+                wait_timeout_seconds=wait_timeout,
+                command_timeout_seconds=command_timeout,
+            )
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    if json_output:
+        _print_json(result.model_dump(mode="json"))
+        return
+    typer.echo(f"Worker {worker} downloaded the artifact.")
+    _print_transfer_result(result)
+
+
+@storage_app.command("upload")
+def upload_artifact(
+    context: typer.Context,
+    artifact: Annotated[
+        str,
+        typer.Argument(help="Artifact key relative to the configured namespace prefix."),
+    ],
+    source: Annotated[
+        str,
+        typer.Argument(help="Absolute path of the artifact on the worker."),
+    ],
+    worker: Annotated[
+        str, typer.Option("--worker", help="Exact RunPod worker ID that uploads the artifact.")
+    ],
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Permit replacing a persisted object that already exists at this key.",
+        ),
+    ] = False,
+    expires_in: Annotated[
+        int | None,
+        typer.Option(
+            "--expires-in",
+            min=MIN_PRESIGN_EXPIRY_SECONDS,
+            max=MAX_PRESIGN_EXPIRY_SECONDS,
+            help="Presigned URL lifetime in seconds.",
+        ),
+    ] = None,
+    wait_timeout: Annotated[
+        float | None,
+        typer.Option("--wait-timeout", min=0.1, help="SSH readiness timeout in seconds."),
+    ] = None,
+    command_timeout: Annotated[
+        float | None,
+        typer.Option("--command-timeout", min=0.1, help="Transfer timeout in seconds."),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Upload one worker artifact through a presigned PUT URL, then verify it."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            outcome = _worker_transfer(client, settings).upload(
+                worker,
+                storage=S3Storage.from_settings(settings),
+                source=source,
+                key=artifact,
+                overwrite=overwrite,
+                expires_in_seconds=expires_in,
+                wait_timeout_seconds=wait_timeout,
+                command_timeout_seconds=command_timeout,
+            )
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    if json_output:
+        _print_json(outcome.model_dump(mode="json"))
+        return
+    typer.echo(f"Worker {worker} uploaded the artifact.")
+    _print_transfer_result(outcome.result)
+    typer.echo("Controller verification of the stored object follows.")
+    _print_storage_verification(outcome.verification, bucket=settings.storage.bucket or "-")
+
+
 def _context(context: typer.Context) -> CliContext:
     root_context = context.find_root().obj
     if not isinstance(root_context, CliContext):
@@ -748,6 +1105,24 @@ def _ssh_access(
     return executor, waiter
 
 
+def _worker_transfer(
+    client: RunPodClient,
+    settings: Settings,
+) -> WorkerArtifactTransfer:
+    executor, waiter = _ssh_access(client, settings)
+    return WorkerArtifactTransfer(waiter, executor, settings.ssh)
+
+
+def _load_manifest_file(path: Path | None) -> ArtifactManifest | None:
+    if path is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigurationError(f"Could not read manifest file {path}: {redact(exc)}") from exc
+    return load_manifest_json(text)
+
+
 def _reconcile_state(workers: list[Worker]) -> None:
     try:
         _state_store().reconcile(workers)
@@ -775,6 +1150,31 @@ def _state_record(worker_id: str) -> WorkerRecord | None:
     except StateError as exc:
         typer.echo(f"State warning: {redact(exc)}", err=True)
         return None
+
+
+def _print_storage_verification(verification: StorageVerification, *, bucket: str) -> None:
+    typer.echo(f"Object: s3://{bucket}/{verification.key}")
+    typer.echo(f"Size: {verification.size_bytes} bytes")
+    typer.echo(f"ETag: {verification.etag or '-'} (S3 ETag is not a SHA-256 digest)")
+    last_modified = verification.last_modified.isoformat() if verification.last_modified else "-"
+    typer.echo(f"Last modified: {last_modified}")
+    typer.echo(
+        "Expected size: " + ("matched" if verification.expected_size_checked else "not requested")
+    )
+    if verification.manifest_checked:
+        typer.echo(f"Manifest: consistent; recorded SHA-256 {verification.manifest_sha256}")
+    else:
+        typer.echo("Manifest: not provided")
+    typer.echo("Content checksum: NOT verified; the object body was not downloaded")
+    for limitation in verification.limitations:
+        typer.echo(f"note: {limitation}")
+
+
+def _print_transfer_result(result: ArtifactTransferResult) -> None:
+    typer.echo(f"Operation: {result.operation}")
+    typer.echo(f"Path: {result.path}")
+    typer.echo(f"Size: {result.size_bytes} bytes")
+    typer.echo(f"SHA-256: {result.sha256}")
 
 
 def _print_doctor_report(report: DoctorReport) -> None:
@@ -934,6 +1334,11 @@ def _configuration_failure(exc: Exception) -> Never:
 
 def _provider_failure(exc: Exception) -> Never:
     typer.echo(f"RunPod error: {redact(exc)}", err=True)
+    raise typer.Exit(code=1) from exc
+
+
+def _storage_failure(exc: Exception) -> Never:
+    typer.echo(f"Storage error: {redact(exc)}", err=True)
     raise typer.Exit(code=1) from exc
 
 

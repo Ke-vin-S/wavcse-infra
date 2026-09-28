@@ -119,3 +119,39 @@ class UnsupportedAcceleratorError(WorkerHealthError):
 
 class StateError(InfraError):
     """Raised when supplemental local operational state cannot be handled safely."""
+
+
+class StorageError(InfraError):
+    """Base class for sanitized canonical-storage failures."""
+
+
+class StorageKeyError(StorageError):
+    """Raised when an artifact key is unsafe, ambiguous, or outside the namespace."""
+
+
+class StorageObjectNotFoundError(StorageError):
+    """Raised when a required S3 object does not exist."""
+
+
+class StorageObjectExistsError(StorageError):
+    """Raised when an operation would replace an existing S3 object unexpectedly."""
+
+
+class StoragePermissionError(StorageError):
+    """Raised when the controller identity lacks permission for a storage operation."""
+
+
+class StorageVerificationError(StorageError):
+    """Raised when stored object metadata contradicts the expected artifact."""
+
+
+class ArtifactTransferError(StorageError):
+    """Raised when a worker artifact transfer fails or violates its protocol."""
+
+
+class ArtifactSizeMismatchError(ArtifactTransferError):
+    """Raised when an artifact does not match its expected byte size."""
+
+
+class ArtifactChecksumMismatchError(ArtifactTransferError):
+    """Raised when an artifact does not match its expected SHA-256 digest."""

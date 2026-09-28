@@ -26,9 +26,11 @@ credential method to be `iam-role` before making STS or S3 calls, so an accident
 exported static key is reported rather than used for the diagnostic.
 
 The role should grant only required actions for the configured bucket and `wavcse/`
-prefix. Phase 1 diagnostics use STS `GetCallerIdentity` and, when a bucket is configured,
-a bounded S3 prefix listing. Later storage phases will require narrowly scoped
-`GetObject`, `PutObject`, and `HeadObject` permissions.
+prefix. Diagnostics use STS `GetCallerIdentity` and, when a bucket is configured, a
+bounded S3 prefix listing. Storage operations use narrow `s3:ListBucket` (with an
+`s3:prefix` condition), `s3:GetObject`, and `s3:PutObject` permissions; `HeadObject` is
+covered by `s3:GetObject`. See [Presigned URLs and worker transfer](#presigned-urls-and-worker-transfer)
+for the policy example and the worker credential model.
 
 For RunPod credential resolution, grant `ssm:GetParameter` only on the configured
 parameter ARN:
@@ -129,13 +131,101 @@ their user-owned upstream stores; AGF needs no account and reads existing local 
 session stores. No agent tool or controller authentication state is installed on a
 normal GPU worker.
 
-## Presigned URLs
+## Presigned URLs and worker transfer
 
-Future S3 transfers will use Signature Version 4 URLs scoped to one object and method.
-URLs are bearer credentials until expiry, can generally be reused during that period,
-and can expire earlier when the EC2 role session rotates. They must not appear in logs or
-state files. Upload flows must avoid accidental replacement and verify checksums and
-durability before worker deletion.
+Workers never receive AWS credentials, `~/.aws` state, a controller SSH private key, the
+RunPod token, or GitHub write credentials. Object access is granted one transfer at a
+time through a Signature Version 4 URL generated with the controller's instance-profile
+role.
+
+Each URL is scoped to:
+
+- one bucket (always the configured `storage.bucket`);
+- one exact object key, already resolved beneath `storage.prefix`;
+- one operation (`GetObject` or `PutObject`), never a broader grant;
+- a finite lifetime, default `storage.presign_expiry_seconds = 3600` and clamped to
+  60–604800 seconds.
+
+The URL is a bearer secret: anyone holding it can use it until it expires, and it can
+stop working earlier when the EC2 role session rotates. It must not be persisted. The
+project therefore keeps it out of local state, manifests, Git, documentation examples,
+MLflow metadata, and ordinary logs, and `PresignedUrl.__repr__` renders
+`url=<redacted>`. Only the command that was explicitly asked to produce a URL writes it
+to standard output as its result.
+
+Transport matters as much as generation. The controller sends the URL on the direct SSH
+session's stdin, together with the reviewed transfer module, and never on a command
+line, environment dump, or log line — so it does not appear in the controller's or the
+worker's process argument list. Worker-side error text is passed through the same URL
+redaction as controller-side errors.
+
+IAM policy remains authoritative. A presigned URL cannot grant more than the role that
+signed it, so the role should be limited to the required actions on the configured
+bucket and prefix:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::<bucket>",
+      "Condition": {"StringLike": {"s3:prefix": ["wavcse/*"]}}
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::<bucket>/wavcse/*"
+    }
+  ]
+}
+```
+
+`HeadObject` requires `s3:GetObject` on the object. Do not grant account-wide S3
+permissions, `s3:DeleteObject`, or `s3:DeleteBucket` for this workflow.
+
+## Integrity, materialization, and verification limits
+
+Artifacts are identified by a SHA-256 digest computed from their bytes. Multi-
+gigabyte files are never read into memory: the worker streams in bounded chunks, while
+the controller reads only small manifests and S3 metadata. An S3 ETag is never treated
+as a SHA-256 checksum
+and is never compared against a recorded digest, because multipart uploads make the ETag
+depend on part boundaries.
+
+Downloads materialize through a temporary sibling file:
+
+```text
+<destination>.wavcse-partial-<pid>-<random>
+  -> streamed write + incremental SHA-256
+  -> expected size and digest checks when supplied
+  -> fsync, then atomic link (or rename with --overwrite)
+```
+
+An incomplete or failing transfer never appears at the destination path; temporary files
+are removed on failure, and an existing destination is never replaced without explicit
+`--overwrite`. A supplied digest mismatch, a supplied size mismatch, an announced-size
+mismatch, or a non-2xx response fails the transfer.
+
+Uploads stream SHA-256 over the bytes handed to HTTP and report the resulting size and
+digest. The controller then confirms the stored object's size with a HEAD request. A
+default PUT is signed with `If-None-Match: *`, so a new object at the same key cannot be
+silently replaced after the initial HEAD check. `--overwrite` removes that condition.
+An HTTP PUT success alone is not treated as durable completion. One PUT cannot exceed
+5 GB; larger objects require multipart upload, which Phase 5 does not implement.
+
+`infra storage verify` proves existence, stored size, available metadata, and — when a
+manifest is supplied — that the manifest describes exactly this object and size. It does
+not prove content, because downloading a multi-gigabyte object back to the controller to
+re-hash it is not part of this workflow. The command prints that limitation instead of
+implying a stronger guarantee, and `StorageVerification.content_checksum_verified` is
+always `false`.
+
+The trust model is therefore: a digest is only as trustworthy as the producer that
+recorded it. A worker-reported digest after upload is producer-claimed evidence, the
+stored size is provider-verified evidence, and cryptographic confirmation requires
+something that actually reads the bytes.
 
 ## Logging and redaction
 

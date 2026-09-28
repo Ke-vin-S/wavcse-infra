@@ -253,7 +253,22 @@ compute cost, not a guarantee of zero total cost. Current provider documentation
 `stop` retains the Pod. `destroy` permanently terminates the Pod resource and requires
 the exact provider ID plus confirmation unless `--yes` is supplied. Destroying a Pod
 does not imply deletion of a separately managed network volume. S3 remains canonical;
-Phase 4 does not transfer or verify artifacts.
+artifact materialization and verification go through the S3 presign paths described in
+[Operations](OPERATIONS.md#artifact-storage-operations), not through the Pod filesystem.
+
+## Artifact transfer over RunPod SSH
+
+Artifact bytes never travel over SSH. RunPod's basic proxy is interactive-only, so
+`infra storage download` and `infra storage upload` require the same mapped public-IP
+direct endpoint as `worker exec`, bootstrap, and health. Over that channel the controller
+streams the small reviewed transfer program and generated transfer assignments on
+stdin; the URL is never an argument on either side.
+
+Workers receive no AWS credential, `~/.aws` state, GitHub write credential, controller
+SSH private key, or RunPod token. Their only S3 capability is the single object and
+operation in the URL the controller just generated, until that URL expires. A worker
+without Python 3 cannot transfer: run `infra worker bootstrap <id>` first, which
+installs and health-checks it.
 
 ## Local state
 
@@ -286,7 +301,7 @@ REST v2 RFC 9457 error `detail` text is sanitized and bounded before display. Re
 headers and complete response objects are never rendered. Authorization values and URL
 query strings pass through central redaction.
 
-## Current Phase 4 limitations
+## Current limitations
 
 - REST v2 does not currently expose interruptible/spot Pod creation.
 - The client-side maximum price check is not a provider-side atomic price reservation.

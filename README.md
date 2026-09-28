@@ -11,7 +11,7 @@ repository.
 
 ## Delivery status
 
-The repository currently implements Phases 0–4 of the v1 specification:
+The repository currently implements Phases 0–5 of the v1 specification:
 
 - a typed `infra` CLI and layered TOML/environment configuration;
 - Ruff, pytest, ShellCheck, and shfmt validation;
@@ -30,11 +30,19 @@ The repository currently implements Phases 0–4 of the v1 specification:
 - idempotent stdin-streamed worker bootstrap plus version, tool, disk, and NVIDIA GPU
   health;
 - a separate local readiness model in which provider `RUNNING` does not imply `READY`;
+- a prefix-constrained S3 namespace with listing, metadata, existence, and verification;
+- bounded, object-scoped presigned GET/PUT URLs that are redacted from logs, state, and
+  errors;
+- version 1 artifact manifests with streaming SHA-256 semantics and embedding archive
+  conventions;
+- worker artifact download and upload through presigned URLs only, with temporary-file
+  materialization, optional expected-checksum enforcement, and controller-side size
+  verification of the stored object;
 - provider-neutral worker/request/offer models and bounded retries for safe reads;
 - initial architecture, security, operations, provider, and decision documentation.
 
-Phase 4 stops at worker readiness. Artifact transfer, wavCSE checkout/execution, MLflow
-runs, and jobs remain unimplemented.
+Phase 5 stops at artifact storage and worker transfer. Exact-commit wavCSE checkout,
+research environments, jobs, MLflow runs, and scheduling remain unimplemented.
 
 ## Architecture
 
@@ -182,6 +190,12 @@ infra worker health <exact-worker-id>
 infra worker stop <exact-worker-id>
 infra worker start <exact-worker-id>
 infra worker destroy <exact-worker-id>
+infra storage list [--prefix <relative-key-prefix>] [--limit <n>] [--json]
+infra storage presign-download <artifact> [--expires-in <seconds>]
+infra storage presign-upload <artifact> [--expires-in <seconds>] [--overwrite]
+infra storage verify <artifact> [--expected-size <bytes>] [--manifest <key> | --manifest-file <path>]
+infra storage download <artifact> <absolute-worker-path> --worker <exact-worker-id>
+infra storage upload <artifact> <absolute-worker-path> --worker <exact-worker-id> [--overwrite]
 ```
 
 Global `--config`, `--runpod-api-url`, `--runpod-timeout`, and `--verbose` options must
@@ -227,21 +241,75 @@ never silently marked ready.
 ## Storage model
 
 S3 is canonical for embeddings, checkpoints, and explicitly persisted large outputs.
-RunPod local disks and network volumes are caches. Future workers will receive
-time-limited presigned URLs for individual transfers; they will not receive long-lived
-AWS credentials. Git stores code and small metadata, not generated tensors or archives.
+RunPod local disks and network volumes are caches. Workers receive time-limited
+presigned URLs for individual transfers; they never receive long-lived AWS credentials,
+a controller SSH key, or the RunPod API key.
+
+Every ordinary storage operation resolves its argument beneath the configured
+`storage.bucket`/`storage.prefix`:
+
+```text
+infra storage presign-download embeddings/v1/voxceleb-minpooling.tar
+  -> s3://<bucket>/wavcse/embeddings/v1/voxceleb-minpooling.tar
+```
+
+Keys are relative, normalized, and unambiguous. `../x`, `/x`, `a//b`, `a/`, trailing
+whitespace, `?`/`#`, a bucket/URL, and a key that repeats the configured prefix are all
+rejected instead of being rewritten. No storage command accepts a bucket or an absolute
+key, so a typo cannot reach an unrelated part of the account.
+
+Presigned URLs are bearer secrets with a bounded lifetime (default
+`storage.presign_expiry_seconds = 3600`, maximum 604800 seconds). They are scoped to one
+bucket, one exact object, and one operation; they are printed only when a command was
+asked to produce one, and their representation is redacted everywhere else.
+
+The canonical embedding layout is dataset-level plain TAR archives with one version 1
+sidecar manifest per archive:
+
+```text
+wavcse/embeddings/<embedding-version>/
+├── voxceleb-minpooling.tar
+├── voxceleb-minpooling.manifest.json
+├── keyword-spotting-minpooling.tar
+├── keyword-spotting-minpooling.manifest.json
+├── emotion-recognition-minpooling.tar
+└── emotion-recognition-minpooling.manifest.json
+```
+
+Each sidecar manifest is schema version 1 and records the artifact name/type, dataset, the
+key relative to the namespace prefix, byte size, SHA-256, creation time, and, when
+actually known, the generator commit and extracted destination. It never stores a
+presigned URL or any credential.
+
+`infra storage download` presigns a GET URL, streams the reviewed worker transfer module
+over direct SSH stdin together with the URL, downloads into a temporary sibling file,
+verifies size and SHA-256 when expectations are supplied, and only then materializes it
+atomically. `infra storage upload` hashes the bytes it sends, PUTs them through a
+presigned URL, and then verifies the stored object's size at the controller. Default
+uploads use a signed no-replacement header; `--overwrite` opts out. A single PUT is
+limited to 5 GB. `infra storage verify` proves existence, size, and
+manifest consistency — and states explicitly that it does not verify content, because
+the object body is never downloaded back to the controller.
+
+Git stores code and small metadata, not generated tensors or archives. MLflow/DagsHub
+continues to own experiment metadata.
 
 ## Security model
 
 - The controller is trusted and uses its EC2 IAM role through the normal AWS SDK
-  credential chain.
+  credential chain (Boto3's provider chain, never an explicit metadata fetch).
 - RunPod credentials resolve in memory from an environment override or SSM
   `SecureString`; authorization values are redacted and never persisted.
-- GPU workers are temporary and less trusted than the controller.
-- S3 buckets remain private; presigned URLs are bearer secrets until expiry.
+- GPU workers are temporary and less trusted than the controller. They receive
+  presigned URLs only, over direct SSH stdin, and never an AWS credential, `~/.aws`
+  profile, controller SSH key, GitHub write credential, or RunPod token.
+- S3 buckets remain private; presigned URLs are bearer secrets until expiry and are
+  redacted from logs and errors.
 - SSH uses the configured dedicated controller key. OpenSSH ignores user configuration,
   writes only to a wavcse-infra known-hosts file, and uses trust-on-first-use with
   `accept-new`; changed keys are rejected. Global host verification is never disabled.
+- Artifacts are verified with streaming SHA-256; an S3 ETag is never treated as a
+  SHA-256 checksum.
 
 See [Security](docs/SECURITY.md) for the threat assumptions and IAM guidance.
 

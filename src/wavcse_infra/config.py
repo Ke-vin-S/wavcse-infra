@@ -19,7 +19,8 @@ from pydantic import (
     field_validator,
 )
 
-from wavcse_infra.errors import ConfigurationError
+from wavcse_infra.errors import ConfigurationError, StorageKeyError
+from wavcse_infra.storage.keys import normalize_prefix
 
 DEFAULT_CONFIG_PATH = Path("~/.config/wavcse-infra/config.toml")
 DEFAULT_RUNPOD_API_URL = "https://api.runpod.io/v2"
@@ -111,10 +112,11 @@ class RunPodConfig(FrozenModel):
 
 
 class StorageConfig(FrozenModel):
-    """Canonical artifact storage location."""
+    """Canonical artifact storage location and bounded presign settings."""
 
     bucket: str | None = Field(default=None, min_length=3, max_length=63)
     prefix: str = Field(default="wavcse", min_length=1)
+    presign_expiry_seconds: int = Field(default=3600, ge=60, le=604800)
 
     @field_validator("bucket", mode="before")
     @classmethod
@@ -122,6 +124,16 @@ class StorageConfig(FrozenModel):
         """Treat the example bucket marker as absent configuration."""
 
         return _placeholder_as_none(value)
+
+    @field_validator("prefix")
+    @classmethod
+    def canonical_prefix(cls, value: str) -> str:
+        """Store the namespace prefix without S3 boundary slashes or ambiguous segments."""
+
+        try:
+            return normalize_prefix(value)
+        except StorageKeyError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class SshConfig(FrozenModel):
@@ -132,6 +144,7 @@ class SshConfig(FrozenModel):
     connect_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     command_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
     bootstrap_timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
+    transfer_timeout_seconds: float = Field(default=3600.0, gt=0, le=86400)
     readiness_timeout_seconds: float = Field(default=180.0, gt=0, le=3600)
     poll_interval_seconds: float = Field(default=2.0, gt=0, le=60)
     max_poll_interval_seconds: float = Field(default=10.0, gt=0, le=120)
@@ -181,6 +194,7 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "WAVCSE_INFRA_RUNPOD_TIMEOUT_SECONDS": ("runpod", "request_timeout_seconds"),
     "WAVCSE_INFRA_S3_BUCKET": ("storage", "bucket"),
     "WAVCSE_INFRA_S3_PREFIX": ("storage", "prefix"),
+    "WAVCSE_INFRA_S3_PRESIGN_EXPIRY_SECONDS": ("storage", "presign_expiry_seconds"),
     "WAVCSE_INFRA_SSH_PRIVATE_KEY": ("ssh", "private_key"),
     "WAVCSE_INFRA_SSH_KNOWN_HOSTS_FILE": ("ssh", "known_hosts_file"),
     "WAVCSE_INFRA_SSH_CONNECT_TIMEOUT_SECONDS": ("ssh", "connect_timeout_seconds"),
@@ -188,6 +202,10 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "WAVCSE_INFRA_SSH_BOOTSTRAP_TIMEOUT_SECONDS": (
         "ssh",
         "bootstrap_timeout_seconds",
+    ),
+    "WAVCSE_INFRA_SSH_TRANSFER_TIMEOUT_SECONDS": (
+        "ssh",
+        "transfer_timeout_seconds",
     ),
     "WAVCSE_INFRA_SSH_READINESS_TIMEOUT_SECONDS": (
         "ssh",

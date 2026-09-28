@@ -21,3 +21,11 @@ def test_redacts_query_string_from_urls() -> None:
     redacted = redact(value)
 
     assert redacted == "upload failed for https://bucket.s3.example/key?<redacted>"
+
+
+def test_redacts_signed_parameters_without_a_full_url() -> None:
+    redacted = redact("request failed: x-amz-signature=secret&X-Amz-Credential=other")
+
+    assert "secret" not in redacted
+    assert "other" not in redacted
+    assert redacted.count("<redacted>") == 2

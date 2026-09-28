@@ -10,6 +10,10 @@ _SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(\s*[:=]\s*)[^\s,;]+"
 )
 _URL_QUERY_PATTERN = re.compile(r"(https?://[^\s?#]+)\?[^\s]+", re.IGNORECASE)
+_SIGNED_PARAMETER_PATTERN = re.compile(
+    r"(?i)\b(x-amz-(?:signature|credential|security-token)|awsaccesskeyid)"
+    r"(\s*[:=]\s*)[^\s&;,]+"
+)
 
 
 def redact(text: object) -> str:
@@ -18,4 +22,5 @@ def redact(text: object) -> str:
     value = str(text)
     value = _AUTHORIZATION_PATTERN.sub(r"\1<redacted>", value)
     value = _SECRET_ASSIGNMENT_PATTERN.sub(r"\1\2<redacted>", value)
-    return _URL_QUERY_PATTERN.sub(r"\1?<redacted>", value)
+    value = _URL_QUERY_PATTERN.sub(r"\1?<redacted>", value)
+    return _SIGNED_PARAMETER_PATTERN.sub(r"\1\2<redacted>", value)

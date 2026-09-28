@@ -494,3 +494,90 @@ isolated inside the RunPod provider and is not introduced as a general abstracti
 - [RunPod GraphQL schema](https://graphql-spec.runpod.io/)
 - [RunPod CLI Pod reference](https://docs.runpod.io/runpodctl/reference/runpodctl-pod)
 - [RunPod SSH methods](https://docs.runpod.io/pods/configuration/use-ssh)
+
+## ADR-015: Transfer artifacts through presigned URLs carried on SSH stdin
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+
+### Context
+
+Phase 5 must move artifacts between canonical S3 and disposable workers without giving a
+worker any durable cloud identity. Two mechanisms were available: presigned URLs over
+HTTP, or reusing the direct SSH channel that Phase 4 already established. A presigned URL
+is a bearer secret, so where it travels matters as much as how it is scoped: a command
+line is visible to `ps` on both sides and tends to reach logs, while an environment dump
+is equivalent.
+
+### Decision
+
+Use S3 presigned URLs as the only worker artifact transport, and send the URL on the
+direct SSH session's stdin rather than in a command line. The controller streams one
+generated assignment line followed by the reviewed transfer module, so the worker runs
+exactly the code the repository contains and the URL exists only in the SSH stream and
+in the worker process's memory.
+
+Keep that transfer program stdlib-only and packaged inside `wavcse_infra` so the same
+file is unit-tested on the controller and executed on the worker. Do not add boto3, the
+AWS CLI, or the wavcse-infra package to normal workers.
+
+### Alternatives considered
+
+- `curl`-based worker scripts: rejected because the transfer logic (partial file, size
+  and digest enforcement, atomic rename, structured result) would be duplicated in Bash
+  and not exercisable by the unit suite in the same form.
+- Passing the URL as a remote command argument: rejected because it exposes the
+  signature in process argument lists and in any command echo.
+- Installing boto3 or the AWS CLI on workers: rejected because it grows the worker
+  dependency surface for no capability gain and invites durable credential handling.
+- Shipping the wavcse-infra package to workers: rejected because the worker contract is
+  a small reviewed program, not a control-plane installation.
+
+### Consequences
+
+Workers need only Python 3, which bootstrap already installs and health-checks. The
+transfer module may not import anything outside the standard library and may not use a
+`from __future__` import, because the controller prepends two assignments before its first
+line; both properties are enforced by tests. Artifact bytes still travel through S3, so a
+worker never becomes a data path between machines, and losing a worker cannot lose the
+only copy of an artifact.
+
+## ADR-016: Verify stored artifacts by metadata; trust digests recorded at creation
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+
+### Context
+
+Reproducibility depends on being able to tell whether a large artifact is the one that
+was recorded. The embedding set is approximately 20 GiB. Re-hashing it on the controller
+after every upload or before every job would cost a full download, consume controller
+bandwidth, and still not prove the data was readable by the worker that consumes it. An
+S3 ETag is also not a content digest: it depends on multipart part boundaries.
+
+### Decision
+
+Compute SHA-256 once, at artifact creation, and record it in the version 1 manifest.
+Verify presence, stored size, and manifest consistency at the controller. Enforce the
+digest on the machine that will actually consume the artifact: the worker download path
+verifies expected size and expected SHA-256 before materializing a file. Refuse to treat
+an ETag as a checksum, and state the limitation explicitly in `infra storage verify`
+output and in the verification model.
+
+### Alternatives considered
+
+- Download-and-rehash at the controller for verification: rejected as wasteful at this
+  artifact size and still weaker than verifying where the data is used.
+- Trust the S3 ETag: rejected because it is not a content digest and multipart uploads
+  make it implementation-defined.
+- Skip digest enforcement when a digest is supplied: rejected because a silent truncation
+  or partial write would surface later as an unexplainable research failure.
+
+### Consequences
+
+`infra storage verify` is a metadata-level check and says so. A worker-reported digest
+after upload is producer-claimed evidence; stored size is provider-verified evidence;
+cryptographic confirmation happens only where the bytes are read. Artifact integrity
+therefore rests on the creation step being trustworthy, which is why manifests validate
+digest form, forbid bearer material, and require a full Git commit ID rather than a
+branch name when a generator commit is recorded.

@@ -325,12 +325,16 @@ Embeddings must be namespaced by a version/identity representing their generatio
 Example:
 
     s3://bucket/wavcse/embeddings/wavcse-base-v1-minpool/
-      manifest.json
-      voxceleb.tar
-      keyword-spotting.tar
-      emotion-recognition.tar
+      voxceleb-minpooling.tar
+      voxceleb-minpooling.manifest.json
+      keyword-spotting-minpooling.tar
+      keyword-spotting-minpooling.manifest.json
+      emotion-recognition-minpooling.tar
+      emotion-recognition-minpooling.manifest.json
 
-The manifest should capture enough information to determine whether an existing embedding set can safely be reused.
+Each artifact manifest should capture enough information to determine whether that
+dataset archive can safely be reused. The version directory identifies the embedding
+set; checking the set requires checking every expected archive and sidecar manifest.
 
 Do not overwrite an existing embedding version by default.
 
