@@ -13,7 +13,15 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wavcse_infra.errors import StateError
-from wavcse_infra.models import CloudType, Worker, WorkerCreationPlan, WorkerState
+from wavcse_infra.models import (
+    CloudType,
+    Worker,
+    WorkerConnectionInfo,
+    WorkerCreationPlan,
+    WorkerHealthReport,
+    WorkerReadinessState,
+    WorkerState,
+)
 
 DEFAULT_STATE_PATH = Path("~/.local/state/wavcse-infra/workers.json")
 
@@ -45,6 +53,19 @@ class WorkerRecord(BaseModel):
     ssh_host: str | None = None
     ssh_port: int | None = Field(default=None, ge=1, le=65535)
     ssh_username: str | None = None
+    ssh_kind: str | None = None
+    readiness_state: WorkerReadinessState = WorkerReadinessState.NOT_READY
+    last_ssh_ready_at: datetime | None = None
+    bootstrap_version: str | None = None
+    last_bootstrap_at: datetime | None = None
+    health_status: str | None = None
+    last_health_check_at: datetime | None = None
+    observed_gpu_models: tuple[str, ...] = ()
+    observed_gpu_memory_mib: tuple[int, ...] = ()
+    observed_nvidia_driver_version: str | None = None
+    observed_cuda_version: str | None = None
+    disk_path: str | None = None
+    disk_available_bytes: int | None = Field(default=None, ge=0)
     provider_absent: bool = False
 
 
@@ -98,6 +119,7 @@ class WorkerStateStore:
             ssh_host=connection.host if connection is not None else None,
             ssh_port=connection.port if connection is not None else None,
             ssh_username=connection.username if connection is not None else None,
+            ssh_kind=connection.kind if connection is not None else None,
         )
         self._upsert(record)
         return record
@@ -125,6 +147,12 @@ class WorkerStateStore:
                 "ssh_username": (
                     connection.username if connection is not None else existing.ssh_username
                 ),
+                "ssh_kind": connection.kind if connection is not None else existing.ssh_kind,
+                "readiness_state": (
+                    existing.readiness_state
+                    if worker.state is WorkerState.RUNNING
+                    else WorkerReadinessState.NOT_READY
+                ),
                 "provider_absent": False,
             }
         )
@@ -141,6 +169,7 @@ class WorkerStateStore:
             update={
                 "last_observed_state": WorkerState.DESTROYED,
                 "last_observed_at": self._now(),
+                "readiness_state": WorkerReadinessState.NOT_READY,
                 "provider_absent": True,
             }
         )
@@ -164,6 +193,7 @@ class WorkerStateStore:
                     update={
                         "last_observed_state": WorkerState.DESTROYED,
                         "last_observed_at": now,
+                        "readiness_state": WorkerReadinessState.NOT_READY,
                         "provider_absent": True,
                     }
                 )
@@ -186,10 +216,102 @@ class WorkerStateStore:
                     "ssh_username": (
                         connection.username if connection is not None else existing.ssh_username
                     ),
+                    "ssh_kind": connection.kind if connection is not None else existing.ssh_kind,
+                    "readiness_state": (
+                        existing.readiness_state
+                        if worker.state is WorkerState.RUNNING
+                        else WorkerReadinessState.NOT_READY
+                    ),
                     "provider_absent": False,
                 }
             )
         self._write(document.model_copy(update={"workers": updated_records}))
+
+    def mark_ssh_ready(
+        self,
+        worker: Worker,
+        connection: WorkerConnectionInfo,
+    ) -> WorkerRecord | None:
+        """Persist a successful SSH probe for an already tracked worker."""
+
+        document = self._load()
+        existing = document.workers.get(worker.id)
+        if existing is None:
+            return None
+        now = self._now()
+        updated = existing.model_copy(
+            update={
+                "last_observed_state": worker.state,
+                "last_observed_at": now,
+                "ssh_host": connection.host,
+                "ssh_port": connection.port,
+                "ssh_username": connection.username,
+                "ssh_kind": connection.kind,
+                "readiness_state": WorkerReadinessState.SSH_READY,
+                "last_ssh_ready_at": now,
+                "provider_absent": False,
+            }
+        )
+        document.workers[worker.id] = updated
+        self._write(document)
+        return updated
+
+    def mark_bootstrapped(self, worker_id: str, bootstrap_version: str) -> WorkerRecord | None:
+        """Persist completion of the idempotent bootstrap script."""
+
+        document = self._load()
+        existing = document.workers.get(worker_id)
+        if existing is None:
+            return None
+        now = self._now()
+        updated = existing.model_copy(
+            update={
+                "readiness_state": WorkerReadinessState.BOOTSTRAPPED,
+                "bootstrap_version": bootstrap_version,
+                "last_bootstrap_at": now,
+            }
+        )
+        document.workers[worker_id] = updated
+        self._write(document)
+        return updated
+
+    def mark_gpu_healthy(self, worker_id: str) -> WorkerRecord | None:
+        """Persist the successful accelerator checkpoint before final readiness."""
+
+        document = self._load()
+        existing = document.workers.get(worker_id)
+        if existing is None:
+            return None
+        updated = existing.model_copy(update={"readiness_state": WorkerReadinessState.GPU_HEALTHY})
+        document.workers[worker_id] = updated
+        self._write(document)
+        return updated
+
+    def record_health(self, report: WorkerHealthReport) -> WorkerRecord | None:
+        """Persist non-secret health facts without replacing provider authority."""
+
+        document = self._load()
+        existing = document.workers.get(report.provider_worker_id)
+        if existing is None:
+            return None
+        gpu = report.gpu
+        updated = existing.model_copy(
+            update={
+                "readiness_state": report.readiness_state,
+                "bootstrap_version": report.bootstrap_version_observed,
+                "health_status": "READY" if report.ready else "FAILED",
+                "last_health_check_at": self._now(),
+                "observed_gpu_models": gpu.models if gpu is not None else (),
+                "observed_gpu_memory_mib": gpu.memory_mib if gpu is not None else (),
+                "observed_nvidia_driver_version": (gpu.driver_version if gpu is not None else None),
+                "observed_cuda_version": gpu.cuda_version if gpu is not None else None,
+                "disk_path": report.disk_path,
+                "disk_available_bytes": report.disk_available_bytes,
+            }
+        )
+        document.workers[report.provider_worker_id] = updated
+        self._write(document)
+        return updated
 
     def _upsert(self, record: WorkerRecord) -> None:
         document = self._load()

@@ -62,7 +62,7 @@ and process-list exposure. Resolved values are not persisted in configuration or
 state. HTTP authorization headers are never rendered. Provider and SSM failures expose
 only safe operation/status context; user-facing errors pass through redaction.
 
-Phase 3 uses REST API v2. Safe GET operations may retry; paid creation is sent once and
+Worker management uses REST API v2. Safe GET operations may retry; paid creation is sent once and
 is never automatically repeated. A lost create response is reconciled only against the
 complete generated infra identity. Start, stop, and destroy accept exact provider IDs;
 destroy never resolves names or prefixes. `--yes` skips the human confirmation only and
@@ -74,7 +74,9 @@ Created-worker metadata lives in `~/.local/state/wavcse-infra/workers.json`. The
 directory is mode `0700`, the JSON file is mode `0600`, and writes use a temporary file
 in the same directory followed by `fsync` and atomic replacement. The file may contain
 provider IDs, generated names, requested/observed GPU configuration, catalog or observed
-price, timestamps, lifecycle state, and provider-reported SSH endpoint coordinates.
+price, timestamps, lifecycle/readiness state, provider-reported SSH endpoint
+coordinates, bootstrap version, non-secret health timestamps, disk capacity, and GPU
+model/driver facts.
 
 It must never contain the RunPod key, authorization headers, SSM values, AWS
 credentials, private keys, or complete environment data. RunPod remains authoritative;
@@ -82,9 +84,30 @@ the local file is not permission to delete a different or similarly named Pod.
 
 ### SSH
 
-Future worker access will use a dedicated key. Private keys remain on the controller.
-Host-key handling must be explicit; globally disabling strict host-key checking is not
-allowed. RunPod basic proxied SSH and full public-IP SSH are separate endpoint types.
+Worker access uses the dedicated private key configured by `ssh.private_key`. Commands
+refuse a key readable by group/other users; the private key never leaves the controller.
+Only its public counterpart is registered in the RunPod account. `startSsh` causes
+RunPod to inject account-registered public keys into compatible images. The CLI never
+copies controller GitHub credentials, AWS credentials, the RunPod token, `~/.aws`, or
+the SSH private key to a worker.
+
+System OpenSSH is invoked with an argv, `shell=False`, an explicit identity, batch/key-
+only authentication, bounded connect/command timeouts, and `-F /dev/null` so user SSH
+configuration cannot silently redirect the connection. Basic proxied SSH and the
+mapped public-IP endpoint are modeled separately; direct is preferred, proxy is the
+command-only fallback, and neither is used for artifact transfer.
+
+Host keys use a dedicated `~/.local/state/wavcse-infra/known_hosts` file with mode
+`0600`, `StrictHostKeyChecking=accept-new`, and the global known-hosts file disabled for
+these worker sessions only. This is deliberate trust on first use: it prevents silent
+key changes after the first connection but cannot authenticate the very first endpoint,
+so a first-connection network attacker remains a risk. A mismatch fails closed and
+requires the operator to inspect the exact Pod endpoint before changing the entry. The
+user's normal `~/.ssh/known_hosts` and global SSH configuration are not weakened.
+
+Bootstrap scripts are streamed through SSH stdin and contain no credentials. The
+worker stores only a non-secret bootstrap-version marker. Normal workers do not receive
+OMP, Codex, AGF, controller authentication stores, or permanent cloud credentials.
 
 ### Controller agent tools
 

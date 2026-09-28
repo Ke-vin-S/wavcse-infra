@@ -3,9 +3,9 @@
 ## Boundaries
 
 `wavcse-infra` owns infrastructure bootstrap, provider communication, controller
-diagnostics, and—only in later phases—worker lifecycle, remote execution, and artifact
-transport. It does not own research code, experiment semantics, model dependencies, or
-MLflow instrumentation.
+diagnostics, Pod lifecycle, SSH readiness, and worker bootstrap. Later phases add
+exact-commit execution and artifact transport. It does not own research code,
+experiment semantics, model dependencies, or MLflow instrumentation.
 
 The components are:
 
@@ -35,9 +35,9 @@ Controller IAM role
   -> controller verifies durable object
 ```
 
-Phase 3 manages the RunPod Pod resource lifecycle and local operational metadata. It
-does not perform SSH, worker bootstrap, artifact transfer, repository checkout, or job
-execution.
+Phase 4 extends the RunPod Pod lifecycle through SSH-ready, bootstrapped, GPU-healthy,
+and locally `READY`. It does not perform artifact transfer, repository checkout,
+research dependency installation, or job execution.
 
 ## Implemented modules
 
@@ -54,6 +54,13 @@ execution.
   same-directory replacement beneath `~/.local/state/wavcse-infra/`.
 - `workers/lifecycle.py` owns cost/availability guards, bounded polling, transitions,
   and provider-authoritative reconciliation.
+- `workers/ssh.py` invokes system OpenSSH with an explicit identity, isolated
+  known-hosts file, bounded timeouts, captured streams, and provider-refreshed endpoint
+  readiness polling.
+- `workers/bootstrap.py` streams reviewed Bash scripts over SSH stdin, parses normalized
+  health facts, and gates local readiness without changing provider lifecycle state.
+- `worker/bootstrap.sh` and `worker/health-check.sh` are the idempotent worker-side
+  setup and inspection contracts packaged with the CLI.
 - `redaction.py` removes authorization values, known secret assignments, and URL
   query strings from user-facing external errors.
 - `controller/bootstrap.sh` converges supported Ubuntu controllers on required tools
@@ -119,6 +126,25 @@ the provider client lists Pods and matches only that complete name. It adopts on
 reports duplicates, or fails safely. It never retries the paid create POST because
 RunPod v2 exposes neither an idempotency key nor a provider-enforced unique Pod name.
 
+After provider `RUNNING`, readiness proceeds independently:
+
+```text
+RUNNING
+  -> refresh ssh.direct / ssh.proxy from GET /pods/{id}
+  -> authenticated SSH no-op
+  -> SSH_READY
+  -> versioned idempotent bootstrap over stdin
+  -> BOOTSTRAPPED
+  -> disk/tool/nvidia-smi health
+  -> GPU_HEALTHY
+  -> READY
+```
+
+The direct endpoint is preferred because it is the Pod's mapped public `22/tcp` port;
+the RunPod proxy is a command-only fallback. Endpoint metadata is refreshed during
+polling because IP/port publication can lag provider `RUNNING`. Stopping or destroying
+a tracked Pod resets local readiness without redefining its provider state.
+
 ## Reliability stance
 
 Read-only HTTP operations use explicit timeouts and bounded exponential backoff, with a
@@ -133,6 +159,5 @@ Missing optional provider fields remain `None`; the parser does not invent metad
 
 ## Deferred architecture
 
-SSH, worker bootstrap, S3 transfer, exact-commit jobs, and job state remain deferred.
-Directories and interfaces for those features will be added only with working
-responsibilities.
+S3 transfer, exact-commit checkout/execution, research environments, MLflow execution,
+jobs, and scheduling remain deferred. Direct SSH is not used as the artifact transport.

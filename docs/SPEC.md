@@ -161,6 +161,11 @@ Provider-native state should be retained for diagnostics.
 
 Do not assume local state is always synchronized with RunPod.
 
+Provider lifecycle and controller-observed readiness are separate. RunPod `RUNNING`
+only means the Pod resource is running; local `READY` additionally requires a current
+SSH endpoint, authenticated command execution, the expected bootstrap version, disk and
+tool checks, and a supported healthy GPU.
+
 # 8. Worker profiles
 
 ## training

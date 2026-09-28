@@ -13,8 +13,14 @@ from wavcse_infra.models import (
     Availability,
     CloudType,
     GpuOffer,
+    HealthCheckStatus,
     Worker,
+    WorkerConnectionInfo,
     WorkerCreationPlan,
+    WorkerGpuInfo,
+    WorkerHealthCheck,
+    WorkerHealthReport,
+    WorkerReadinessState,
     WorkerSpec,
     WorkerState,
 )
@@ -168,3 +174,65 @@ def test_state_document_is_versioned_json(tmp_path: Path) -> None:
 
     assert payload["version"] == 1
     assert list(payload["workers"]) == ["pod-123"]
+
+
+def test_readiness_transitions_persist_health_and_reset_when_stopped(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+    connection = WorkerConnectionInfo(
+        provider_worker_id="pod-123",
+        kind="direct",
+        host="203.0.113.9",
+        port=30222,
+        username="root",
+    )
+    running = _worker(
+        state=WorkerState.RUNNING,
+        native_status="RUNNING",
+        ssh_direct=connection,
+    )
+    store.record_created(_plan(), running)
+
+    store.mark_ssh_ready(running, connection)
+    store.mark_bootstrapped("pod-123", "1")
+    store.mark_gpu_healthy("pod-123")
+    report = WorkerHealthReport(
+        provider_worker_id="pod-123",
+        provider_state=WorkerState.RUNNING,
+        readiness_state=WorkerReadinessState.READY,
+        connection=connection,
+        bootstrap_version_expected="1",
+        bootstrap_version_observed="1",
+        disk_path="/workspace",
+        disk_available_bytes=50 * 1024**3,
+        git_version="git version 2.43.0",
+        python_version="Python 3.12.3",
+        uv_version="uv 0.10.9",
+        gpu=WorkerGpuInfo(
+            count=1,
+            models=("NVIDIA RTX A4000",),
+            memory_mib=(16376,),
+            driver_version="550.54.15",
+            cuda_version="12.8",
+        ),
+        checks=(
+            WorkerHealthCheck(name="gpu", status=HealthCheckStatus.PASS, detail="one NVIDIA GPU"),
+        ),
+    )
+    store.record_health(report)
+
+    ready = store.get("pod-123")
+    assert ready is not None
+    assert ready.readiness_state is WorkerReadinessState.READY
+    assert ready.last_ssh_ready_at == NOW
+    assert ready.bootstrap_version == "1"
+    assert ready.health_status == "READY"
+    assert ready.observed_gpu_models == ("NVIDIA RTX A4000",)
+    assert ready.disk_available_bytes == 50 * 1024**3
+    serialized = (tmp_path / "workers.json").read_text(encoding="utf-8")
+    assert "PRIVATE KEY" not in serialized
+    assert "Authorization" not in serialized
+
+    store.observe(_worker(state=WorkerState.STOPPED, native_status="EXITED"))
+    stopped = store.get("pod-123")
+    assert stopped is not None
+    assert stopped.readiness_state is WorkerReadinessState.NOT_READY

@@ -27,12 +27,15 @@ from wavcse_infra.models import (
     CloudType,
     Worker,
     WorkerCreationPlan,
+    WorkerHealthReport,
     WorkerSpec,
 )
 from wavcse_infra.providers.runpod import RunPodClient
 from wavcse_infra.redaction import redact
 from wavcse_infra.state import WorkerRecord, WorkerStateStore
+from wavcse_infra.workers.bootstrap import WorkerBootstrapper
 from wavcse_infra.workers.lifecycle import WorkerLifecycle
+from wavcse_infra.workers.ssh import SshExecutor, WorkerSshWaiter
 
 app = typer.Typer(
     name="infra",
@@ -364,6 +367,122 @@ def create_worker(
     _print_worker(worker)
 
 
+@worker_app.command("wait-ssh")
+def wait_for_worker_ssh(
+    context: typer.Context,
+    worker_id: Annotated[str, typer.Argument(help="Exact RunPod worker ID.")],
+    wait_timeout: Annotated[
+        float | None,
+        typer.Option("--wait-timeout", min=0.1, help="SSH readiness timeout in seconds."),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Wait until a provider-running worker accepts an authenticated SSH command."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            _, waiter = _worker_access(client, settings)
+            result = waiter.wait(worker_id, timeout_seconds=wait_timeout)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    if json_output:
+        _print_json(result.connection.model_dump(mode="json"))
+        return
+    typer.echo(f"RunPod worker {worker_id} is SSH READY.")
+    typer.echo(f"Connection: {result.connection.kind}")
+    typer.echo(f"Host: {result.connection.host}")
+    typer.echo(f"Port: {result.connection.port}")
+    typer.echo(f"Username: {result.connection.username}")
+
+
+@worker_app.command("bootstrap")
+def bootstrap_worker(
+    context: typer.Context,
+    worker_id: Annotated[str, typer.Argument(help="Exact RunPod worker ID.")],
+    wait_timeout: Annotated[
+        float | None,
+        typer.Option("--wait-timeout", min=0.1, help="SSH readiness timeout in seconds."),
+    ] = None,
+    command_timeout: Annotated[
+        float | None,
+        typer.Option("--command-timeout", min=0.1, help="Bootstrap timeout in seconds."),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Idempotently bootstrap a running NVIDIA worker and require READY health."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            bootstrapper, _ = _worker_access(client, settings)
+            report = bootstrapper.bootstrap(
+                worker_id,
+                wait_timeout_seconds=wait_timeout,
+                command_timeout_seconds=command_timeout,
+            )
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    _print_health(report, json_output=json_output)
+    if not report.ready:
+        typer.echo(
+            f"Worker {worker_id} bootstrap completed, but required health checks failed; "
+            "local readiness is FAILED.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+@worker_app.command("health")
+def health_worker(
+    context: typer.Context,
+    worker_id: Annotated[str, typer.Argument(help="Exact RunPod worker ID.")],
+    wait_timeout: Annotated[
+        float | None,
+        typer.Option("--wait-timeout", min=0.1, help="SSH readiness timeout in seconds."),
+    ] = None,
+    command_timeout: Annotated[
+        float | None,
+        typer.Option("--command-timeout", min=0.1, help="Health-command timeout in seconds."),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Inspect provider, SSH, bootstrap, tools, disk, and NVIDIA GPU health."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            bootstrapper, _ = _worker_access(client, settings)
+            report = bootstrapper.health(
+                worker_id,
+                wait_timeout_seconds=wait_timeout,
+                command_timeout_seconds=command_timeout,
+            )
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    _print_health(report, json_output=json_output)
+    if not report.ready:
+        raise typer.Exit(code=1)
+
+
 @worker_app.command("start")
 def start_worker(
     context: typer.Context,
@@ -500,6 +619,19 @@ def _state_store() -> WorkerStateStore:
     return WorkerStateStore()
 
 
+def _worker_access(
+    client: RunPodClient,
+    settings: Settings,
+) -> tuple[WorkerBootstrapper, WorkerSshWaiter]:
+    state_store = _state_store()
+    executor = SshExecutor(settings.ssh)
+    waiter = WorkerSshWaiter(client, executor, state_store, settings.ssh)
+    return (
+        WorkerBootstrapper(waiter, executor, state_store, settings.ssh),
+        waiter,
+    )
+
+
 def _reconcile_state(workers: list[Worker]) -> None:
     try:
         _state_store().reconcile(workers)
@@ -613,6 +745,30 @@ def _print_destroy_plan(worker: Worker, record: WorkerRecord | None) -> None:
     typer.echo(f"GPU count: {worker.gpu_count if worker.gpu_count is not None else '-'}")
     typer.echo(f"State: {worker.state.value}")
     typer.echo(f"Known running price/hour: {_money(known_price)}")
+
+
+def _print_health(report: WorkerHealthReport, *, json_output: bool) -> None:
+    if json_output:
+        payload = report.model_dump(mode="json")
+        payload["ready"] = report.ready
+        _print_json(payload)
+        return
+    typer.echo(f"Worker: {report.provider_worker_id}")
+    typer.echo(f"Provider state: {report.provider_state.value}")
+    typer.echo(f"Readiness: {report.readiness_state.value}")
+    for check in report.checks:
+        typer.echo(f"{check.status.value:4} {check.name}: {check.detail}")
+    if report.gpu is not None:
+        typer.echo(f"GPU count: {report.gpu.count}")
+        typer.echo(f"GPU model(s): {', '.join(report.gpu.models) or '-'}")
+        typer.echo(
+            "GPU VRAM (MiB): " + (", ".join(str(value) for value in report.gpu.memory_mib) or "-")
+        )
+        typer.echo(f"NVIDIA driver: {report.gpu.driver_version or '-'}")
+        typer.echo(f"CUDA compatibility: {report.gpu.cuda_version or '-'}")
+    if report.disk_available_bytes is not None:
+        gibibytes = report.disk_available_bytes / (1024**3)
+        typer.echo(f"Disk available: {gibibytes:.2f} GiB at {report.disk_path}")
 
 
 def _infra_worker_name(prefix: str | None) -> str:

@@ -37,6 +37,10 @@ class HealthyProbes(SystemProbes):
     def path_is_file(self, path: Path) -> bool:
         return path in self.existing_paths
 
+    def file_mode(self, path: Path) -> int:
+        assert path in self.existing_paths
+        return 0o600
+
     def http_status(self, url: str, timeout_seconds: float) -> int:
         del url, timeout_seconds
         return 200
@@ -306,6 +310,27 @@ def test_doctor_reports_loaded_configuration_values(tmp_path: Path) -> None:
     assert checks["Worker SSH key"] == DoctorCheck(
         "Worker SSH key", CheckStatus.PASS, str(settings.ssh.private_key)
     )
+
+
+def test_doctor_rejects_worker_key_readable_by_other_users(tmp_path: Path) -> None:
+    settings = _configured_settings(tmp_path)
+    config_path = _config_file(tmp_path)
+    existing_paths = {settings.paths.wavcse, settings.ssh.private_key, config_path}
+
+    class InsecureKeyProbes(HealthyProbes):
+        def file_mode(self, path: Path) -> int:
+            del path
+            return 0o644
+
+    report = run_doctor(
+        settings,
+        InsecureKeyProbes(existing_paths),
+        config_path=config_path,
+    )
+
+    check = next(check for check in report.checks if check.name == "Worker SSH key")
+    assert check.status is CheckStatus.FAIL
+    assert "0600 or stricter" in check.detail
 
 
 def test_doctor_reports_missing_config_and_actionable_keys(tmp_path: Path) -> None:

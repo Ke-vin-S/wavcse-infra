@@ -69,5 +69,53 @@ class LifecycleTimeoutError(LifecycleError):
     """Raised when a bounded lifecycle wait expires."""
 
 
+class SshError(InfraError):
+    """Base class for sanitized worker SSH failures."""
+
+
+class SshConfigurationError(SshError):
+    """Raised when controller SSH configuration cannot be used safely."""
+
+
+class SshEndpointUnavailableError(SshError):
+    """Raised when a running worker has no usable provider SSH endpoint."""
+
+
+class SshConnectionError(SshError):
+    """Raised when the controller cannot establish a worker SSH session."""
+
+
+class SshAuthenticationError(SshConnectionError):
+    """Raised when the configured controller key is not accepted by a worker."""
+
+
+class SshHostKeyError(SshConnectionError):
+    """Raised when dedicated known-hosts verification rejects a worker host key."""
+
+
+class SshCommandError(SshError):
+    """Raised when a remote worker command exits unsuccessfully."""
+
+
+class SshCommandTimeoutError(SshCommandError):
+    """Raised when a bounded remote command does not finish in time."""
+
+
+class SshReadinessTimeoutError(SshError):
+    """Raised when a worker does not become SSH-ready within the configured bound."""
+
+
+class WorkerBootstrapError(InfraError):
+    """Raised when an idempotent worker bootstrap cannot complete."""
+
+
+class WorkerHealthError(InfraError):
+    """Raised when required worker health checks do not pass."""
+
+
+class UnsupportedAcceleratorError(WorkerHealthError):
+    """Raised when Phase 4 has no safe health check for a worker accelerator."""
+
+
 class StateError(InfraError):
     """Raised when supplemental local operational state cannot be handled safely."""

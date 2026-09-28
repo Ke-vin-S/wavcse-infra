@@ -195,11 +195,47 @@ def test_list_workers_paginates_and_normalizes_v2_response() -> None:
     assert worker.ssh_port == 10341
     assert worker.exposed_ports == ("22/tcp", "8888/http")
     assert worker.ssh_proxy is not None
+    assert worker.ssh_proxy.provider_worker_id == "pod-123"
+    assert worker.ssh_proxy.host == "ssh.runpod.io"
+    assert worker.ssh_direct is not None
+    assert worker.ssh_direct.provider_worker_id == "pod-123"
+    assert worker.ssh_direct.port == 10341
     assert worker.datacenter == "EU-RO-1"
     assert worker.container_disk_gb == 30
     assert worker.volume_gb == 20
     assert worker.volume_mount_path == "/workspace"
     assert worker.created_at is not None
+
+
+def test_worker_with_no_published_ssh_endpoint_normalizes_cleanly() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json=_pod_payload(ssh=None),
+            request=request,
+        )
+    )
+    with RunPodClient(_config(), transport=transport) as client:
+        worker = client.get_worker("pod-123")
+
+    assert worker.ssh_proxy is None
+    assert worker.ssh_direct is None
+    assert worker.public_ip is None
+    assert worker.ssh_port is None
+
+
+def test_malformed_ssh_endpoint_is_rejected_as_provider_response_error() -> None:
+    malformed = _pod_payload(
+        ssh={"direct": {"host": "bad host", "port": 30222, "username": "root"}}
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json=malformed, request=request)
+    )
+    with (
+        RunPodClient(_config(), transport=transport) as client,
+        pytest.raises(ProviderResponseError, match="unexpected response"),
+    ):
+        client.get_worker("pod-123")
 
 
 def test_show_worker_percent_encodes_exact_provider_id() -> None:

@@ -123,9 +123,16 @@ class StorageConfig(FrozenModel):
 
 
 class SshConfig(FrozenModel):
-    """Controller-side worker SSH key location."""
+    """Controller-side worker SSH execution and bounded polling settings."""
 
     private_key: Path | None = None
+    known_hosts_file: Path = Path("~/.local/state/wavcse-infra/known_hosts")
+    connect_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    command_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    bootstrap_timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
+    readiness_timeout_seconds: float = Field(default=180.0, gt=0, le=3600)
+    poll_interval_seconds: float = Field(default=2.0, gt=0, le=60)
+    max_poll_interval_seconds: float = Field(default=10.0, gt=0, le=120)
 
     @field_validator("private_key", mode="before")
     @classmethod
@@ -172,6 +179,22 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "WAVCSE_INFRA_S3_BUCKET": ("storage", "bucket"),
     "WAVCSE_INFRA_S3_PREFIX": ("storage", "prefix"),
     "WAVCSE_INFRA_SSH_PRIVATE_KEY": ("ssh", "private_key"),
+    "WAVCSE_INFRA_SSH_KNOWN_HOSTS_FILE": ("ssh", "known_hosts_file"),
+    "WAVCSE_INFRA_SSH_CONNECT_TIMEOUT_SECONDS": ("ssh", "connect_timeout_seconds"),
+    "WAVCSE_INFRA_SSH_COMMAND_TIMEOUT_SECONDS": ("ssh", "command_timeout_seconds"),
+    "WAVCSE_INFRA_SSH_BOOTSTRAP_TIMEOUT_SECONDS": (
+        "ssh",
+        "bootstrap_timeout_seconds",
+    ),
+    "WAVCSE_INFRA_SSH_READINESS_TIMEOUT_SECONDS": (
+        "ssh",
+        "readiness_timeout_seconds",
+    ),
+    "WAVCSE_INFRA_SSH_POLL_INTERVAL_SECONDS": ("ssh", "poll_interval_seconds"),
+    "WAVCSE_INFRA_SSH_MAX_POLL_INTERVAL_SECONDS": (
+        "ssh",
+        "max_poll_interval_seconds",
+    ),
     "WAVCSE_INFRA_WAVCSE_PATH": ("paths", "wavcse"),
 }
 
@@ -285,7 +308,8 @@ def _expand_paths(settings: Settings) -> Settings:
                         settings.ssh.private_key.expanduser()
                         if settings.ssh.private_key is not None
                         else None
-                    )
+                    ),
+                    "known_hosts_file": settings.ssh.known_hosts_file.expanduser(),
                 }
             ),
         }

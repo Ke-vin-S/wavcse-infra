@@ -2,8 +2,8 @@
 
 `wavcse-infra` is the infrastructure control plane for reproducible wavCSE
 research workloads. It prepares a persistent AWS EC2 controller, inspects disposable
-RunPod GPU workers, and will later coordinate exact-commit execution and durable S3
-artifact transfer.
+RunPod GPU workers, prepares them through SSH, and will later coordinate exact-commit
+execution and durable S3 artifact transfer.
 
 It is not the wavCSE research repository. Model code, experiments, research
 configuration, tests, and MLflow integration remain in the separate `wavCSE`
@@ -11,7 +11,7 @@ repository.
 
 ## Delivery status
 
-The repository currently implements Phases 0–3 of the v1 specification:
+The repository currently implements Phases 0–4 of the v1 specification:
 
 - a typed `infra` CLI and layered TOML/environment configuration;
 - Ruff, pytest, ShellCheck, and shfmt validation;
@@ -25,11 +25,14 @@ The repository currently implements Phases 0–3 of the v1 specification:
   maximum-hourly-price guard;
 - conservative ambiguous-create reconciliation without automatic POST retries;
 - atomic non-secret local worker state beneath `~/.local/state/wavcse-infra/`;
+- normalized direct/proxy RunPod SSH discovery and bounded authenticated readiness;
+- idempotent streamed worker bootstrap plus version, tool, disk, and NVIDIA GPU health;
+- a separate local readiness model in which provider `RUNNING` does not imply `READY`;
 - provider-neutral worker/request/offer models and bounded retries for safe reads;
 - initial architecture, security, operations, provider, and decision documentation.
 
-Phase 3 manages Pod resources only. SSH connections, worker bootstrap, artifact
-transfer, wavCSE checkout/execution, MLflow runs, and jobs remain unimplemented.
+Phase 4 stops at worker readiness. Artifact transfer, wavCSE checkout/execution, MLflow
+runs, and jobs remain unimplemented.
 
 ## Architecture
 
@@ -168,6 +171,9 @@ infra worker list
 infra worker show <worker-id>
 infra worker gpu-types --cloud COMMUNITY --gpu-count 1
 infra worker create --gpu <exact-type-id> --cloud COMMUNITY --image <image> --max-price <usd-hour>
+infra worker wait-ssh <exact-worker-id>
+infra worker bootstrap <exact-worker-id>
+infra worker health <exact-worker-id>
 infra worker stop <exact-worker-id>
 infra worker start <exact-worker-id>
 infra worker destroy <exact-worker-id>
@@ -178,11 +184,16 @@ appear before the command name.
 
 ## Worker lifecycle
 
-Phase 3 implements the Pod-resource portion of the lifecycle: discover an exact current
-GPU offer, enforce availability and price limits, print and confirm a creation plan,
-create once, persist the provider ID, and poll to a bounded provider state. Start, stop,
-and destroy use exact provider IDs. Create and destroy require confirmation unless
-`--yes` is supplied; that flag never bypasses validation or `--max-price`.
+Phase 3 implements the Pod-resource lifecycle: discover an exact current GPU offer,
+enforce availability and price limits, print and confirm a creation plan, create once,
+persist the provider ID, and poll to a bounded provider state. Phase 4 then discovers a
+current direct or proxy SSH endpoint, waits for an authenticated no-op, streams an
+idempotent bootstrap script over stdin, and runs normalized health checks. A Pod can be
+RunPod `RUNNING` while its local readiness remains `NOT_READY`, `SSH_READY`,
+`BOOTSTRAPPED`, `GPU_HEALTHY`, or `FAILED`; only all required checks produce `READY`.
+
+Start, stop, and destroy use exact provider IDs. Create and destroy require confirmation
+unless `--yes` is supplied; that flag never bypasses validation or `--max-price`.
 
 Every CLI-created Pod receives a high-entropy `wavcse-...` identity. If a create response
 is lost, the client reconciles by the complete identity and never blindly retries the
@@ -199,9 +210,11 @@ REST API v2 currently does not expose interruptible/spot Pod creation. The CLI r
 [RunPod provider notes](docs/RUNPOD.md) and [Operations](docs/OPERATIONS.md) for the safe
 first-worker procedure and current limitations.
 
-Normal GPU workers do not install OMP, Codex, AGF, or other agent-development tooling.
-Any future development-worker profile must add that behavior explicitly without
-changing the training-worker contract.
+Normal GPU bootstrap installs only stable Ubuntu prerequisites: Git, Python, uv, curl,
+CA certificates, archive tools, and basic process/filesystem utilities. It does not
+install OMP, Codex, AGF, PyTorch, wavCSE, or research dependencies. The current GPU
+health contract supports NVIDIA workers with `nvidia-smi`; unsupported accelerators are
+never silently marked ready.
 
 ## Storage model
 
@@ -218,8 +231,9 @@ AWS credentials. Git stores code and small metadata, not generated tensors or ar
   `SecureString`; authorization values are redacted and never persisted.
 - GPU workers are temporary and less trusted than the controller.
 - S3 buckets remain private; presigned URLs are bearer secrets until expiry.
-- SSH uses keys and explicit host-key policy. Global host verification bypass is not
-  permitted.
+- SSH uses the configured dedicated controller key. OpenSSH ignores user configuration,
+  writes only to a wavcse-infra known-hosts file, and uses trust-on-first-use with
+  `accept-new`; changed keys are rejected. Global host verification is never disabled.
 
 See [Security](docs/SECURITY.md) for the threat assumptions and IAM guidance.
 

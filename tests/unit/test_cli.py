@@ -11,11 +11,18 @@ from wavcse_infra.models import (
     Availability,
     CloudType,
     GpuOffer,
+    HealthCheckStatus,
     Worker,
+    WorkerConnectionInfo,
+    WorkerGpuInfo,
+    WorkerHealthCheck,
+    WorkerHealthReport,
+    WorkerReadinessState,
     WorkerSpec,
     WorkerState,
 )
 from wavcse_infra.state import WorkerStateStore
+from wavcse_infra.workers.ssh import SshWaitResult
 
 runner = CliRunner()
 
@@ -352,3 +359,106 @@ def test_generated_worker_names_are_recognizable_and_unique() -> None:
     assert first.startswith("wavcse-dg-0004-")
     assert second.startswith("wavcse-dg-0004-")
     assert first != second
+
+
+def _connection() -> WorkerConnectionInfo:
+    return WorkerConnectionInfo(
+        provider_worker_id="pod-123",
+        kind="direct",
+        host="203.0.113.9",
+        port=30222,
+        username="root",
+    )
+
+
+def _health_report(*, ready: bool = True) -> WorkerHealthReport:
+    status = HealthCheckStatus.PASS if ready else HealthCheckStatus.FAIL
+    return WorkerHealthReport(
+        provider_worker_id="pod-123",
+        provider_state=WorkerState.RUNNING,
+        readiness_state=(WorkerReadinessState.READY if ready else WorkerReadinessState.FAILED),
+        connection=_connection(),
+        bootstrap_version_expected="1",
+        bootstrap_version_observed="1" if ready else None,
+        disk_path="/workspace",
+        disk_available_bytes=50 * 1024**3,
+        git_version="git version 2.43.0",
+        python_version="Python 3.12.3",
+        uv_version="uv 0.10.9",
+        gpu=(
+            WorkerGpuInfo(
+                count=1,
+                models=("NVIDIA RTX A4000",),
+                memory_mib=(16376,),
+                driver_version="550.54.15",
+                cuda_version="12.8",
+            )
+            if ready
+            else None
+        ),
+        checks=(WorkerHealthCheck(name="gpu", status=status, detail="GPU result"),),
+    )
+
+
+def test_wait_ssh_command_reports_normalized_mapped_endpoint(monkeypatch, tmp_path: Path) -> None:
+    client = FakeClient()
+    _install_fakes(monkeypatch, tmp_path, client)
+
+    class Waiter:
+        def wait(self, worker_id: str, *, timeout_seconds: float | None = None):
+            assert (worker_id, timeout_seconds) == ("pod-123", 15)
+            return SshWaitResult(worker=_worker(), connection=_connection())
+
+    monkeypatch.setattr(cli, "_worker_access", lambda client, settings: (object(), Waiter()))
+    result = runner.invoke(
+        app,
+        ["worker", "wait-ssh", "pod-123", "--wait-timeout", "15", "--json"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert '"kind": "direct"' in result.stdout
+    assert '"port": 30222' in result.stdout
+    assert "fake-token" not in result.stdout
+
+
+def test_bootstrap_command_reports_ready_health(monkeypatch, tmp_path: Path) -> None:
+    _install_fakes(monkeypatch, tmp_path, FakeClient())
+
+    class Bootstrapper:
+        def bootstrap(self, worker_id: str, **kwargs: object) -> WorkerHealthReport:
+            assert worker_id == "pod-123"
+            assert kwargs == {"wait_timeout_seconds": None, "command_timeout_seconds": None}
+            return _health_report()
+
+    monkeypatch.setattr(cli, "_worker_access", lambda client, settings: (Bootstrapper(), object()))
+    result = runner.invoke(
+        app,
+        ["worker", "bootstrap", "pod-123"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Readiness: READY" in result.stdout
+    assert "PASS gpu: GPU result" in result.stdout
+    assert "Disk available: 50.00 GiB" in result.stdout
+
+
+def test_health_command_exits_nonzero_without_ready_transition(monkeypatch, tmp_path: Path) -> None:
+    _install_fakes(monkeypatch, tmp_path, FakeClient())
+
+    class Bootstrapper:
+        def health(self, worker_id: str, **kwargs: object) -> WorkerHealthReport:
+            del worker_id, kwargs
+            return _health_report(ready=False)
+
+    monkeypatch.setattr(cli, "_worker_access", lambda client, settings: (Bootstrapper(), object()))
+    result = runner.invoke(
+        app,
+        ["worker", "health", "pod-123", "--json"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 1
+    assert '"readiness_state": "FAILED"' in result.stdout
+    assert '"ready": false' in result.stdout

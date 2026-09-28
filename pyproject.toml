@@ -29,6 +29,10 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/wavcse_infra"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"worker/bootstrap.sh" = "wavcse_infra/worker/bootstrap.sh"
+"worker/health-check.sh" = "wavcse_infra/worker/health-check.sh"
+
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]

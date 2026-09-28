@@ -416,3 +416,45 @@ inspection, but the automation will not intentionally duplicate a paid Pod.
 - [RunPod v2 OpenAPI schema](https://api.runpod.io/v2/openapi.json)
 - [RunPod v2 GPU catalog](https://docs.runpod.io/api-reference-v2/catalog/list-gpu-types)
 - [RunPod v2 create Pod](https://docs.runpod.io/api-reference-v2/pods/create-a-pod)
+
+## ADR-013: Isolate ephemeral-worker SSH with dedicated TOFU state
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+
+### Context
+
+RunPod exposes command-only proxy SSH and, on eligible machines with `22/tcp`, direct
+SSH through a mapped public port. Pods and endpoint mappings are ephemeral. Disabling
+host verification would hide interception, while writing these short-lived endpoints
+to the user's normal SSH state would mix automation trust with unrelated hosts.
+
+### Decision
+
+Invoke system OpenSSH with an explicit dedicated worker identity, `-F /dev/null`,
+batch/key-only authentication, and bounded timeouts. Store accepted keys only in
+`~/.local/state/wavcse-infra/known_hosts` with `StrictHostKeyChecking=accept-new`.
+Prefer the direct mapped endpoint, fall back to the proxy for command execution, and
+refresh provider endpoint metadata while waiting. Do not depend on SCP/SFTP.
+
+### Alternatives considered
+
+- `StrictHostKeyChecking=no`: rejected because it accepts changed keys silently.
+- The user's global `~/.ssh/known_hosts`: rejected because ephemeral infrastructure
+  should not mutate or weaken unrelated SSH trust state.
+- A Python SSH dependency: rejected because OpenSSH already provides the required key,
+  timeout, host-verification, and subprocess behavior with a smaller dependency surface.
+
+### Consequences
+
+The first connection uses trust on first use and is therefore not protected against a
+first-contact network attacker. Subsequent changed keys fail closed. Operators must
+inspect the exact provider endpoint before removing a stale entry. The RunPod proxy
+remains unsuitable for SCP/SFTP, but Phase 4 streams only small reviewed scripts over
+stdin and later artifacts use S3.
+
+### Official sources
+
+- [RunPod: Connect to a Pod with SSH](https://docs.runpod.io/pods/configuration/use-ssh)
+- [RunPod REST v2: Get a Pod](https://docs.runpod.io/api-reference-v2/pods/get-a-pod)
+- [RunPod REST v2: Create a Pod](https://docs.runpod.io/api-reference-v2/pods/create-a-pod)

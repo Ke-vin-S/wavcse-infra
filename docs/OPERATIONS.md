@@ -41,6 +41,13 @@ Supported environment variables:
 | `WAVCSE_INFRA_S3_PREFIX` | Bucket prefix, default `wavcse` |
 | `WAVCSE_INFRA_WAVCSE_PATH` | Controller wavCSE checkout |
 | `WAVCSE_INFRA_SSH_PRIVATE_KEY` | Dedicated worker key path |
+| `WAVCSE_INFRA_SSH_KNOWN_HOSTS_FILE` | Isolated worker known-hosts file |
+| `WAVCSE_INFRA_SSH_CONNECT_TIMEOUT_SECONDS` | Per-attempt OpenSSH connect timeout |
+| `WAVCSE_INFRA_SSH_COMMAND_TIMEOUT_SECONDS` | Default worker health-command timeout |
+| `WAVCSE_INFRA_SSH_BOOTSTRAP_TIMEOUT_SECONDS` | Worker package bootstrap timeout |
+| `WAVCSE_INFRA_SSH_READINESS_TIMEOUT_SECONDS` | Overall SSH-ready polling timeout |
+| `WAVCSE_INFRA_SSH_POLL_INTERVAL_SECONDS` | Initial SSH readiness polling delay |
+| `WAVCSE_INFRA_SSH_MAX_POLL_INTERVAL_SECONDS` | Maximum SSH readiness polling delay |
 | `WAVCSE_INFRA_EXPECT_OMP` | Whether doctor requires `omp` |
 | `WAVCSE_INFRA_MLFLOW_URL` | Optional MLflow health endpoint |
 
@@ -234,7 +241,7 @@ writes provider credentials, or changes existing OMP/Codex authentication stores
 infra doctor
 ```
 
-Phase 3 requires the current REST v2 base URL. Controllers created from the older
+Worker management requires the current REST v2 base URL. Controllers created from the older
 Phase 2 template must update their user-owned file explicitly:
 
 ```toml
@@ -293,8 +300,21 @@ value, length, prefix, suffix, hash, or fingerprint.
    infra worker gpu-types --cloud COMMUNITY --gpu-count 1
    ```
 
-2. Create one worker using that exact GPU ID, a deliberately selected image or template,
-   minimal storage, and a maximum price at or just above the displayed total:
+2. Confirm that the public half of the dedicated key configured as `ssh.private_key`
+   is registered in the RunPod account. Keep the private half on the controller and
+   restrict it to mode `0600`:
+
+   ```bash
+   chmod 0600 ~/.ssh/wavcse_worker
+   infra doctor
+   ```
+
+   Never copy this private key, a GitHub key, AWS credentials, or the RunPod token into
+   a Pod.
+
+3. Create one worker using that exact GPU ID, a reviewed official Ubuntu-based image,
+   minimal test storage, SSH setup, and a maximum price at or just above the displayed
+   total:
 
    ```bash
    infra worker create \
@@ -304,6 +324,7 @@ value, length, prefix, suffix, hash, or fingerprint.
      --image '<reviewed-container-image>' \
      --container-disk 20 \
      --volume 0 \
+     --start-ssh \
      --max-price '<maximum-total-usd-per-hour>'
    ```
 
@@ -312,13 +333,29 @@ value, length, prefix, suffix, hash, or fingerprint.
    plan, then answer `y`. For deliberate non-interactive automation, add `--yes`; it
    does not bypass the maximum price or availability checks.
 
-3. Record the provider ID printed after the Pod reaches `RUNNING`, inspect it, and stop
-   or destroy it using only that exact ID:
+4. Record the provider ID printed after the Pod reaches provider `RUNNING`. Then wait
+   for authenticated SSH, bootstrap idempotently, and inspect the resulting readiness:
 
    ```bash
    infra worker show <exact-worker-id>
+   infra worker wait-ssh <exact-worker-id>
+   infra worker bootstrap <exact-worker-id>
+   infra worker health <exact-worker-id>
+   ```
+
+   `RUNNING` alone is not `READY`. Bootstrap first refreshes the v2 SSH endpoint, waits
+   for sshd, installs only stable worker prerequisites, and requires the expected marker,
+   Git, Python, uv, disk visibility, and a healthy NVIDIA GPU. It is safe to rerun after
+   a partial failure. `health` is read-only on the worker apart from the controller's
+   supplemental local-state update. JSON is available with `--json`.
+
+5. Stop/start or destroy it using only that exact ID:
+
+   ```bash
    infra worker stop <exact-worker-id>
    infra worker start <exact-worker-id>
+   infra worker wait-ssh <exact-worker-id>
+   infra worker health <exact-worker-id>
    infra worker destroy <exact-worker-id>
    ```
 
@@ -349,7 +386,9 @@ Created-worker metadata is stored beneath:
 
 Writes are atomic and contain no credentials. Provider reads remain authoritative.
 `worker list` and `worker show` update known records while leaving unrelated account
-Pods unclaimed. Missing tracked Pods are marked absent locally.
+Pods unclaimed. Missing tracked Pods are marked absent locally. Readiness timestamps,
+bootstrap version, endpoint coordinates, disk availability, and GPU/driver facts are
+supplemental; stopping/destroying resets readiness and never changes provider truth.
 
 If create loses its response, the CLI checks for the exact generated infra name. It
 adopts one exact match, reports multiple matches, or fails safely after bounded checks.
@@ -397,6 +436,20 @@ artifacts from S3, and experiment metadata from MLflow/DagsHub.
 - RunPod 429/5xx or transport failure: safe reads retry within the configured bound.
 - Lifecycle timeout: inspect the exact ID with `infra worker show`; the error includes
   the last known provider state and does not imply the resource is absent.
+- SSH endpoint unavailable: verify provider state, create-time `--start-ssh`, port
+  `22/tcp`, an SSH-capable image, and a registered RunPod account public key.
+- SSH authentication failure: verify the configured private key corresponds to that
+  registered public key; do not print or copy the private key.
+- SSH host-key mismatch: inspect the exact Pod ID, public IP, and mapped port before
+  changing the dedicated wavcse-infra known-hosts entry. Never disable checking.
+- SSH timeout/refusal: rerun `wait-ssh` with a deliberate `--wait-timeout`; provider
+  `RUNNING` can precede sshd readiness.
+- Bootstrap/package failure: verify the image is supported Ubuntu with apt networking,
+  then rerun `infra worker bootstrap <id>`; completed steps and the version marker are
+  idempotent.
+- Health failure: inspect the named failed check. A missing marker requires bootstrap;
+  missing/no-GPU `nvidia-smi` prevents `READY`; AMD workers are explicitly unsupported
+  in Phase 4.
 - AWS identity failure: verify an instance profile is attached and IMDS access is not
   blocked. Do not work around it by creating permanent access keys.
 - S3 failure: verify region, bucket, prefix, and role policy separately.

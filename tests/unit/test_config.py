@@ -19,6 +19,10 @@ def test_defaults_are_safe_and_do_not_require_secrets(
     assert settings.runpod.api_key_parameter is None
     assert settings.storage.bucket is None
     assert settings.paths.wavcse == Path("~/projects/wavCSE").expanduser()
+    assert (
+        settings.ssh.known_hosts_file
+        == Path("~/.local/state/wavcse-infra/known_hosts").expanduser()
+    )
 
 
 def test_default_user_config_is_loaded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -45,6 +49,27 @@ private_key = "~/.ssh/wavcse_worker"
     assert settings.aws.region == "us-east-1"
     assert settings.storage.bucket == "wavcse-research-artifacts"
     assert settings.ssh.private_key == tmp_path / ".ssh" / "wavcse_worker"
+
+
+def test_ssh_environment_settings_override_file_and_expand_paths(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[ssh]\nprivate_key = "/from-file"\nreadiness_timeout_seconds = 30\n',
+        encoding="utf-8",
+    )
+
+    settings = load_settings(
+        config_path=config_file,
+        environ={
+            "WAVCSE_INFRA_SSH_PRIVATE_KEY": str(tmp_path / "worker-key"),
+            "WAVCSE_INFRA_SSH_KNOWN_HOSTS_FILE": str(tmp_path / "known_hosts"),
+            "WAVCSE_INFRA_SSH_READINESS_TIMEOUT_SECONDS": "45",
+        },
+    )
+
+    assert settings.ssh.private_key == tmp_path / "worker-key"
+    assert settings.ssh.known_hosts_file == tmp_path / "known_hosts"
+    assert settings.ssh.readiness_timeout_seconds == 45
 
 
 def test_committed_example_is_valid_and_contains_no_secret_fields() -> None:

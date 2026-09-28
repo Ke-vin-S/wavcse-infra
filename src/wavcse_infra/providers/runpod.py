@@ -506,8 +506,8 @@ def _normalize_pod(pod: _Pod) -> Worker:
     mounts = pod.mounts or _Mounts()
     persistent = mounts.persistent
     network = mounts.network[0] if mounts.network else None
-    proxy = _connection_info("proxy", pod.ssh.proxy if pod.ssh is not None else None)
-    direct = _connection_info("direct", pod.ssh.direct if pod.ssh is not None else None)
+    proxy = _connection_info(pod.id, "proxy", pod.ssh.proxy if pod.ssh is not None else None)
+    direct = _connection_info(pod.id, "direct", pod.ssh.direct if pod.ssh is not None else None)
     return Worker(
         id=pod.id,
         name=pod.name,
@@ -541,11 +541,14 @@ def _normalize_pod(pod: _Pod) -> Worker:
 
 
 def _connection_info(
-    kind: Literal["proxy", "direct"], endpoint: _SshEndpoint | None
+    worker_id: str,
+    kind: Literal["proxy", "direct"],
+    endpoint: _SshEndpoint | None,
 ) -> WorkerConnectionInfo | None:
     if endpoint is None:
         return None
     return WorkerConnectionInfo(
+        provider_worker_id=worker_id,
         kind=kind,
         host=endpoint.host,
         port=endpoint.port,

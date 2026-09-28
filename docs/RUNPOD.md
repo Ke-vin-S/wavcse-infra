@@ -2,7 +2,7 @@
 
 ## Selected API
 
-Phase 3 uses RunPod REST API v2:
+Pod lifecycle and SSH endpoint discovery use RunPod REST API v2:
 
 ```text
 https://api.runpod.io/v2
@@ -74,8 +74,8 @@ The v2 request is nested and names exactly one GPU type:
 The CLI requires exactly one of `--image` or `--template`. Optional request fields cover
 an explicit list of datacenter IDs, a host-local persistent volume, one existing
 network volume, and RunPod's `startSsh` setup flag. Persistent and network volumes are
-mutually exclusive. Phase 3 only configures the Pod resource; it does not connect over
-SSH, validate an SSH daemon, bootstrap software, or execute commands.
+mutually exclusive. `--start-ssh` sends `startSsh: true` and exposes `22/tcp`; this is
+required for a direct mapped endpoint and is recommended for Phase 4 bootstrap.
 
 REST v2 currently has no interruptible/spot property in `CreatePodRequest` and its GPU
 catalog does not expose a spot offer for Pod creation. `--interruptible` is retained as
@@ -134,6 +134,59 @@ or destroy response is lost, the lifecycle layer reconciles with bounded GET pol
 Poll intervals back off to a configured maximum, safe GET failures are transient, and
 timeouts report the last known provider state.
 
+## SSH endpoint and public-key behavior
+
+Current v2 Pod responses expose an `ssh` object with either or both of:
+
+- `ssh.proxy`: `ssh.runpod.io:22` with a Pod-specific username. RunPod documents this
+  basic connection as command capable but without SCP/SFTP support.
+- `ssh.direct`: a public IP, provider-assigned external TCP port, and normally username
+  `root`. This exists only when the machine supports a public IP, an SSH daemon is
+  running, and container port `22/tcp` is exposed. The external port is not assumed to
+  be 22.
+
+`infra worker wait-ssh` repeatedly calls exact `GET /pods/{id}`, prefers `ssh.direct`,
+falls back to `ssh.proxy`, and runs an authenticated remote `true`. It does not equate
+RunPod `RUNNING` with SSH readiness. Missing IP/port metadata, startup connection
+refusal, and transient provider GET failures remain within a bounded backoff; terminal
+Pod states, authentication failure, host-key mismatch, and timeout are explicit errors.
+
+On create, `startSsh` injects a `PUBLIC_KEY` value containing the account's registered
+SSH public keys unless the request supplied one. It does nothing when the account has
+no registered public key, and only compatible images start sshd from this convention.
+RunPod official images support it. wavcse-infra does not manage account keys or send a
+private key; register the public half of the configured dedicated worker key before
+creating the Pod. The v2 reference describes `startSsh` as create-only: GET does not
+return the flag and PATCH cannot enable it later.
+
+RunPod's current documents use two names around image-level overrides: the v2 create
+reference says the provisioner injects `PUBLIC_KEY`, while the general SSH guide tells
+operators to set `SSH_PUBLIC_KEY` to override an account key for one Pod. This project
+sets neither variable itself and relies only on `startSsh` plus account-registered keys,
+avoiding an undocumented guess between the two names.
+
+## Bootstrap, GPU health, and readiness
+
+`infra worker bootstrap <id>` streams `worker/bootstrap.sh` to `bash -s` over SSH; it
+does not require SCP/SFTP. The script is non-interactive and idempotent: on a supported
+Ubuntu image it installs missing CA certificates, curl, Git, Python, uv, tar/gzip, and
+basic process/filesystem utilities, creates `/workspace`, then atomically writes the
+expected version to `~/.local/state/wavcse-worker/bootstrap-version`. It does not clone
+wavCSE or install PyTorch, research dependencies, OMP, Codex, or AGF.
+
+The subsequent health script reports the bootstrap marker, Git/Python/uv versions,
+available bytes at the selected workspace path, and `nvidia-smi` facts: GPU count,
+model, MiB, driver, and CUDA compatibility version. A valid NVIDIA GPU is required for
+Phase 4 `READY`. AMD and other accelerators are reported as unsupported rather than
+being tested with the wrong tool. Less than roughly 20 GiB free produces a warning
+because the planned embeddings alone are approximately that size; it does not invent a
+larger readiness minimum.
+
+RunPod state and local readiness are separate. The local progression is `NOT_READY` →
+`SSH_READY` → `BOOTSTRAPPED` → `GPU_HEALTHY` → `READY`; a required failed check records
+`FAILED`. Stop/destroy returns a tracked worker to `NOT_READY`. Re-running bootstrap is
+the supported recovery path after a partial failure or version mismatch.
+
 ## Stop, storage, and destroy costs
 
 RunPod reports Pod `cost` as zero while status is `EXITED`, but that is the current
@@ -148,7 +201,7 @@ compute cost, not a guarantee of zero total cost. Current provider documentation
 `stop` retains the Pod. `destroy` permanently terminates the Pod resource and requires
 the exact provider ID plus confirmation unless `--yes` is supplied. Destroying a Pod
 does not imply deletion of a separately managed network volume. S3 remains canonical;
-Phase 3 does not transfer or verify artifacts.
+Phase 4 does not transfer or verify artifacts.
 
 ## Local state
 
@@ -160,9 +213,10 @@ Created-worker metadata is written atomically to:
 
 The versioned JSON file is mode `0600`; its directory is mode `0700`. Writes use a
 same-directory temporary file, `fsync`, and atomic replacement. It stores request and
-observed resource details, price, timestamps, last state, and provider-reported SSH
-endpoint fields. It never stores API tokens, authorization headers, SSM values, AWS
-credentials, or private keys.
+observed resource details, price, timestamps, provider state, local readiness,
+provider-reported SSH coordinates, bootstrap version, health timestamps, disk capacity,
+and GPU facts. It never stores API tokens, authorization headers, SSM values, AWS
+credentials, GitHub credentials, or private keys.
 
 RunPod remains authoritative. List/show reads come from RunPod and only reconcile
 records already tracked locally. Unrelated Pods in the same account are displayed but
@@ -180,14 +234,19 @@ REST v2 RFC 9457 error `detail` text is sanitized and bounded before display. Re
 headers and complete response objects are never rendered. Authorization values and URL
 query strings pass through central redaction.
 
-## Current Phase 3 limitations
+## Current Phase 4 limitations
 
 - REST v2 does not currently expose interruptible/spot Pod creation.
 - The client-side maximum price check is not a provider-side atomic price reservation.
 - Availability is a current catalog signal, not a capacity guarantee.
-- Phase 3 may request RunPod's SSH setup fields but does not connect or verify SSH.
-- No worker bootstrap, artifact transfer, exact-commit execution, or job management is
-  implemented.
+- Worker bootstrap currently supports Ubuntu images with `apt-get` and NVIDIA health
+  through `nvidia-smi`; it will not mark AMD workers READY.
+- Proxy SSH does not support SCP/SFTP. wavcse-infra uses stdin for its small scripts and
+  deliberately leaves data transport to the later S3 phase.
+- Trust-on-first-use cannot authenticate the first SSH host key. Later changed keys fail
+  closed in the dedicated known-hosts file.
+- No artifact transfer, exact-commit execution, research environment, or job management
+  is implemented.
 - No normal test or CI job calls the live API or performs a paid mutation.
 
 ## Official references

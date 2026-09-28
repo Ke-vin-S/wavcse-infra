@@ -7,7 +7,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class WorkerState(StrEnum):
@@ -22,6 +22,25 @@ class WorkerState(StrEnum):
     DESTROYED = "DESTROYED"
     ERROR = "ERROR"
     UNKNOWN = "UNKNOWN"
+
+
+class WorkerReadinessState(StrEnum):
+    """Controller-observed readiness, separate from provider lifecycle state."""
+
+    NOT_READY = "NOT_READY"
+    SSH_READY = "SSH_READY"
+    BOOTSTRAPPED = "BOOTSTRAPPED"
+    GPU_HEALTHY = "GPU_HEALTHY"
+    READY = "READY"
+    FAILED = "FAILED"
+
+
+class HealthCheckStatus(StrEnum):
+    """Normalized outcome of one worker readiness check."""
+
+    PASS = "PASS"
+    WARN = "WARN"
+    FAIL = "FAIL"
 
 
 class CloudType(StrEnum):
@@ -46,10 +65,37 @@ class WorkerConnectionInfo(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    provider_worker_id: str = Field(min_length=1)
     kind: Literal["proxy", "direct"]
     host: str = Field(min_length=1)
     port: int = Field(ge=1, le=65535)
     username: str = Field(min_length=1)
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        """Reject endpoint text that could alter an OpenSSH argv."""
+
+        normalized = value.strip()
+        if (
+            not normalized
+            or normalized.startswith("-")
+            or any(character.isspace() or ord(character) < 32 for character in normalized)
+        ):
+            raise ValueError("SSH host is malformed")
+        return normalized
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        """Restrict SSH usernames to the portable account-name subset RunPod returns."""
+
+        normalized = value.strip()
+        if not normalized or any(
+            not (character.isalnum() or character in "._-") for character in normalized
+        ):
+            raise ValueError("SSH username is malformed")
+        return normalized
 
 
 class Worker(BaseModel):
@@ -153,3 +199,50 @@ class WorkerCreationPlan(BaseModel):
     spec: WorkerSpec
     offer: GpuOffer
     max_hourly_price: Decimal | None = Field(default=None, ge=0)
+
+
+class WorkerHealthCheck(BaseModel):
+    """One normalized check from a worker health inspection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1)
+    status: HealthCheckStatus
+    detail: str = Field(min_length=1)
+
+
+class WorkerGpuInfo(BaseModel):
+    """GPU facts reported by vendor tooling on the worker."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    vendor: Literal["NVIDIA"] = "NVIDIA"
+    count: int = Field(ge=0)
+    models: tuple[str, ...] = ()
+    memory_mib: tuple[int, ...] = ()
+    driver_version: str | None = None
+    cuda_version: str | None = None
+
+
+class WorkerHealthReport(BaseModel):
+    """Normalized provider, SSH, bootstrap, disk, tool, and GPU readiness report."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider_worker_id: str = Field(min_length=1)
+    provider_state: WorkerState
+    readiness_state: WorkerReadinessState
+    connection: WorkerConnectionInfo
+    bootstrap_version_expected: str = Field(min_length=1)
+    bootstrap_version_observed: str | None = None
+    disk_path: str | None = None
+    disk_available_bytes: int | None = Field(default=None, ge=0)
+    git_version: str | None = None
+    python_version: str | None = None
+    uv_version: str | None = None
+    gpu: WorkerGpuInfo | None = None
+    checks: tuple[WorkerHealthCheck, ...]
+
+    @property
+    def ready(self) -> bool:
+        return self.readiness_state is WorkerReadinessState.READY

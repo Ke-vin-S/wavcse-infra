@@ -30,3 +30,10 @@ prefix = "wavcse"
 
 [ssh]
 private_key = "~/.ssh/wavcse_worker"
+known_hosts_file = "~/.local/state/wavcse-infra/known_hosts"
+connect_timeout_seconds = 10.0
+command_timeout_seconds = 300.0
+bootstrap_timeout_seconds = 900.0
+readiness_timeout_seconds = 180.0
+poll_interval_seconds = 2.0
+max_poll_interval_seconds = 10.0

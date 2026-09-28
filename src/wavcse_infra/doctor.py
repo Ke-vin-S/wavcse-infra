@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import platform
 import shutil
+import stat
 import sys
 from dataclasses import dataclass
 from enum import StrEnum
@@ -85,6 +86,9 @@ class SystemProbes:
 
     def path_is_file(self, path: Path) -> bool:
         return path.is_file()
+
+    def file_mode(self, path: Path) -> int:
+        return stat.S_IMODE(path.stat().st_mode)
 
     def runpod_credential(self, settings: Settings) -> ResolvedRunPodCredential:
         return resolve_runpod_api_key(settings)
@@ -254,6 +258,13 @@ def _ssh_key_check(probes: SystemProbes, path: Path | None, config_path: Path) -
             "WAVCSE_INFRA_SSH_PRIVATE_KEY",
         )
     if probes.path_is_file(path):
+        mode = probes.file_mode(path)
+        if mode & 0o077:
+            return DoctorCheck(
+                "Worker SSH key",
+                CheckStatus.FAIL,
+                f"{path} has mode {mode:04o}; restrict it to 0600 or stricter",
+            )
         return DoctorCheck("Worker SSH key", CheckStatus.PASS, str(path))
     return DoctorCheck(
         "Worker SSH key",
