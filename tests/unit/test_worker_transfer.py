@@ -496,6 +496,29 @@ def test_job_upload_accepts_a_regular_file_inside_workspace(
     assert transport.uploaded == [PAYLOAD]
 
 
+def test_job_upload_reports_a_missing_source_as_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A declared output the command never produced is terminal, not resumable.
+
+    `FileNotFoundError` is an `OSError`, so classified as a transient transfer failure it
+    made the controller retry a permanently absent file and kept the job record out of a
+    terminal state.
+    """
+
+    workspace = tmp_path / "job"
+    (workspace / "outputs").mkdir(parents=True)
+    transport = _install(monkeypatch, FakeTransport())
+
+    with pytest.raises(TransferInputError) as failure:
+        upload(URL, str(workspace / "outputs" / "missing.json"), allowed_root=str(workspace))
+
+    message = str(failure.value)
+    assert "does not exist" in message
+    assert worker_transfer.TRANSIENT_FAILURE_MARKER not in message
+    assert transport.calls == []
+
+
 def test_upload_reports_http_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install(monkeypatch, FakeTransport(error=_http_error(403)))
     source = _write_source(tmp_path)

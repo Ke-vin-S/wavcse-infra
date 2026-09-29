@@ -1577,6 +1577,21 @@ def cache_stats(root: str) -> dict[str, str]:
     }
 
 
+def _open_upload_component(name: str, flags: int, *, dir_fd: int | None = None) -> int:
+    """Open one upload path component, reporting absence as a terminal input error.
+
+    A declared output that is simply not there is not a transient transfer failure: the
+    command finished without producing it, and no retry can change that. Left as a bare
+    `FileNotFoundError` it is an `OSError`, so it would be relabelled with the resumable
+    marker and the job record could never reach a terminal state.
+    """
+
+    try:
+        return os.open(name, flags, dir_fd=dir_fd)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise TransferInputError(f"upload source does not exist: {name!r}") from exc
+
+
 def _open_upload_source(origin: str, allowed_root: str | None):
     """Open a job output through directory fds, rejecting every symlink component."""
 
@@ -1592,12 +1607,14 @@ def _open_upload_source(origin: str, allowed_root: str | None):
     directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for part in parts[:-1]:
-            next_fd = os.open(
+            next_fd = _open_upload_component(
                 part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd
             )
             os.close(directory_fd)
             directory_fd = next_fd
-        source_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        source_fd = _open_upload_component(
+            parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd
+        )
         if not stat.S_ISREG(os.fstat(source_fd).st_mode):
             os.close(source_fd)
             raise TransferInputError("upload source is not a regular file")
