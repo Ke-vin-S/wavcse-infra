@@ -1,1043 +1,145 @@
 # AGENTS.md — wavcse-infra
 
-## Purpose
+## What this repository is
 
-`wavcse-infra` is the infrastructure and orchestration repository for running reproducible wavCSE research workloads across persistent controller infrastructure and ephemeral GPU workers.
+`wavcse-infra` is the infrastructure control plane for reproducible wavCSE research
+workloads. It prepares and operates a persistent but stoppable AWS EC2 controller, creates
+and inspects disposable RunPod GPU workers, transfers artifacts, and executes research jobs
+against an exact commit, all through the `infra` CLI. Machine bootstrap, worker and volume
+lifecycle, remote execution, storage transfer, environment diagnostics, and orchestration
+are its responsibilities.
 
-This repository is NOT the wavCSE research repository.
+It is not the wavCSE research repository: research code, models, experiment definitions,
+tests, study documentation, and MLflow/DagsHub reporting stay in the separate `wavCSE`
+checkout. Never move research logic into this repository.
 
-The repositories have separate responsibilities:
+## Boundary — what does not belong here
 
-- `wavCSE`: research code, models, experiment definitions, research state, tests, study documentation.
-- `wavcse-infra`: machine bootstrap, worker lifecycle, remote execution, storage transfer, environment diagnostics, and infrastructure orchestration.
+- Research logic, experiment definitions, and research state: the `wavCSE` repository.
+- Detailed behaviour, configuration, and recovery narrative: `README.md`, `docs/SPEC.md`,
+  `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/OPERATIONS.md`, `docs/RUNPOD.md`,
+  `docs/DECISIONS.md`. Point at them; do not restate them here.
+- Procedure a skill already covers: reference the skill (see below); do not duplicate it.
+- Large artifacts, checkpoints, and embeddings: S3, never Git.
+- Do not add without an explicit request: Kubernetes, Slurm, Ray, Celery, Airflow, Ansible,
+  Terraform/OpenTofu, a web UI, a daemon, a database, a message broker, a custom experiment
+  tracker or secrets manager, multi-user authorization, or generic cloud abstraction beyond
+  keeping provider code isolated.
+- Build small correct vertical slices; no speculative platform engineering.
 
-Do not move research logic into this repository.
+## Hard invariants — never violate
 
----
+Non-negotiable. A skill mentioning one of these does not relax it.
 
-# Architecture
+1. **The controller is the authoritative writable environment; workers are disposable.**
+   Source changes are made, tested, committed, and pushed in the controller's `wavCSE`
+   checkout, then fetched by a worker at an exact pushed commit. A worker MUST NOT be the
+   only location holding a change, MUST NOT hold a push credential, and a normal worker
+   MUST NOT run OMP. An explicitly requested development/debug worker may carry extra
+   tooling, but recorded runs still execute committed code.
+2. **Every recorded experiment executes an explicit immutable commit SHA.** Never infer a
+   commit from the checked-out branch or from an unspecified working tree. Prefer full SHAs
+   over branch names. Detached checkout, `HEAD` verified equal to the requested object on
+   both sides, clean-tree requirement for recorded jobs, and the SHA recorded in execution
+   metadata.
+3. **Storage layers are not interchangeable.** S3 is canonical; a network volume is a
+   rebuildable warm cache; container disk is ephemeral scratch. Losing a worker or a volume
+   must lose nothing canonical. An artifact is trusted because its identity was verified,
+   not because a file with the expected name exists: verification is streaming SHA-256 (an
+   S3 ETag is never a checksum), and publication is not complete at upload acknowledgement.
+4. **No long-lived cloud credentials on GPU workers.** Workers never receive AWS access
+   keys, a controller SSH key, a GitHub write credential, or a provider API token. S3 access
+   is through time-limited, object-scoped presigned URLs, treated as secrets until expiry
+   and never logged in full. The controller uses its EC2 IAM role via the normal SDK
+   credential chain, under least privilege scoped to the configured bucket and prefix, which
+   stays private (public-read artifacts are out of scope); no static AWS keys on the
+   controller.
+5. **Secrets are never logged or persisted.** Redact authorization headers, API tokens,
+   presigned URL query strings, AWS temporary credentials, and private keys; never print a
+   full environment dump. Secret values come from the environment or an external credential
+   store, never from committed configuration; `.env.example` carries names only.
+6. **Destructive operations require explicit intent and confirmation.** Worker, volume, and
+   storage deletion targets an explicit identifier, prints the exact target, and requires
+   confirmation unless `--yes` is given; `--yes` never bypasses validation or a price guard.
+   Automated cleanup may destroy only resources this tool created and tracks, never by
+   naming convention alone.
+7. **Cost is a first-class constraint.** Never silently provision GPU resources. Creation
+   exposes GPU type and count, cloud tier, maximum acceptable hourly price, storage, and
+   interruptibility policy, prints the selected resource and the provider-observed hourly
+   price, and refuses to guess an absent price. The price ceiling belongs to a human.
+8. **Provider state is authoritative; local state is convenience.** Reconcile against the
+   provider before acting, and never let a lost response become a duplicate paid resource:
+   an ambiguous create is reconciled by exact generated identity and the paid request is
+   never blindly retried.
+9. **Infrastructure actions go through the `infra` CLI.** Raw provider HTTP calls, ad-hoc
+   `aws` invocations, and manual `ssh` mutation discard the cost guards, identity
+   safeguards, bounded retries, and provenance the CLI provides, and are defects.
+10. **Failures must be actionable and credential-free.** Every operation identifies the
+    provider, resource or job ID, operation, and result, and reports the observed state; no
+    bare "error occurred" and no leaked tokens. Retries are bounded and must never turn a
+    destructive operation into unintended duplicate provisioning.
+11. **Idempotence where practical.** Bootstrap and configuration operations must be safe to
+    rerun and converge on the same desired state, never corrupting or duplicating it.
 
-The system consists of:
+## Validation
 
-1. Controller
-2. Research repository
-3. GPU workers
-4. GitHub
-5. S3
-6. MLflow/DagsHub
+`make check` is the required gate for any change; run the narrower target while iterating.
 
-## Controller
-
-The controller is a persistent but stoppable AWS EC2 instance.
-
-It contains:
-
-- OMP
-- Codex when needed
-- tmux
-- Git
-- `wavCSE`
-- `wavcse-infra`
-- AWS CLI/SDK access through an EC2 IAM role
-- RunPod credentials
-- orchestration CLI
-
-The controller is the authoritative writable development environment.
-
-Expected layout:
-
-```
-~/projects/
-├── wavCSE/
-└── wavcse-infra/
-```
-
-OMP normally runs from:
-
-```
-~/projects/wavCSE
-```
-
-The infrastructure CLI normally runs from:
-
-```
-~/projects/wavcse-infra
-```
-
-## GPU workers
-
-GPU workers are disposable execution environments.
-
-Workers:
-
-- clone `wavCSE`
-- checkout an explicit Git commit
-- obtain required datasets/embeddings
-- run commands
-- report results to MLflow
-- upload durable artifacts when required
-- may be destroyed afterward
-
-Workers are NOT authoritative development environments.
-
-Workers MUST NOT become the only location containing source-code changes.
-
-Normal workers MUST NOT run OMP.
-
-An explicitly requested development/debug worker may contain additional development tooling, but recorded research runs must still execute committed code.
-
----
-
-# Fundamental invariants
-
-## 1. Controller writable, workers disposable
-
-Source-code modifications happen in the controller's `wavCSE` clone.
-
-Normal workflow:
-
-```
-OMP edits controller wavCSE
-    ->
-tests
-    ->
-git commit
-    ->
-git push
-    ->
-worker fetches exact commit
-    ->
-experiment executes
+```bash
+make check     # uv lock check + format check + lint + tests + cloud-init schema
+make test      # pytest
+make format    # ruff fix/format, shfmt -w
+make lint      # ruff check, shellcheck
+make doctor    # read-only controller checks via uv run infra doctor
 ```
 
-Do not build a workflow in which workers contain unique uncommitted research changes.
+Bash scripts keep a Bash shebang, `set -Eeuo pipefail`, quoted expansions, actionable
+errors, and stay ShellCheck-clean and shfmt-formatted; substantial orchestration state
+machines do not belong in Bash. Python is Ruff-clean and type-hinted. Unit tests mock
+provider HTTP and AWS calls. No normal test or validation command creates, starts, stops, or
+destroys paid infrastructure and CI runs without cloud credentials; integration tests that
+could create paid resources are opt-in, explicitly flagged, self-cleaning, and never in CI.
 
-## 2. Every recorded experiment executes an explicit Git commit
+## Skills — load the one that fits the work
 
-Never launch a recorded research experiment from an unspecified working tree.
+- `.agents/skills/wavcse-infra-operator/SKILL.md` — operating the control plane with `infra`:
+  reconciling provider and local state, worker and network-volume lifecycle, exact-commit job
+  submission, secrets handling, destructive operations, retries and cost guards.
+- `.agents/skills/gpu-research-operator/SKILL.md` — GPU selection and price ceilings,
+  measuring throughput before scaling, bottleneck diagnosis, stopping paid compute.
+- `.agents/skills/wavcse-artifact-pipeline/SKILL.md` — artifact identity, the S3 / network
+  volume / scratch model, cache-hit criteria, transfer semantics, version 1 manifests,
+  deterministic packaging, publication verification, cleanup.
+- `.agents/commands/{infra-status,infra-gpu,infra-artifact}.md` — read-only reconciliation,
+  GPU-economics, and artifact-flow entry points.
 
-The job specification must contain a commit SHA.
+Load the operator skill before any CLI-driven change; add the GPU or artifact skill when the
+work touches capacity economics or artifact bytes.
 
-Prefer immutable commit SHAs over branch names.
+## Current state — reconcile, never assume
 
-## 3. Git is for code, not large research artifacts
+Worker IDs, endpoints, ports, prices, availability, job outcomes, and volume placement are
+never trustworthy from conversation memory or an earlier session. Re-derive them:
 
-Git/GitHub:
-
-- source code
-- configuration
-- experiment definitions
-- documentation
-- manifests
-- small metadata
-
-S3:
-
-- precomputed embeddings
-- large checkpoints
-- packaged datasets where appropriate
-- large durable experiment artifacts
-
-MLflow/DagsHub:
-
-- run metadata
-- parameters
-- metrics
-- experiment identifiers
-- runtime metadata
-- Git commit SHA
-- worker/GPU metadata
-- references to large artifacts
-
-## 4. S3 is canonical storage
-
-RunPod local disk and network volumes are caches or execution storage.
-
-They are never the only authoritative copy of important embeddings or research artifacts.
-
-## 5. No permanent AWS credentials on GPU workers
-
-The EC2 controller uses its IAM instance role.
-
-GPU workers must not receive long-lived AWS access keys.
-
-For S3 object transfer, prefer time-limited presigned URLs generated by the controller.
-
-If another temporary credential mechanism is introduced later, document its threat model and lifetime before implementing it.
-
-## 6. Infrastructure operations must be idempotent where practical
-
-Running bootstrap/configuration operations repeatedly must not corrupt the machine or duplicate configuration.
-
-A second bootstrap should converge toward the same desired state.
-
-## 7. Destructive operations require explicit intent
-
-Worker deletion, artifact replacement, storage deletion, and similar operations must not happen implicitly.
-
-CLI destructive commands require:
-
-- explicit resource identifier
-- confirmation unless `--yes` is supplied
-- useful logging
-
-Automated cleanup may only destroy resources created and tracked by this tool.
-
-## 8. Cost is a first-class constraint
-
-Never silently provision arbitrary GPU resources.
-
-Worker creation must expose:
-
-- GPU type
-- GPU count
-- cloud type
-- maximum acceptable hourly price when supported
-- storage requirements
-- interruptibility policy
-
-Display the selected resource and observed/provider-reported hourly cost.
-
-The system must make expensive resource creation visible.
-
----
-
-# Scope of v1
-
-Implement only what is needed for the current wavCSE research workflow.
-
-v1 supports:
-
-- one persistent AWS controller
-- RunPod GPU workers
-- one or more workers
-- GitHub-based code distribution
-- S3 artifact/embedding storage
-- MLflow/DagsHub used by wavCSE itself
-- SSH remote execution
-- local controller state
-- worker lifecycle operations
-- worker health checks
-- storage transfer helpers
-- exact-commit execution
-
-Do NOT add without explicit request:
-
-- Kubernetes
-- Slurm
-- Ray
-- Celery
-- Airflow
-- Ansible
-- Terraform/OpenTofu
-- a web UI
-- a daemon
-- a database
-- a message broker
-- a custom experiment tracker
-- a custom secrets manager
-- multi-user authorization
-- generic cloud abstraction beyond what is needed to keep provider code isolated
-
-Avoid speculative platform engineering.
-
----
-
-# Technology choices
-
-## Python
-
-Use Python 3.12+ for control-plane logic.
-
-Use `uv` for Python dependency/project management.
-
-Recommended libraries:
-
-- Typer — CLI
-- httpx — HTTP client
-- boto3 — AWS/S3 integration
-- pydantic — structured configuration/models
-- pytest — tests
-
-Keep dependencies minimal.
-
-## Bash
-
-Use Bash for:
-
-- controller bootstrap
-- worker bootstrap
-- small remote entrypoints
-- OS/package setup
-
-Every Bash script must:
-
-- use a Bash shebang
-- use `set -Eeuo pipefail`
-- quote variable expansions
-- fail with actionable error messages
-- be ShellCheck clean
-- be shfmt formatted
-
-Do not implement substantial orchestration state machines in Bash.
-
-## Configuration
-
-Non-secret configuration belongs in versioned TOML/YAML files.
-
-Secrets belong in environment variables or external credential systems.
-
-Never commit real credentials.
-
----
-
-# Repository layout
-
-Target layout:
-
-```
-wavcse-infra/
-├── AGENTS.md
-├── README.md
-├── Makefile
-├── pyproject.toml
-├── uv.lock
-├── .env.example
-├── .gitignore
-├── .editorconfig
-│
-├── config/
-│   ├── infra.example.toml
-│   └── worker-profiles/
-│       ├── training.toml
-│       └── development.toml
-│
-├── controller/
-│   ├── bootstrap.sh
-│   ├── cloud-init.yaml
-│   └── config/
-│       ├── tmux.conf
-│       └── shell/
-│
-├── worker/
-│   ├── bootstrap.sh
-│   ├── health-check.sh
-│   └── run-job.sh
-│
-├── src/
-│   └── wavcse_infra/
-│       ├── __init__.py
-│       ├── cli.py
-│       ├── config.py
-│       ├── models.py
-│       ├── state.py
-│       ├── errors.py
-│       │
-│       ├── providers/
-│       │   ├── base.py
-│       │   └── runpod.py
-│       │
-│       ├── workers/
-│       │   ├── lifecycle.py
-│       │   ├── ssh.py
-│       │   ├── bootstrap.py
-│       │   └── health.py
-│       │
-│       ├── storage/
-│       │   ├── s3.py
-│       │   ├── manifests.py
-│       │   └── transfer.py
-│       │
-│       └── jobs/
-│           ├── models.py
-│           ├── submit.py
-│           ├── status.py
-│           └── collect.py
-│
-├── scripts/
-│   └── doctor.sh
-│
-├── tests/
-│   ├── unit/
-│   ├── integration/
-│   └── fixtures/
-│
-└── docs/
-    ├── SPEC.md
-    ├── ARCHITECTURE.md
-    ├── SECURITY.md
-    ├── OPERATIONS.md
-    └── RUNPOD.md
+```bash
+infra doctor            # configuration, credential source, endpoints, identity, S3
+infra config validate   # configuration parse only, no network calls
+infra worker list       # reconciles tracked workers against the provider
+infra volume list       # also warns about unresolved create intents
+infra job status <job-id>   # may drive an interrupted job forward from worker evidence
 ```
 
-Do not create empty abstraction layers merely to satisfy this tree. Implement directories/modules when their responsibility exists.
-
----
-
-# CLI contract
-
-The public CLI executable is:
-
-```
-infra
-```
-
-The CLI is the stable interface consumed by humans and eventually OMP.
-
-Initial command groups:
-
-```
-infra doctor
-
-infra worker create
-infra worker list
-infra worker show <worker-id>
-infra worker ssh <worker-id>
-infra worker exec <worker-id> -- <command>
-infra worker stop <worker-id>
-infra worker start <worker-id>
-infra worker destroy <worker-id>
-
-infra storage list
-infra storage presign-download <artifact>
-infra storage presign-upload <artifact>
-infra storage verify <artifact>
-infra storage download <artifact> --worker <worker-id> <worker-path>
-infra storage upload <artifact> --worker <worker-id> <worker-path>
-
-infra job submit <job-spec>
-infra job status <job-id>
-infra job logs <job-id>
-infra job cancel <job-id>
-```
-
-Not every command must be fully implemented in the first commit.
-
-Prefer a small correct vertical slice over many placeholder commands.
-
----
-
-# Worker lifecycle
-
-A normal worker lifecycle is:
-
-```
-create provider resource
-    ->
-wait for provider RUNNING state
-    ->
-discover SSH endpoint
-    ->
-wait for SSH
-    ->
-bootstrap worker
-    ->
-run health checks
-    ->
-mark READY
-    ->
-execute jobs
-    ->
-persist outputs
-    ->
-stop/destroy when explicitly requested
-```
-
-The lifecycle must tolerate transient API and SSH failures with bounded retries and exponential backoff.
-
-Retries must never turn a destructive operation into an unintended duplicate resource creation.
-
----
-
-# Worker bootstrap contract
-
-Given a compatible Linux GPU worker, bootstrap must establish:
-
-- Git
-- curl
-- required OS tools
-- Python/uv as required by wavCSE
-- repository checkout directory
-- required runtime environment
-- GPU visibility verification
-- required data directories
-
-Bootstrap must NOT:
-
-- install OMP by default
-- install Codex by default
-- embed secrets
-- contain research-specific experiment logic
-- silently checkout an arbitrary branch
-
-The worker should expose a health check verifying at least:
-
-- shell works
-- expected disk path exists
-- sufficient disk space
-- `nvidia-smi` works
-- GPU is visible
-- Git works
-- network connectivity required for Git/storage exists
-
-wavCSE-specific Python environment setup may call a setup contract provided by wavCSE rather than duplicating research dependency logic in infra.
-
----
-
-# Git execution contract
-
-Recorded jobs specify:
-
-- repository URL
-- immutable commit SHA
-- command
-- working directory
-- environment references
-- required artifacts
-- output policy
-
-Before execution the worker must:
-
-1. clone repository if absent
-2. fetch required commit
-3. checkout detached commit
-4. verify `HEAD` equals requested SHA
-5. refuse dirty state for recorded jobs unless explicitly allowed
-6. record commit SHA in execution metadata
-
-Never infer a commit from whatever branch happens to be checked out.
-
----
-
-# Job specification
-
-Use a versioned declarative job format.
-
-Example:
-
-```
-version: 1
-name: dg-0004-seed-42
-
-repository:
-  url: git@github.com:Synergy-io/wavCSE.git
-  commit: <full-sha>
-
-worker:
-  profile: training
-
-command:
-  argv:
-    - uv
-    - run
-    - python
-    - ...
-  working_directory: /workspace/wavCSE
-
-artifacts:
-  required:
-    - wavcse-v1/voxceleb-minpooling
-  outputs: []
-
-metadata:
-  study: DG-0004
-  seed: 42
-```
-
-Prefer argv arrays to shell command strings.
-
-Do not use `shell=True` for normal command execution.
-
----
-
-# Local state
-
-v1 does not need a database.
-
-Store controller-side operational state beneath:
-
-```
-~/.local/state/wavcse-infra/
-```
-
-State may include:
-
-- known worker IDs
-- provider
-- creation timestamp
-- requested GPU
-- observed GPU
-- hourly price
-- SSH endpoint
-- current lifecycle state
-- submitted job metadata
-
-Use atomic file writes.
-
-State is operational convenience, not the sole source of truth.
-
-Provider APIs and durable experiment systems remain authoritative for their own resources.
-
-The CLI must reconcile local state with provider state rather than blindly trusting stale files.
-
----
-
-# RunPod provider
-
-RunPod is the only required GPU provider in v1.
-
-Use the current RunPod REST API rather than browser automation.
-
-Provider-specific implementation belongs under:
-
-```
-providers/runpod.py
-```
-
-Do not leak RunPod-specific response objects throughout the application.
-
-Normalize them into internal worker models.
-
-Support configuration for:
-
-- Secure or Community Cloud
-- GPU type IDs
-- GPU count
-- image/template
-- container disk
-- volume
-- network volume ID when explicitly configured
-- SSH/public-IP requirements
-- interruptible/on-demand choice where applicable
-
-Never hardcode current GPU prices.
-
-Read actual API/provider values when available.
-
-RunPod API token comes from environment/secret configuration and must never be logged.
-
----
-
-# SSH policy
-
-SSH is for:
-
-- worker health inspection
-- bootstrap
-- remote process execution
-- logs
-- debugging
-
-SSH is NOT the canonical data transport.
-
-Use key authentication.
-
-Do not implement password-based worker access as the default.
-
-Host-key handling must be explicit. Do not globally disable host-key checking without documenting the security tradeoff.
-
-Remote command execution must:
-
-- preserve exit codes
-- capture stdout/stderr
-- support timeouts
-- clearly identify worker and command in logs
-
----
-
-# Storage architecture
-
-Canonical storage:
-
-```
-S3
-```
-
-Example logical layout:
-
-```
-s3://<bucket>/wavcse/
-├── embeddings/
-│   └── <embedding-version>/
-│       ├── manifest.json
-│       ├── voxceleb-minpooling.tar
-│       ├── keyword-spotting-minpooling.tar
-│       └── emotion-recognition-minpooling.tar
-│
-└── checkpoints/
-    └── ...
-```
-
-Embeddings are expected to be approximately 20 GiB total initially.
-
-The original embedding tree contains many `.pt` files. Store dataset-level archives for transport while preserving the expected extracted directory layout.
-
-Example extracted structure:
-
-```
-datasets/
-  voxceleb/
-    minpooling/
-      <utterance>/
-        <utterance>.pt
-```
-
-Do not force wavCSE training code to understand S3.
-
-Workers should materialize required artifacts to normal filesystem paths.
-
----
-
-# Artifact manifests
-
-Every reusable embedding artifact must have metadata sufficient to identify how it was produced.
-
-Manifest fields should include where known:
-
-- schema version
-- artifact name
-- dataset
-- embedding model
-- model/checkpoint identifier
-- pooling strategy
-- sample rate
-- generator Git commit
-- creation timestamp
-- archive object key
-- archive size
-- SHA-256 checksum
-- extracted destination
-- optional notes
-
-Never claim reproducibility metadata that is not actually known.
-
----
-
-# S3 security
-
-The controller obtains AWS credentials from its EC2 IAM role.
-
-Do not require static AWS keys on the controller.
-
-IAM policy must follow least privilege and be scoped to the required bucket/prefix.
-
-Workers should normally receive presigned S3 URLs for individual required operations.
-
-Presigned URLs:
-
-- must be time limited
-- must not be logged in full
-- must be treated as secrets until expiry
-- should be scoped to one object/action
-- should have enough validity for expected transfer duration
-
-The S3 bucket must remain private.
-
-Public-read artifacts are out of scope.
-
----
-
-# Secrets
-
-Expected secret values may include:
-
-- RUNPOD\_API\_KEY
-- MLflow/DagsHub credentials if needed by infrastructure
-- GitHub authentication where private repository access requires it
-
-`.env.example` contains names only, never values.
-
-`.gitignore` must reject common secret files.
-
-Logs must redact:
-
-- authorization headers
-- API tokens
-- presigned URL query strings
-- AWS temporary credentials
-- private keys
-
-Never print a complete environment dump.
-
----
-
-# Controller bootstrap
-
-`controller/bootstrap.sh` converts a supported fresh Ubuntu EC2 instance into a controller.
-
-It should install/configure only controller prerequisites.
-
-Cloud-init should remain thin.
-
-Preferred relationship:
-
-```
-cloud-init
-    ->
-fetch/clone wavcse-infra
-    ->
-controller/bootstrap.sh
-```
-
-Do not duplicate the full bootstrap implementation inside cloud-init.
-
-Controller bootstrap must be safe to rerun.
-
-User-specific authentication that cannot safely be automated should be surfaced as an explicit post-bootstrap step.
-
----
-
-# Configuration precedence
-
-Use predictable configuration precedence:
-
-1. CLI arguments
-2. environment variables
-3. user config file
-4. repository/default configuration
-
-Document every supported environment variable.
-
-Secrets must not be accepted from committed configuration files.
-
----
-
-# Logging
-
-Human-readable logs by default.
-
-Support verbose/debug mode.
-
-Never expose secrets in debug logs.
-
-Every worker operation should identify:
-
-- provider
-- worker ID
-- operation
-- result
-
-Job logs should identify:
-
-- job ID
-- worker ID
-- commit SHA
-
----
-
-# Error handling
-
-Failures must be actionable.
-
-Bad:
-
-```
-Error occurred
-```
-
-Good:
-
-```
-Worker rp_123 reached RUNNING state but SSH did not become reachable within 180 seconds.
-```
-
-Use typed/domain exceptions in Python where useful.
-
-Provider errors must preserve enough provider context for debugging without leaking credentials.
-
----
-
-# Testing
-
-Unit tests must not create paid cloud resources.
-
-Mock RunPod HTTP calls.
-
-Mock AWS/S3 calls.
-
-Test:
-
-- configuration precedence
-- provider response normalization
-- lifecycle transitions
-- retry behavior
-- command construction
-- secret redaction
-- job-spec validation
-- state serialization
-- destructive-operation safeguards
-
-Integration tests that can create paid resources must:
-
-- be opt-in
-- be clearly marked
-- require an explicit environment flag
-- clean up after themselves
-- never run in normal CI
-
-Bash scripts must pass:
-
-```
-shellcheck
-shfmt -d
-```
-
-Python must pass the configured formatter/linter/type/test suite.
-
-Use Ruff for Python lint/format.
-
-Do not introduce mypy unless it provides clear value; Python type hints are still expected.
-
----
-
-# CI
-
-GitHub Actions should run without cloud credentials.
-
-CI should include:
-
-- Python dependency install
-- Ruff format check
-- Ruff lint
-- pytest unit tests
-- ShellCheck
-- shfmt check
-
-CI must never create RunPod resources.
-
-CI must never require AWS credentials.
-
----
-
-# Makefile
-
-The Makefile is a convenience layer, not the implementation.
-
-Expected targets:
-
-```
-make bootstrap-controller
-make doctor
-make lint
-make format
-make test
-make check
-```
-
-Do not hide complex business logic in Make recipes.
-
----
-
-# Documentation requirements
-
-README must explain:
-
-- what the repository is
-- what it is not
-- architecture
-- initial controller setup
-- configuration
-- common commands
-- worker lifecycle
-- storage model
-- security model
-- recovery procedure
-
-`docs/ARCHITECTURE.md` must describe component boundaries and data/control flow.
-
-`docs/SECURITY.md` must describe credentials, IAM, S3, SSH, secret handling, and threat assumptions.
-
-`docs/OPERATIONS.md` must describe common operational procedures and recovery.
-
-`docs/RUNPOD.md` must document provider-specific behavior and known limitations.
-
----
-
-# Engineering principles
-
-Prefer:
-
-- explicit over implicit
-- immutable identifiers over mutable names
-- small interfaces
-- boring technology
-- observable operations
-- reproducibility
-- failure-safe behavior
-- cost visibility
-
-Avoid:
-
-- premature generic frameworks
-- unnecessary daemons
-- hidden global state
-- magic auto-detection when explicit configuration is safer
-- duplicated research logic
-- long-lived worker credentials
-- silent fallback to expensive resources
-- destructive cleanup based only on naming conventions
-
----
-
-# Implementation strategy
-
-Build vertical slices.
-
-Recommended order:
-
-1. project skeleton and CI
-2. configuration
-3. `infra doctor`
-4. RunPod read-only `worker list/show`
-5. RunPod create/destroy with safeguards
-6. SSH discovery and health
-7. worker bootstrap
-8. S3 manifest/presigned transfer support
-9. exact-commit remote execution
-10. versioned job specification
-11. job submit/status/logs
-12. operational hardening
-
-Do not attempt to build the entire future platform in one pass.
-
----
-
-# Definition of done for v1
-
-v1 is successful when, from the controller, a user can:
-
-1. run `infra doctor`
-2. create a specified RunPod GPU worker
-3. wait until it is ready
-4. bootstrap it
-5. materialize a required embedding artifact
-6. clone wavCSE
-7. checkout an explicit commit SHA
-8. execute a specified research command
-9. observe its exit status/logs
-10. verify MLflow receives the run from wavCSE
-11. persist explicitly requested large outputs
-12. destroy the worker safely
-
-A destroyed worker must not destroy the authoritative source code, embeddings, experiment metrics, or explicitly persisted outputs.
-
-That property is more important than feature count.
-
-## Session bootstrap
-
-At the beginning of a new agent session:
-
-1. Read `AGENTS.md`.
-2. Read:
-   - `README.md`
-   - `docs/SPEC.md`
-   - `docs/ARCHITECTURE.md`
-   - `docs/SECURITY.md`
-   - `docs/OPERATIONS.md`
-   - `docs/RUNPOD.md`
-3. Inspect `git status`.
-4. Inspect recent commits.
-5. Inspect relevant source and tests before modifying code.
-6. Treat repository documentation and committed implementation as the source of truth.
-7. Never assume cloud state from a previous conversation.
-
+Authority order: the provider API (RunPod), then AWS/S3, then the controller-local non-secret
+state records (`workers.json`, `volumes.json`, `jobs/`) written atomically by the CLI beneath
+the CLI state directory. Local state is supplemental, never the sole source of truth, and is
+not hand-edited. Before acting on a disagreement, read `README.md` and the "Local state and
+reconciliation" section of `docs/OPERATIONS.md`.
+
+## Agent-facing assets
+
+- `.agents/skills/<name>/SKILL.md` and `.agents/commands/<name>.md` are the canonical
+  versioned agent assets; OMP discovers both natively and Codex discovers the skills.
+- `.omp/AGENTS.md` is a relative symlink to this file, so this file is the single source of
+  truth for project instructions — edit it here, never through the symlink.
+- When an agent-facing asset is added, renamed, or moved, keep the layout and the symlink
+  consistent and run `make agents-check`.

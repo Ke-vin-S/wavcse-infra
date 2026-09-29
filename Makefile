@@ -1,7 +1,13 @@
 SHELL := /usr/bin/env bash
 SHELL_FILES := $(shell find controller scripts worker -type f -name '*.sh' 2>/dev/null)
 
-.PHONY: bootstrap-controller check cloud-init-check doctor format format-check install-agents lint test
+.PHONY: agents-check agents-sync bootstrap-controller check cloud-init-check doctor format format-check install-agents lint test
+
+agents-sync:
+	python3 scripts/agents/agent_assets.py sync
+
+agents-check:
+	python3 scripts/agents/agent_assets.py check
 
 bootstrap-controller:
 	./controller/bootstrap.sh
@@ -37,3 +43,4 @@ check:
 	$(MAKE) lint
 	$(MAKE) test
 	$(MAKE) cloud-init-check
+	$(MAKE) agents-check
