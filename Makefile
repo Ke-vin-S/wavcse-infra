@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 SHELL_FILES := $(shell find controller scripts worker -type f -name '*.sh' 2>/dev/null)
 
-.PHONY: agents-check agents-sync bootstrap-controller check cloud-init-check doctor format format-check install-agents lint test
+.PHONY: agents-check agents-sync bootstrap-controller check cloud-init-check doctor format format-check install-agents lint omp-overlay omp-overlay-check test
 
 agents-sync:
 	python3 scripts/agents/agent_assets.py sync
@@ -14,6 +14,14 @@ bootstrap-controller:
 
 install-agents:
 	./controller/install-agents.sh
+
+# Machine-local OMP wiring: lets an agent working in the wavCSE checkout reach
+# the control plane's skills without copying them or changing directory.
+omp-overlay:
+	./controller/omp-overlay.sh
+
+omp-overlay-check:
+	./controller/omp-overlay.sh --check
 
 doctor:
 	uv run --locked infra doctor

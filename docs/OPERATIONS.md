@@ -1396,11 +1396,49 @@ must invoke lifecycle commands explicitly.
 - Bootstrap copies only the non-secret parameter reference for a new configuration.
   Credentials and user-specific external authentication remain explicit post-bootstrap
   steps, and existing configuration is never overwritten.
+- `controller/omp-overlay.sh` (also `make omp-overlay`) writes the machine-local OMP
+  overlay that registers this checkout's `.agents/skills` directory for agent sessions
+  on the controller, so research work rooted in the wavCSE checkout can read the
+  operator, GPU and artifact skills without copying them or changing directory. It is
+  generated from the real checkout path — never committed — and it only exports
+  `PI_CONFIG_FILES` when that variable is unset. Bootstrap runs it best-effort and
+  reports the follow-up command when the wavCSE checkout does not exist yet; re-run it
+  after cloning or moving that checkout. `make omp-overlay-check` verifies it.
 
 The cloud-init file assumes the default Ubuntu account and the public canonical
 repository URL. Customize those two non-secret values in an EC2 launch template when
 necessary. It intentionally does not update an existing checkout, preventing first-boot
 automation from overwriting controller work.
+
+## Autonomous callers
+
+An automated caller (the wavCSE research orchestrator) may drive this control plane
+through the CLI alone. It may rely on exactly this much:
+
+- **It creates and owns its resources.** It passes its scope as the human half of the
+  worker name, so a scope-prefixed name is the ownership record, and it records the
+  intent before every billable create so a lost response is reconciled by generated
+  identity rather than repeated.
+- **It supplies its own ceilings.** `--yes` is used because it is non-interactive, and
+  `--max-price` always carries its authorization's hourly ceiling; `--yes` never
+  bypasses validation or the price guard.
+- **It declares inputs and outputs.** Digests are always supplied, so materialization
+  is verified and the rebuildable cache can answer for them.
+- **It reconciles before retrying.** A job whose acknowledgement was lost is found by
+  its deterministic name and spec, never resubmitted.
+- **It is the reaper.** Nothing here expires, reaps or cleans up: the caller stops and
+  destroys what it created, and a network volume is never a cleanup step for compute.
+  A caller that stops running leaves paid resources behind, so a periodic
+  `stop`/`sweep` on the controller is the operator's safeguard:
+
+  ```bash
+  # every 15 minutes: end compute whose deadline has passed, never destroy
+  */15 * * * * cd ~/projects/wavCSE && uv run python -m improvements.compute sweep --scope <SCOPE> --execute >> ~/.local/state/wavcse-research/sweep.log 2>&1
+  ```
+
+- **It never expects research knowledge here.** Scopes, envelopes and scientific
+  policy live in the wavCSE checkout; this control plane only executes what it is
+  asked to execute, and refuses what it cannot verify.
 
 ## Official operational references
 

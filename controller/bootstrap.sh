@@ -139,6 +139,20 @@ install_agent_tools() {
   env WAVCSE_INFRA_CONTROLLER_USER="${CONTROLLER_USER}" "${INSTALL_AGENTS_SCRIPT}"
 }
 
+install_omp_overlay() {
+  local script="${REPOSITORY_ROOT}/controller/omp-overlay.sh"
+  if [[ "${SKIP_AGENTS}" == true ]]; then
+    return
+  fi
+  [[ -x "${script}" ]] || fail "OMP overlay script is missing: ${script}"
+  # The wavCSE checkout may not exist yet on a fresh controller, and the overlay
+  # is a convenience for research sessions, so this must never fail a bootstrap.
+  if ! env WAVCSE_INFRA_CONTROLLER_USER="${CONTROLLER_USER}" "${script}"; then
+    printf 'OMP overlay not configured; run %s once the wavCSE checkout exists.\n' \
+      "${script}"
+  fi
+}
+
 ensure_user_config() {
   local config_directory="${CONTROLLER_HOME}/.config/wavcse-infra"
   local config_file="${config_directory}/config.toml"
@@ -185,6 +199,7 @@ main() {
   install_uv
   sync_project
   install_agent_tools
+  install_omp_overlay
 
   printf 'Controller bootstrap complete.\n'
   printf 'Next: configure the controller and authenticate agent providers, then run infra doctor.\n'

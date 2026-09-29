@@ -14,6 +14,15 @@ Act through the `infra` CLI. Every operation below already carries cost guards, 
 bounded retries, and provenance. Reimplementing it with raw `ssh`, `aws`, or provider HTTP calls
 discards those properties and is a defect.
 
+## Autonomous callers
+
+An automated caller driving this CLI from the wavCSE checkout relies on the contract in
+`docs/OPERATIONS.md` ("Autonomous callers"): it owns what it creates, supplies its own
+price ceiling, declares verified inputs and outputs, reconciles an ambiguous outcome
+before retrying, and is the reaper — nothing here expires or cleans up on its own. When
+a failure needs infrastructure judgement rather than a CLI call, expect to be asked
+about one scope at a time; the research side never changes directory to ask.
+
 ## Controller and worker responsibility
 
 - Controller: the authoritative writable `wavCSE` clone, Git commits and pushes, cloud credentials,
