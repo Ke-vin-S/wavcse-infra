@@ -1,14 +1,26 @@
-"""Atomic supplemental controller state for workers created by this project."""
+"""Atomic supplemental controller state for workers created by this project.
+
+Every mutation replaces the whole document, so a read-decide-write transition must be
+serialized: two controller processes that both read, decide, and write would otherwise let
+the slower one overwrite the newer state. Each mutation therefore takes one local advisory
+lock on the state document, re-reads it inside the lock, and merges its change into what
+it finds there - the same single-machine concurrency model the per-job store uses.
+"""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
-from collections.abc import Callable, Iterable
+import threading
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import wraps
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -21,9 +33,27 @@ from wavcse_infra.models import (
     WorkerHealthReport,
     WorkerReadinessState,
     WorkerState,
+    readiness_at_least,
 )
 
 DEFAULT_STATE_PATH = Path("~/.local/state/wavcse-infra/workers.json")
+
+# The document lock is held for one read-decide-write transition, and one transition may
+# call another (a create that upserts), so the descriptor is cached and its depth counted
+# instead of taking a second flock on a second descriptor, which would block against itself.
+_LOCK_DEPTH: dict[str, int] = {}
+_LOCK_DESCRIPTORS: dict[str, int] = {}
+
+
+def _serialized(method: Any) -> Any:
+    """Run one worker-state mutation while holding the document's local lock."""
+
+    @wraps(method)
+    def wrapper(self: WorkerStateStore, *args: Any, **kwargs: Any) -> Any:
+        with self.locked():
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def write_json_atomically(path: Path, payload: object) -> None:
@@ -133,6 +163,57 @@ class WorkerStateStore:
     def get(self, worker_id: str) -> WorkerRecord | None:
         return self._load().workers.get(worker_id)
 
+    def lock_path(self) -> Path:
+        """Return the local advisory lock path for the worker-state document."""
+
+        return self.path.with_name(f"{self.path.name}.lock")
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        """Hold this document's local lock for one read-decide-write transition.
+
+        Every mutating operation takes it, so a weaker observation can never be written
+        over a stronger one that another controller process recorded in between: the
+        transition re-reads the document inside the lock. It serializes processes on one
+        controller; it is not, and does not need to be, distributed consensus.
+        """
+
+        path = self.lock_path()
+        # The reentrancy key includes the thread, so a second thread of this process - not
+        # just a second process - must take the real lock instead of being mistaken for a
+        # nested call by the same holder.
+        key = f"{path}:{threading.get_ident()}"
+        depth = _LOCK_DEPTH.get(key, 0)
+        if depth:
+            _LOCK_DEPTH[key] = depth + 1
+            try:
+                yield
+            finally:
+                _LOCK_DEPTH[key] = depth
+            return
+        try:
+            directory = path.parent
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        except OSError as exc:
+            raise StateError(f"Could not open the local worker-state lock {path}: {exc}") from exc
+        _LOCK_DESCRIPTORS[key] = descriptor
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except OSError as exc:
+                raise StateError(
+                    f"Could not take the local worker-state lock {path}: {exc}"
+                ) from exc
+            _LOCK_DEPTH[key] = 1
+            yield
+        finally:
+            _LOCK_DEPTH.pop(key, None)
+            held = _LOCK_DESCRIPTORS.pop(key, None)
+            if held is not None:
+                os.close(held)
+
+    @_serialized
     def record_created(self, plan: WorkerCreationPlan, worker: Worker) -> WorkerRecord:
         now = self._now()
         connection = worker.ssh_direct or worker.ssh_proxy
@@ -163,6 +244,7 @@ class WorkerStateStore:
         self._upsert(record)
         return record
 
+    @_serialized
     def observe(self, worker: Worker) -> WorkerRecord | None:
         document = self._load()
         existing = document.workers.get(worker.id)
@@ -199,6 +281,7 @@ class WorkerStateStore:
         self._write(document)
         return updated
 
+    @_serialized
     def mark_destroyed(self, worker_id: str) -> WorkerRecord | None:
         document = self._load()
         existing = document.workers.get(worker_id)
@@ -216,6 +299,7 @@ class WorkerStateStore:
         self._write(document)
         return updated
 
+    @_serialized
     def reconcile(self, workers: Iterable[Worker]) -> None:
         """Update only tracked records; provider reads remain authoritative."""
 
@@ -266,18 +350,28 @@ class WorkerStateStore:
             )
         self._write(document.model_copy(update={"workers": updated_records}))
 
+    @_serialized
     def mark_ssh_ready(
         self,
         worker: Worker,
         connection: WorkerConnectionInfo,
     ) -> WorkerRecord | None:
-        """Persist a successful SSH probe for an already tracked worker."""
+        """Persist a successful SSH probe for an already tracked worker.
+
+        A probe proves only that the endpoint answers. It must therefore never replace a
+        stronger readiness that a bootstrap or health inspection already established: a
+        read-only SSH operation on a READY worker leaves it READY. `last_ssh_ready_at` and
+        the endpoint are always refreshed, because they are facts about this observation.
+        """
 
         document = self._load()
         existing = document.workers.get(worker.id)
         if existing is None:
             return None
         now = self._now()
+        readiness = existing.readiness_state
+        if not readiness_at_least(readiness, WorkerReadinessState.SSH_READY):
+            readiness = WorkerReadinessState.SSH_READY
         updated = existing.model_copy(
             update={
                 "last_observed_state": worker.state,
@@ -286,7 +380,7 @@ class WorkerStateStore:
                 "ssh_port": connection.port,
                 "ssh_username": connection.username,
                 "ssh_kind": connection.kind,
-                "readiness_state": WorkerReadinessState.SSH_READY,
+                "readiness_state": readiness,
                 "last_ssh_ready_at": now,
                 "provider_absent": False,
             }
@@ -295,6 +389,7 @@ class WorkerStateStore:
         self._write(document)
         return updated
 
+    @_serialized
     def mark_bootstrapped(self, worker_id: str, bootstrap_version: str) -> WorkerRecord | None:
         """Persist completion of the idempotent bootstrap script."""
 
@@ -314,18 +409,28 @@ class WorkerStateStore:
         self._write(document)
         return updated
 
+    @_serialized
     def mark_gpu_healthy(self, worker_id: str) -> WorkerRecord | None:
-        """Persist the successful accelerator checkpoint before final readiness."""
+        """Persist the successful accelerator checkpoint before final readiness.
+
+        Like an SSH probe, this is one weaker observation. It records at least
+        `GPU_HEALTHY`, and the authoritative `record_health` call that follows in the same
+        health inspection still decides the final state (including a failure).
+        """
 
         document = self._load()
         existing = document.workers.get(worker_id)
         if existing is None:
             return None
-        updated = existing.model_copy(update={"readiness_state": WorkerReadinessState.GPU_HEALTHY})
+        readiness = existing.readiness_state
+        if not readiness_at_least(readiness, WorkerReadinessState.GPU_HEALTHY):
+            readiness = WorkerReadinessState.GPU_HEALTHY
+        updated = existing.model_copy(update={"readiness_state": readiness})
         document.workers[worker_id] = updated
         self._write(document)
         return updated
 
+    @_serialized
     def record_health(self, report: WorkerHealthReport) -> WorkerRecord | None:
         """Persist non-secret health facts without replacing provider authority."""
 
@@ -352,6 +457,7 @@ class WorkerStateStore:
         self._write(document)
         return updated
 
+    @_serialized
     def _upsert(self, record: WorkerRecord) -> None:
         document = self._load()
         records = dict(document.workers)

@@ -7,6 +7,7 @@ CLI can each be exercised against deterministic evidence.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -15,7 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from wavcse_infra.config import JobsConfig, SshConfig
-from wavcse_infra.errors import SshCommandError
+from wavcse_infra.errors import (
+    ArtifactDestinationExistsError,
+    RemoteOperationInterruptedError,
+    SshCommandError,
+    StorageObjectNotFoundError,
+    StorageVerificationError,
+)
 from wavcse_infra.jobs.context import JobContext
 from wavcse_infra.jobs.execution import CancelResult, PrepareResult, RemoteJobStatus, StartResult
 from wavcse_infra.jobs.state import JobStateStore
@@ -203,12 +210,20 @@ class FakeJobExecutor:
         self.log_error: Exception | None = None
         self.cancel_error: Exception | None = None
         self.status = RemoteJobStatus(status="running", pid=4321, log_bytes=10)
+        self.inspect_results: list[RemoteJobStatus] = []
+        # Optional shared log, so a test can assert the order of preparation steps.
+        self.events: list[str] | None = None
         self.report_missing_commit = False
         self.log_text = "job output\n"
         self.cancel_result = CancelResult(cancelled=True, already_finished=False, pid=4321)
 
+    def _note(self, event: str) -> None:
+        if self.events is not None:
+            self.events.append(event)
+
     def install_runner(self, worker_id: str) -> str:
         self.calls.append("install")
+        self._note("install")
         if self.install_error is not None:
             raise self.install_error
         self.install_calls.append(worker_id)
@@ -216,6 +231,7 @@ class FakeJobExecutor:
 
     def prepare(self, worker_id: str, **kwargs: Any) -> PrepareResult:
         self.calls.append("prepare")
+        self._note("prepare")
         if self.prepare_error is not None:
             raise self.prepare_error
         self.prepare_calls.append({"worker_id": worker_id, **kwargs})
@@ -227,6 +243,7 @@ class FakeJobExecutor:
 
     def start(self, worker_id: str, **kwargs: Any) -> StartResult:
         self.calls.append("start")
+        self._note("start")
         if self.start_error is not None:
             raise self.start_error
         self.start_calls.append({"worker_id": worker_id, **kwargs})
@@ -237,6 +254,8 @@ class FakeJobExecutor:
         self.inspect_calls.append((job_id, job_directory))
         if self.inspect_error is not None:
             raise self.inspect_error
+        if self.inspect_results:
+            return self.inspect_results.pop(0)
         if (
             self.status.status == "finished"
             and self.status.executed_commit is None
@@ -265,21 +284,60 @@ class FakeTransfer:
 
     With `materialize=True` a download also writes a file of the expected size at the
     destination, so a real worker-side command can read what it declared as an input.
+    `download_interrupts` makes the first N downloads report a controller-side interruption,
+    and `destination_exists` makes them report that the destination is already present, so
+    the resume and verification paths can be exercised deterministically.
     """
 
     def __init__(self, *, materialize: bool = False) -> None:
         self.materialize = materialize
         self.downloads: list[dict[str, Any]] = []
         self.uploads: list[dict[str, Any]] = []
+        self.verifies: list[dict[str, Any]] = []
         self.download_error: Exception | None = None
         self.upload_error: Exception | None = None
+        self.verify_error: Exception | None = None
+        self.download_interrupts = 0
+        self.download_attempts = 0
+        self.destination_exists = False
+        self.verified = True
+        # Optional shared log, so a test can assert the order of preparation steps.
+        self.events: list[str] | None = None
+        # Per-call scripts, so a test can interleave outcomes deterministically: an
+        # exception instance is raised, anything else is returned.
+        self.download_results: list[object] = []
+        self.verify_results: list[object] = []
+        self.upload_results: list[object] = []
         self.download_digest = "b" * 64
-        self.upload_digest = "c" * 64
+        # The digest a real upload reports is the digest of the bytes it streamed, so the
+        # double derives it from the payload it places in canonical storage.
+        self.upload_payload = b"wavcse-fake-output-bytes"
+        self.upload_digest = hashlib.sha256(self.upload_payload).hexdigest()
+
+    def _note(self, event: str) -> None:
+        if self.events is not None:
+            self.events.append(event)
 
     def download(self, worker_id: str, **kwargs: Any) -> Any:
         self.downloads.append({"worker_id": worker_id, **kwargs})
+        self._note(f"download:{kwargs.get('destination')}")
+        self.download_attempts += 1
+        if self.download_results:
+            scripted = self.download_results.pop(0)
+            if isinstance(scripted, Exception):
+                raise scripted
+            return scripted
         if self.download_error is not None:
             raise self.download_error
+        if self.download_attempts <= self.download_interrupts:
+            raise RemoteOperationInterruptedError(
+                "the controller stopped waiting for download on RunPod worker pod-123; the "
+                "worker-side process may still be running"
+            )
+        if self.destination_exists:
+            raise ArtifactDestinationExistsError(
+                "download did not start on worker pod-123 because the destination already exists"
+            )
         size = kwargs.get("expected_size") or 11
         if self.materialize:
             destination = Path(kwargs["destination"])
@@ -292,11 +350,45 @@ class FakeTransfer:
             sha256=self.download_digest,
         )
 
+    def verify(self, worker_id: str, **kwargs: Any) -> Any:
+        self.verifies.append({"worker_id": worker_id, **kwargs})
+        self._note(f"verify:{kwargs.get('destination')}")
+        if self.verify_results:
+            scripted = self.verify_results.pop(0)
+            if isinstance(scripted, Exception):
+                raise scripted
+            return scripted
+        if self.verify_error is not None:
+            raise self.verify_error
+        if not self.verified:
+            return None
+        if self.materialize:
+            destination = Path(kwargs["destination"])
+            if not destination.exists():
+                return None
+        return _TransferResult(
+            operation="verify",
+            path=kwargs["destination"],
+            size_bytes=kwargs.get("expected_size") or 11,
+            sha256=kwargs.get("expected_sha256") or self.download_digest,
+        )
+
     def upload(self, worker_id: str, **kwargs: Any) -> Any:
         self.uploads.append({"worker_id": worker_id, **kwargs})
+        self._note(f"upload:{kwargs.get('key')}")
+        if self.upload_results:
+            scripted = self.upload_results.pop(0)
+            if isinstance(scripted, Exception):
+                raise scripted
+            return scripted
         if self.upload_error is not None:
             raise self.upload_error
-        size = 7
+        payload = self.upload_payload
+        size = len(payload)
+        storage = kwargs.get("storage")
+        if storage is not None and hasattr(storage, "put_content"):
+            # A real upload leaves exactly these bytes at the key.
+            storage.put_content(kwargs["key"], payload)
         return _UploadOutcome(
             result=_TransferResult(
                 operation="upload",
@@ -324,10 +416,33 @@ class _TransferResult:
         }
 
 
+def upload_outcome(*, source: str, key: str, payload: bytes) -> Any:
+    """Build one scripted successful upload outcome for bytes placed in storage."""
+
+    return _UploadOutcome(
+        result=_TransferResult(
+            operation="upload",
+            path=source,
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        ),
+        verification=_Verification(key=key, size_bytes=len(payload)),
+    )
+
+
 class _Verification:
-    def __init__(self, *, key: str, size_bytes: int) -> None:
+    def __init__(
+        self,
+        *,
+        key: str,
+        size_bytes: int,
+        content_sha256: str | None = None,
+        content_checksum_verified: bool = False,
+    ) -> None:
         self.key = key
         self.size_bytes = size_bytes
+        self.content_sha256 = content_sha256
+        self.content_checksum_verified = content_checksum_verified
 
 
 class _UploadOutcome:
@@ -337,23 +452,70 @@ class _UploadOutcome:
 
 
 class FakeStorage:
-    """Minimal canonical-storage double for declared inputs."""
+    """Minimal canonical-storage double for declared inputs and persisted outputs.
+
+    Objects carry both a size and their bytes so a content verification is a real check
+    rather than a restatement of the metadata: an object that exists at a key but holds
+    different bytes must be rejected exactly as the real storage would reject it.
+    """
 
     bucket = "wavcse-test-bucket"
     prefix = "wavcse"
 
     def __init__(self) -> None:
         self.objects: dict[str, int] = {}
+        self.contents: dict[str, bytes] = {}
         self.manifests: dict[str, Any] = {}
+        self.metadata_errors: list[Exception] = []
+        self.last_modified: dict[str, datetime] = {}
 
     def object_key(self, key: str) -> str:
         return f"{self.prefix}/{key}"
 
+    def put_content(self, key: str, payload: bytes) -> None:
+        """Record the bytes one upload placed at a key, as canonical storage would."""
+
+        self.objects[key] = len(payload)
+        self.contents[key] = payload
+
     def object_metadata(self, key: str) -> StoredObject | None:
+        if self.metadata_errors:
+            raise self.metadata_errors.pop(0)
         size = self.objects.get(key)
         if size is None:
             return None
-        return StoredObject(key=self.object_key(key), size_bytes=size)
+        return StoredObject(
+            key=self.object_key(key),
+            size_bytes=size,
+            last_modified=self.last_modified.get(key),
+        )
+
+    def verify_object_content(
+        self,
+        key: str,
+        *,
+        expected_size: int | None = None,
+        expected_sha256: str | None = None,
+    ) -> Any:
+        """Prove a stored object's bytes against the expected size and digest."""
+
+        if key not in self.objects:
+            raise StorageObjectNotFoundError(f"s3://{self.bucket}/{self.object_key(key)} missing")
+        payload = self.contents.get(key)
+        if payload is None:
+            raise StorageVerificationError(f"no bytes were recorded for {key!r}")
+        size = len(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        if expected_size is not None and size != expected_size:
+            raise StorageVerificationError(f"{key!r} is {size} bytes, not {expected_size}")
+        if expected_sha256 is not None and digest != expected_sha256.lower():
+            raise StorageVerificationError(f"{key!r} does not contain the expected bytes")
+        return _Verification(
+            key=self.object_key(key),
+            size_bytes=size,
+            content_sha256=digest,
+            content_checksum_verified=True,
+        )
 
     def read_manifest(self, key: str) -> Any:
         return self.manifests[key]

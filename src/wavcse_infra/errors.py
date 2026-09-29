@@ -5,6 +5,35 @@ class InfraError(Exception):
     """Base class for actionable, user-facing infrastructure failures."""
 
 
+class ReconcilableOperationError(InfraError):
+    """An operation did not complete, and that is not evidence of failure.
+
+    This is the single semantic distinction Phase 6.1 turns on. Every subclass means
+    "remote/canonical truth is currently unknown, or the operation can be retried from
+    evidence that still exists" — never "the job failed". Callers must keep the affected
+    job or worker in a reconcilable nonterminal state and re-derive its outcome from
+    evidence; recording FAILED from this class alone is forbidden.
+    """
+
+
+class RemoteOperationInterruptedError(ReconcilableOperationError):
+    """Raised when a bounded remote operation ended without reporting an outcome.
+
+    The controller's SSH command may have been cut short by its own bound or by a dropped
+    connection while the remote process kept running. The remote state is unknown, so this
+    must never be turned into a terminal job or transfer failure on its own.
+    """
+
+
+class ArtifactTransferTransientError(ReconcilableOperationError):
+    """Raised when a bounded transfer attempt exhausted its retries, or could not start.
+
+    The worker keeps resumable state next to the destination, so a later attempt with
+    freshly issued credentials continues the work. The attempt's own retries stay bounded;
+    the recovery opportunity is the next job-level attempt, not an unbounded loop.
+    """
+
+
 class ConfigurationError(InfraError):
     """Raised when configuration cannot be loaded or validated safely."""
 
@@ -125,6 +154,16 @@ class StorageError(InfraError):
     """Base class for sanitized canonical-storage failures."""
 
 
+class StorageUnavailableError(StorageError, ReconcilableOperationError):
+    """Raised when canonical storage cannot be observed or reached right now.
+
+    A transport failure, a throttled or server-side error, or a controller credential that
+    is about to expire says nothing about the artifact: the same request is expected to
+    succeed later. The object being definitively absent, an authorization failure, and a
+    failed integrity check are different classes on purpose and stay definitive.
+    """
+
+
 class StorageKeyError(StorageError):
     """Raised when an artifact key is unsafe, ambiguous, or outside the namespace."""
 
@@ -147,6 +186,23 @@ class StorageVerificationError(StorageError):
 
 class ArtifactTransferError(StorageError):
     """Raised when a worker artifact transfer fails or violates its protocol."""
+
+
+class ArtifactTransferInProgressError(ArtifactTransferError, ReconcilableOperationError):
+    """Raised when another transfer already owns the requested destination.
+
+    The worker serializes transfers to one destination with an advisory lock, so this is
+    positive evidence that a previous invocation is still running. It is never evidence
+    that the operation failed, so it is reconcilable like every other non-outcome.
+    """
+
+
+class ArtifactDestinationExistsError(ArtifactTransferError):
+    """Raised when a destination already holds a file this transfer must not replace.
+
+    The caller must decide from worker evidence whether that file is the verified artifact
+    it wanted (a previous attempt completed in the background) or something else.
+    """
 
 
 class ArtifactSizeMismatchError(ArtifactTransferError):
@@ -179,3 +235,12 @@ class JobExecutionError(JobError):
 
 class JobCancellationError(JobError):
     """Raised when a running job process cannot be cancelled safely."""
+
+
+class JobLaunchExcludedError(JobExecutionError):
+    """Raised when the worker refuses to launch a job because cancellation already won.
+
+    The worker records that decision durably before answering, so every later launch of the
+    same job refuses too. This is affirmative evidence that the command did not and will
+    not run, which is exactly what recording CANCELLED requires.
+    """

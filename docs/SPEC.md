@@ -479,6 +479,29 @@ starting. Submission records FAILED with the failing phase and evidence instead 
 silently discarding the attempt, and `infra job status` reconciles against the worker's
 own recorded state before reporting anything.
 
+Implementation note (Phase 6.1, remediation): the same distinction is applied to every
+observation the controller makes, not only to waits. A worker that is merely stopped or
+restarting keeps its job reconcilable, because its disk (and any outcome the command
+already wrote there) survives; only destruction, termination, or an error state makes the
+outcome permanently unreadable. A required output whose upload outcome is unknown is
+reconciled against the canonical object (key, size, and recency) instead of being recorded
+as failed, and a temporary failure of the controller's own storage or SSH observation keeps
+the job reconcilable. Declared inputs are re-verified from worker evidence immediately
+before the command starts: a controller-side "already materialized" flag is a record of a
+past observation, never proof of the present one. Acquisition that outlives its leader is
+still this job's execution and is tracked by its verified process group.
+
+Implementation note (Phase 6.1): FAILED is written only from evidence. A bounded
+controller wait, a dropped SSH session, or a worker phase that may still be running keeps
+the job in PREPARING with `reconciliation_required` set, because the controller has
+learned nothing about the remote outcome. Every preparation step (runner installation,
+exact-commit checkout, input materialization, command launch) is idempotent, so a later
+`infra job status` completes the attempt: it verifies anything already on the worker
+before trusting it, resumes an interrupted transfer from its recorded ranges, and never
+launches a command the worker may already be running. A job is failed only from a reported
+command failure, a process that is gone with no outcome, a workspace that is provably
+absent after preparation had completed, or a launch that provably never started.
+
 # 18. Experiment scheduling
 
 Eventually the controller may distribute independent runs:

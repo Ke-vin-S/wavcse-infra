@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,7 @@ from job_fakes import FakeStorage, FakeTransfer, FakeWaiter, job_context, job_sp
 from pydantic import ValidationError
 
 from wavcse_infra.config import JobsConfig, SshConfig
-from wavcse_infra.errors import JobExecutionError, SshCommandError
+from wavcse_infra.errors import JobExecutionError, SshCommandError, SshConnectionError
 from wavcse_infra.jobs.execution import JobExecutor
 from wavcse_infra.jobs.models import JobState, load_job_spec
 from wavcse_infra.jobs.status import JobCoordinator
@@ -303,3 +304,184 @@ def test_jobs_configuration_rejects_unsafe_worker_paths() -> None:
         JobsConfig(runner_path="/root/../etc/job_runner.py")
     with pytest.raises(ValidationError):
         JobsConfig(worker_root="/workspace/jobs/")
+
+
+def test_an_interrupted_materialization_is_reconciled_by_a_later_status(
+    tmp_path: Path, workspace: JobsConfig
+) -> None:
+    """The Phase 6.1 incident: the controller stops watching, the artifact lands anyway."""
+
+    storage = FakeStorage()
+    storage.objects["embeddings/v1/probe.tar"] = 18
+    transfer = FakeTransfer()
+    transfer.download_interrupts = 1
+    spec = _spec(
+        name="phase6-reconcile",
+        command={"argv": ["python3", "-c", "print('reconciled')"]},
+        inputs=[
+            {
+                "artifact": "embeddings/v1/probe.tar",
+                "destination": "probe.tar",
+                "sha256": hashlib.sha256(b"x" * 18).hexdigest(),
+            }
+        ],
+        runtime={"timeout_seconds": 60},
+    )
+    context = _context(tmp_path, workspace, transfer, storage)
+
+    interrupted = JobSubmitter(context).submit(spec, worker_id="pod-123")
+
+    assert interrupted.state is JobState.PREPARING
+    assert interrupted.reconciliation_required is True
+    assert interrupted.failure_reason is None
+    assert interrupted.preparation_phase.value == "materializing_inputs"
+    remote = LocalRunnerExecutor()
+    # A second process reconciles from the durable record plus real worker evidence.
+    fresh_context = job_context(
+        tmp_path,
+        executor=JobExecutor(FakeWaiter(), remote, SshConfig(), workspace),
+        transfer=transfer,
+        storage=storage,
+        jobs_config=workspace,
+    )
+    transfer.destination_exists = True
+    transfer.verified = True
+
+    reconciled = JobCoordinator(fresh_context).refresh(interrupted.job_id)
+
+    assert reconciled.record.state is JobState.RUNNING
+    assert reconciled.record.reconciliation_required is False
+    assert reconciled.record.inputs[0].materialized is True
+    assert len(transfer.verifies) == 1
+    # The real runner had already prepared the checkout, so only the launch is new work.
+    phases = [
+        call[0][2]
+        for call in remote.calls
+        if len(call[0]) > 2 and str(call[0][1]).endswith("job_runner.py")
+    ]
+    assert phases.count("prepare") == 0
+    assert phases.count("start") == 1
+
+    finished = _await_terminal(fresh_context, interrupted.job_id)
+
+    assert finished.record.state is JobState.SUCCEEDED, finished.record.failure_reason
+    assert "reconciled" in (fresh_context.job_store.read_log(interrupted.job_id) or "")
+
+
+def test_a_workspace_that_vanished_after_preparation_is_never_re_executed(
+    tmp_path: Path, workspace: JobsConfig
+) -> None:
+    storage = FakeStorage()
+    storage.objects["embeddings/v1/probe.tar"] = 18
+    transfer = FakeTransfer()
+    transfer.download_interrupts = 1
+    spec = _spec(
+        name="phase6-vanished",
+        inputs=[
+            {
+                "artifact": "embeddings/v1/probe.tar",
+                "destination": "probe.tar",
+                "sha256": hashlib.sha256(b"x" * 18).hexdigest(),
+            }
+        ],
+    )
+    context = _context(tmp_path, workspace, transfer, storage)
+    interrupted = JobSubmitter(context).submit(spec, worker_id="pod-123")
+    assert interrupted.executed_commit is not None
+    remote = LocalRunnerExecutor()
+    shutil.rmtree(interrupted.job_directory)
+    fresh_context = job_context(
+        tmp_path,
+        executor=JobExecutor(FakeWaiter(), remote, SshConfig(), workspace),
+        transfer=transfer,
+        storage=storage,
+        jobs_config=workspace,
+    )
+
+    result = JobCoordinator(fresh_context).refresh(interrupted.job_id)
+
+    assert result.record.state is JobState.FAILED
+    assert result.record.remote_status == "workspace_absent"
+    assert "absent" in (result.record.failure_reason or "")
+    phases = [
+        call[0][2]
+        for call in remote.calls
+        if len(call[0]) > 2 and str(call[0][1]).endswith("job_runner.py")
+    ]
+    assert phases == ["inspect"]
+
+
+class _DroppingLaunchExecutor(LocalRunnerExecutor):
+    """Run the reviewed runner, then report a dropped connection for the launch phase.
+
+    The launch really executes (and really fails), so the workspace evidence the next
+    reconciliation reads is the evidence the real runner left behind.
+    """
+
+    def run_checked(self, connection, remote_argv, *, input_text=None, timeout_seconds=None):
+        argv = tuple(remote_argv)
+        if len(argv) > 2 and argv[2] == "start":
+            # The launch really runs and really fails; only the report is lost.
+            with suppress(SshCommandError):
+                super().run_checked(
+                    connection,
+                    argv,
+                    input_text=input_text,
+                    timeout_seconds=timeout_seconds,
+                )
+            raise SshConnectionError("SSH connection dropped while waiting for the launch")
+        return super().run_checked(
+            connection,
+            remote_argv,
+            input_text=input_text,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+def test_a_launch_that_died_before_recording_a_process_is_never_re_launched(
+    tmp_path: Path, workspace: JobsConfig
+) -> None:
+    spec = _spec(
+        name="phase6-launch-died",
+        command={
+            "argv": ["python3", "-c", "print('must not run')"],
+            "working_directory": "missing",
+        },
+        runtime={"timeout_seconds": 60},
+    )
+    dropping = _DroppingLaunchExecutor()
+    context = job_context(
+        tmp_path,
+        executor=JobExecutor(FakeWaiter(), dropping, SshConfig(), workspace),
+        transfer=FakeTransfer(),
+        storage=FakeStorage(),
+        jobs_config=workspace,
+    )
+
+    interrupted = JobSubmitter(context).submit(spec, worker_id="pod-123")
+
+    assert interrupted.state is JobState.PREPARING
+    assert interrupted.preparation_phase.value == "starting_command"
+    assert interrupted.reconciliation_required is True
+
+    remote = LocalRunnerExecutor()
+    fresh_context = job_context(
+        tmp_path,
+        executor=JobExecutor(FakeWaiter(), remote, SshConfig(), workspace),
+        transfer=FakeTransfer(),
+        storage=FakeStorage(),
+        jobs_config=workspace,
+    )
+
+    result = JobCoordinator(fresh_context).refresh(interrupted.job_id)
+
+    assert result.record.state is JobState.FAILED
+    reason = result.record.failure_reason or ""
+    assert "did not complete" in reason
+    assert "No command started" in reason
+    # Only the inspection ran against the worker: the launch was never repeated.
+    assert [call[0][2] for call in remote.calls if len(call[0]) > 2] == ["inspect"]
+    assert not (Path(interrupted.job_directory) / "logs" / "job.log").exists() or (
+        "must not run"
+        not in (Path(interrupted.job_directory) / "logs" / "job.log").read_text(encoding="utf-8")
+    )

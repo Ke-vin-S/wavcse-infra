@@ -35,6 +35,34 @@ class WorkerReadinessState(StrEnum):
     FAILED = "FAILED"
 
 
+# Ordered ladder of proven capabilities. `FAILED` is not a rung: it is a distinct marker
+# that the last full health inspection found a failing check, so it ranks below every
+# proven capability and any weaker but successful observation may replace it.
+READINESS_RANK: dict[WorkerReadinessState, int] = {
+    WorkerReadinessState.FAILED: 0,
+    WorkerReadinessState.NOT_READY: 1,
+    WorkerReadinessState.SSH_READY: 2,
+    WorkerReadinessState.BOOTSTRAPPED: 3,
+    WorkerReadinessState.GPU_HEALTHY: 4,
+    WorkerReadinessState.READY: 5,
+}
+
+
+def readiness_rank(state: WorkerReadinessState) -> int:
+    """Return the position of one readiness state on the proven-capability ladder."""
+
+    return READINESS_RANK[state]
+
+
+def readiness_at_least(
+    current: WorkerReadinessState,
+    minimum: WorkerReadinessState,
+) -> bool:
+    """Return whether `current` already establishes at least `minimum`."""
+
+    return readiness_rank(current) >= readiness_rank(minimum)
+
+
 class HealthCheckStatus(StrEnum):
     """Normalized outcome of one worker readiness check."""
 

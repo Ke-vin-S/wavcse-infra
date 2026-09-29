@@ -942,3 +942,289 @@ there leaves the previous entry gone. In exchange, the destination can only ever
 verified inode, and the crash leaves the resumable staging file and range record intact
 with one link, so the next attempt continues rather than wedging. Small downloads now leave
 an empty lock file next to their destination like ranged ones.
+
+## ADR-023: Keep readiness monotone and never fabricate a terminal job state
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+- **Amends:** ADR-017, ADR-018
+
+### Context
+
+The first real wavCSE embedding-generation bring-up produced three infrastructure defects.
+
+A fully bootstrapped, healthy worker was recorded as `READY`, then a read-only SSH/exec
+operation on that worker rewrote local readiness to `SSH_READY`. Submission requires
+`READY`, so the next `infra job submit` failed, and only `infra worker health` restored it.
+`WorkerStateStore.mark_ssh_ready` wrote `SSH_READY` unconditionally, even though an SSH
+probe proves strictly less than a bootstrap plus a health inspection.
+
+A ~1.18 GiB checkpoint download exceeded `ssh.transfer_timeout_seconds = 3600`, which was
+equal to `storage.presign_expiry_seconds`. The controller recorded the job `FAILED` and
+stopped watching, while the worker-side download kept running and completed successfully
+about fifteen minutes later. An autonomous caller reading `FAILED` could have retried or
+reallocated while the original transfer still held the machine and bandwidth.
+
+For the same job the CLI reported that "the job workspace was removed or the worker was
+rebuilt". Inspection showed the workspace present, the input materialization still running,
+`state/` empty, and the experiment command never started. Status collapsed every
+"no finished record and no live process" case into one conclusion that the evidence did
+not support, because the worker reported nothing about how far preparation had reached.
+
+### Decision
+
+- Readiness is a ladder, not a last-writer-wins flag. `mark_ssh_ready` and
+  `mark_gpu_healthy` record *at least* their capability and never replace a stronger one;
+  a full health inspection remains authoritative in both directions, and leaving `RUNNING`,
+  destruction, and provider reconciliation still reset readiness.
+- A controller-side bound is not evidence about a remote phase. A bounded SSH timeout or a
+  dropped connection during a transfer or a job phase raises a distinct
+  `RemoteOperationInterruptedError`, and the job stays `PREPARING` with
+  `reconciliation_required`, the preparation phase it had reached, and the interruption
+  time. No `failure_reason` and no `finished_at` are written.
+- `FAILED` is written only from evidence: a reported command failure, a recorded process
+  that is gone with no outcome, a workspace that is absent although preparation had
+  completed, or a launch that provably never recorded a process. A remote process that may
+  still be alive is never reported as a failure.
+- Reconciliation is the continuation of an idempotent preparation pass, not a new
+  mechanism. `infra job status` (and `--wait`) reuses the same install/prepare/materialize/
+  start code as submission. A destination that already exists is verified by size and
+  SHA-256 on the worker before it is trusted; a transfer another process still owns is
+  reported instead of duplicated; a command that may already have been launched is never
+  launched again.
+- The worker runner records how far preparation reached: workspace present, checkout
+  prepared for this job, launch slot claimed, and whether the recorded launch process is
+  still alive. `prepare` is serialized per job with an advisory lock, and the launch slot
+  records its owner's identity so a later inspection can distinguish "still starting" from
+  "died before recording a process" without guessing.
+- One bounded transfer attempt can never outlive the URL that authorises it: the attempt
+  bound is `min(ssh.transfer_timeout_seconds, presign_expiry_seconds - 30)`. Long transfers
+  are retried with a freshly presigned URL and resume from the ranges recorded beside the
+  destination, which is what makes a per-attempt bound safe.
+- The worker transfer module gained a read-only `verify` subcommand that reports one
+  already-placed artifact (and whether a transfer currently holds its lock) without
+  downloading, writing, or carrying a URL. The download path is unchanged.
+
+### Alternatives rejected
+
+- Making readiness fully monotone: rejected. A genuine invalidation (worker left `RUNNING`,
+  destroyed, failed its health inspection) must still clear `READY`, or a dead worker would
+  keep accepting jobs.
+- Converting the controller timeout into `RUNNING` or a new terminal `UNKNOWN` state:
+  rejected as a state-machine change that would still let a caller act on an outcome the
+  controller does not know. `PREPARING` plus explicit evidence and a reconciliation flag
+  keeps the documented vocabulary and tells the caller what to do next.
+- Declaring `FAILED` once a reconciliation deadline expires, regardless of liveness:
+  rejected, because a long transfer that is still making progress would be reported as
+  failed, which is the original incident.
+- Re-downloading a destination that the worker already holds: rejected. The resumable
+  transfer is verified first, so completed bytes are reused and never silently replaced.
+- A background reconciler, daemon, or queue: rejected. Reconciliation is a bounded,
+  synchronous pass driven by an operator or a caller command, exactly as Phase 6 requires.
+
+### Consequences
+
+`infra job status` can now perform work: for a job that is still `PREPARING` it resumes an
+interrupted input materialization and may start the command that never started. That is
+the deliberate recovery for an interrupted submission, and `infra job cancel` is the
+explicit opt-out. `infra job submit` exits 1 while a job is `PREPARING` with
+`reconciliation_required`, so a scripted caller cannot mistake "unknown" for "running".
+
+Durable job records gained three optional fields (`preparation_phase`, `interrupted_at`,
+`reconciliation_required`) with defaults, so existing records and existing job states load
+unchanged. A worker-side input materialization that the controller no longer waits for may
+still finish inside that job's own directory; it is reported, not silently assumed to have
+stopped, and it disappears with the disposable worker.
+
+## ADR-024: One reconcilable-uncertainty model, and worker-side ordering for every decision
+
+- **Status:** Accepted
+- **Date:** 2026-09-29
+- **Amends:** ADR-017, ADR-018, ADR-023
+
+### Context
+
+An independent review of the Phase 6.1 remediation found that the same class of defect —
+turning an observation failure into a terminal job result — survived in six more places, and
+that two decisions were being made without mutual exclusion.
+
+`inspect` read the worker's outcome, process, and launch records as independent files and
+then concluded from one snapshot: a supervisor that wrote `finished.json` and exited between
+the outcome read and the process check could be reported as "no process, no outcome", and a
+launch record written during inspection could be reported as "never started". A launch and a
+cancellation of the same job were serialized only by controller timing: a cancellation that
+observed no start slot could write CANCELLED while the launch claimed the slot a moment
+later and ran the command anyway. The controller wrote whole-document JSON without any
+compare-and-swap, so a slower process could overwrite newer state. A transfer's attempt
+bound was derived from the URL's nominal lifetime even though waiting for SSH had already
+consumed part of it, and a URL signed with temporary credentials dies with them. Reloading
+during recovery skipped re-verifying inputs a previous attempt had recorded as materialized.
+A provider `STOPPED` was treated as evidence about the command. An interrupted output upload
+became a failed job. A controller-side storage hiccup became a failed job. An attempt that
+exhausted its bounded range retries became a failed job even though the resumable state was
+intact. A descendant that outlived its stage leader was invisible to both inspection and
+cancellation. And verification re-opened the destination by name after inspecting it, so a
+swap in between could make a verified digest describe another file.
+
+### Decision
+
+- One semantic distinction carries all of it: `ReconcilableOperationError`. An interrupted
+  observation, an exhausted resumable attempt, an unfinished competing transfer, and a
+  transient canonical-storage failure are uncertainty; no caller may record FAILED,
+  SUCCEEDED, or CANCELLED from them. Reported remote failures, integrity mismatches,
+  authorization or configuration errors, and definitively absent objects remain evidence.
+  Storage failures are typed along that line rather than converted wholesale.
+- `inspect` derives its report from an ordered, bounded snapshot: read the recorded outcome,
+  observe the process state, then re-read the outcome and launch records before concluding
+  that nothing is recorded and nothing is running. A terminal conclusion is never reached
+  from one inconsistent read.
+- Creating a job's process and cancelling a job that has no process yet take a per-job
+  lifecycle lock, so exactly one of them decides. A cancellation that wins records a durable
+  pre-start exclusion that every later launch refuses; a launch that wins is terminated
+  through its own recorded process identity, and a cancellation that arrives while the
+  launch is creating its process is told so rather than answered with a false CANCELLED.
+- Every mutating controller operation takes a per-job local lock and re-reads the record
+  inside it. Atomic replacement plus reload-under-lock is the whole concurrency story for one
+  controller machine.
+- Readiness is established before a URL is signed; the attempt bound comes from the lifetime
+  actually granted; and a lifetime signed with temporary credentials is capped by those
+  credentials' remaining validity, refused as transient when too short to be useful.
+- Every declared input is verified from worker evidence immediately before the command may
+  start, except one established by a transfer in the same pass. A controller-side
+  "materialized" flag is a record of a past observation, never present proof.
+- A provider state that a started worker can return from keeps its job reconcilable; only
+  states that make the workspace permanently unreadable end it, and their reason says the
+  outcome can no longer be read.
+- An unknown output-upload outcome keeps the job reconcilable and is resolved by inspecting
+  the canonical object (key, size, and recency) instead of being recorded as a failure.
+- A process group whose leader exited is still this job's execution: it is reported as
+  running, it is terminated through its verified group id, and the supervisor reaps
+  survivors before it writes the outcome, so a terminal record means nothing of the job is
+  still running. PID reuse is ruled out by the recorded start ticks.
+- Verification opens the destination once with `O_NOFOLLOW` and hashes that descriptor,
+  then re-checks that the pathname still names the inspected inode.
+
+### Alternatives rejected
+
+- A second worker-side daemon or a job supervisor process: rejected. The runner already owns
+  the job's lifecycle; two advisory `flock`s and one identity file are the smallest
+  synchronization that makes the decisions mutually exclusive.
+- Compare-and-swap revisions on every record field: rejected as a much larger change than
+  the semantics need. A per-job lock plus reload-under-lock gives the same guarantee on a
+  single controller machine.
+- Treating every provider state as terminal, or every state as reconcilable: rejected.
+  Destruction makes reconciliation impossible, and leaving such a job open forever is its
+  own false claim.
+- Re-downloading every input on every preparation pass: rejected as wasteful. Verification is
+  evidence and costs a read; a transfer costs a download.
+- Retrying a transfer attempt forever inside one command: rejected. Bounded attempts plus a
+  job-level retry with fresh credentials is what keeps both the URL and the wait bounded.
+- Signing a URL with an unbounded lifetime to cover long transfers: rejected; the credential
+  cap and resume make a bounded lifetime sufficient.
+
+### Consequences
+
+`infra job status` does more work than before: it re-verifies recorded inputs, may re-attempt
+a required output's upload, and may terminate a surviving process group. All of it is bounded
+by one attempt per pass, and all of it is reported. A job whose worker is merely stopped now
+stays reconcilable indefinitely; an operator ends it explicitly with `infra job cancel` or by
+destroying the worker, and a destroyed worker is reported as unrecoverable rather than as a
+command failure. Legacy records written before the runner recorded a stage's group id cannot
+name a surviving descendant, so a leftover process from such a run must be cleaned up by hand;
+every run started by this version reaps its own survivors.
+
+## ADR-025: Bind output provenance to bytes, and never signal an unproven process group
+
+- **Status:** Accepted
+- **Date:** 2026-09-29
+- **Amends:** ADR-022, ADR-024
+
+### Context
+
+A final bounded review of the Phase 6.1 work found nine remaining defects, five of them
+correctness or safety issues:
+
+1. Output recovery accepted an object at the declared key from its size and modification
+   time and then recorded *the worker file's* SHA-256 against it, so a different object of
+   the same size - an earlier run's artifact, for example - could be recorded as this run's
+   output with a digest that never described it.
+2. A worker could durably establish that a pre-start cancellation won and that the launch
+   was excluded, lose the acknowledgement to a dropped SSH session, and be reported later
+   as `FAILED` for having no executed commit.
+3. The presign lifetime cap read `credentials.expiry_time`, which botocore's
+   `RefreshableCredentials` does not define, so exactly the credentials that expire
+   produced no cap at all.
+4. Output persistence rebuilt the output list from the outputs completed so far and saved
+   it after each one, so an interruption left fewer durable entries than the specification
+   declared and a restart failed against a strict pairing of declared and recorded outputs.
+5. A process group whose recorded start ticks were missing could still be signalled, and a
+   recorded identity could be *erased* by a leader that exited normally - which both
+   risked signalling an unrelated group and made a genuine surviving descendant
+   unrecognizable.
+
+### Decision
+
+- Canonical storage is asked for the bytes, not for a promise about them. A new
+  `verify_object_content` streams one object through a SHA-256, binds the read to the
+  version the metadata read reported when the bucket provides one, and compares both the
+  size and the digest to the expected values. A freshly uploaded output is verified that
+  way before it is recorded, and a recovered object is accepted only when the same check
+  passes. The recorded digest is therefore always one the controller observed at the
+  declared key. Where a bucket has no versioning, the remaining assumption is that a single
+  `GetObject` returns one consistent object; a replacement can only change the answer to
+  "these are not the expected bytes", never to a false acceptance.
+- Pre-start cancellation is carried out of the worker as explicit evidence: `inspect`
+  reports the `pre_start` flag from the worker's durable cancellation record, the controller
+  treats it as CANCELLED before it considers commit evidence, and only a cancellation that
+  actually executed still requires the verified commit.
+- The credential-expiry adapter freezes the credentials (which refreshes them when the
+  chain says so) and reads the expiry of the object that would sign. Static credentials,
+  which have no expiry, produce no cap.
+- Durable job state keeps exactly one slot per declared output, filled in place and saved
+  as a whole list, so an interruption leaves a shorter *progress* record, never a shorter
+  *structure*. A slot missing from an older record is padded, so a declared required output
+  can never become invisible to the success check.
+- Process-group identity is a precondition for every signal. `terminate_job_group` refuses
+  when the recorded start ticks are missing, refuses when an observed leader has different
+  ticks, and otherwise signals only through the group number that a live member proves is
+  still allocated to this job's group. The recorded start ticks are no longer overwritten
+  with "unknown" when the same leader exits, so an ordinary background process that
+  outlives its stage leader remains identifiable and terminable.
+- The supervisor re-checks the groups it terminated and refuses to write `finished.json`
+  while any of them is still alive, leaving the job nonterminal with its live group
+  reported instead of claiming a clean outcome.
+- Presign failures are classified as definitive only when the evidence is: no credentials
+  or an invalid request. A credential refresh, transport, or service failure during signing
+  is `StorageUnavailableError`, so the job stays reconcilable. A generic HTTP 400 is no
+  longer transient; only named retryable conditions are.
+- Worker-state mutations take a local document lock, reload under it, merge, and write
+  atomically, matching the per-job store. The lock's reentrancy is scoped to the thread, so
+  a second thread of one process is not mistaken for a nested call by the same holder.
+
+### Alternatives rejected
+
+- Adding a checksum header to the presigned PUT and trusting S3 to echo it: it would avoid
+  the read-back, but it depends on undefined behaviour for an unsigned `x-amz-checksum-*`
+  header on a presigned URL, and could not be verified offline. Reading the object back is
+  verifiable by construction and costs one read per persisted output.
+- Recording the worker's digest and comparing only sizes: rejected outright. That is the
+  misattribution this ADR removes.
+- Reaching for S3 version ids as the sole binding: rejected as insufficient on its own,
+  because an unversioned bucket is a supported configuration; the digest is the authority
+  and the version id only narrows the read window.
+- Tracking process lineage in more detail than start ticks: rejected. If the recorded
+  identity cannot prove continuity, the group is reported as unproven and left alone.
+- Rewriting the output list as a partial record and repairing it on load: rejected. Keeping
+  the structure complete at every write is simpler and cannot lose a declared output.
+
+### Consequences
+
+Persisting a declared output now reads it back once, so large outputs cost one extra
+transfer; that is the price of a cryptographic claim about canonical storage. A job whose
+own process group cannot be terminated stays nonterminal until an operator intervenes,
+which is deliberate: a live survivor is recoverable, a killed unrelated workload is not.
+Legacy job records that predate recorded group identity remain unidentifiable, and
+cancelling such a job now fails loudly instead of guessing. The Phase 6 limitations
+recorded in ADR-024 - an orphaned transfer may outrun the controller, cancellation can wait
+behind an in-flight lock, a stopped worker stays reconcilable, and no scheduler, daemon,
+database, or automatic reaper exists - are unchanged and remain accepted.

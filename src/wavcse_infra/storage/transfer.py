@@ -10,6 +10,7 @@ can verify the durable object.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from importlib import resources
 from typing import Literal
 
@@ -17,16 +18,27 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from wavcse_infra.config import SshConfig
 from wavcse_infra.errors import (
+    ArtifactDestinationExistsError,
     ArtifactTransferError,
-    SshCommandError,
+    ArtifactTransferInProgressError,
+    ArtifactTransferTransientError,
+    InfraError,
+    RemoteOperationInterruptedError,
+    SshError,
 )
 from wavcse_infra.redaction import redact
 from wavcse_infra.storage.s3 import PresignedUrl, S3Storage, StorageVerification
 from wavcse_infra.storage.worker_transfer import (
+    DESTINATION_ABSENT_MARKER,
+    DESTINATION_EXISTS_MARKER,
+    DESTINATION_INCOMPLETE_MARKER,
     DOWNLOAD_OPERATION,
     SCHEMA_KEY,
     SCHEMA_VERSION,
+    TRANSFER_IN_PROGRESS_MARKER,
+    TRANSIENT_FAILURE_MARKER,
     UPLOAD_OPERATION,
+    VERIFY_OPERATION,
     TransferInputError,
     download_concurrency,
     validate_presigned_url,
@@ -36,12 +48,18 @@ from wavcse_infra.workers.ssh import (
     SshCommandResult,
     SshExecutor,
     WorkerSshWaiter,
+    remote_outcome_is_unknown,
 )
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PROTOCOL_FIELDS = frozenset({"operation", "status", "path", "size_bytes", "sha256"})
 _DIAGNOSTIC_LIMIT = 500
 _WORKER_MODULE = "worker_transfer.py"
+# One bounded SSH command must finish while its bearer URL is still valid, so the command
+# bound is always derived from the URL lifetime with this much headroom. A URL that expires
+# mid-command would turn a resumable transfer into a confusing HTTP 403 instead of a fresh
+# attempt with a new URL.
+PRESIGN_SAFETY_MARGIN_SECONDS = 30.0
 
 
 class ArtifactTransferResult(BaseModel):
@@ -49,7 +67,7 @@ class ArtifactTransferResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    operation: Literal["download", "upload"]
+    operation: Literal["download", "upload", "verify"]
     path: str = Field(min_length=1)
     size_bytes: int = Field(ge=0)
     sha256: str
@@ -193,7 +211,6 @@ class WorkerArtifactTransfer:
                 validated_concurrency = download_concurrency(concurrency)
             except TransferInputError as exc:
                 raise ArtifactTransferError(str(exc)) from exc
-        presigned = storage.presign_download(key, expires_in_seconds=expires_in_seconds)
         arguments = ["--destination", destination]
         if expected_size is not None:
             arguments += ["--expected-size", str(expected_size)]
@@ -205,9 +222,9 @@ class WorkerArtifactTransfer:
             arguments.append("--overwrite")
         return self._execute(
             worker_id,
-            presigned,
-            DOWNLOAD_OPERATION,
-            arguments,
+            operation=DOWNLOAD_OPERATION,
+            presign=lambda: storage.presign_download(key, expires_in_seconds=expires_in_seconds),
+            arguments=arguments,
             wait_timeout_seconds=wait_timeout_seconds,
             command_timeout_seconds=command_timeout_seconds,
         )
@@ -229,40 +246,111 @@ class WorkerArtifactTransfer:
 
         _worker_path(source, label="upload source")
         storage.require_writable(key, overwrite=overwrite)
-        presigned = storage.presign_upload(
-            key, expires_in_seconds=expires_in_seconds, overwrite=overwrite
-        )
         arguments = ["--source", source]
         if allowed_root is not None:
             _worker_path(allowed_root, label="upload allowed root")
             arguments.extend(("--allowed-root", allowed_root))
         result = self._execute(
             worker_id,
-            presigned,
-            UPLOAD_OPERATION,
-            arguments,
+            operation=UPLOAD_OPERATION,
+            presign=lambda: storage.presign_upload(
+                key, expires_in_seconds=expires_in_seconds, overwrite=overwrite
+            ),
+            arguments=arguments,
             wait_timeout_seconds=wait_timeout_seconds,
             command_timeout_seconds=command_timeout_seconds,
         )
         verification = storage.verify_object(key, expected_size=result.size_bytes)
         return ArtifactUploadOutcome(result=result, verification=verification)
 
+    def verify(
+        self,
+        worker_id: str,
+        *,
+        destination: str,
+        expected_size: int | None = None,
+        expected_sha256: str | None = None,
+        wait_timeout_seconds: float | None = None,
+        command_timeout_seconds: float | None = None,
+    ) -> ArtifactTransferResult | None:
+        """Report worker-side evidence for an artifact that may already be in place.
+
+        Returns the verified artifact when a complete, matching file is already placed, and
+        `None` when nothing complete is there yet (absent, or still partial). It never
+        downloads, never replaces, and never claims success without hashing the file. A
+        transfer that is still running, or a controller that lost contact, is reported by
+        raising rather than by guessing an outcome.
+        """
+
+        _worker_path(destination, label="verify destination")
+        arguments = ["--destination", destination]
+        if expected_size is not None:
+            arguments += ["--expected-size", str(expected_size)]
+        if expected_sha256 is not None:
+            arguments += ["--expected-sha256", expected_sha256]
+        try:
+            ready = self._waiter.wait(worker_id, timeout_seconds=wait_timeout_seconds)
+        except SshError as exc:
+            raise _transfer_failure(worker_id, VERIFY_OPERATION, exc) from exc
+        timeout = (
+            self._config.command_timeout_seconds
+            if command_timeout_seconds is None
+            else command_timeout_seconds
+        )
+        try:
+            result = self._executor.run_checked(
+                ready.connection,
+                ("python3", "-", VERIFY_OPERATION, *arguments),
+                # A read-only probe needs no bearer URL at all, so none is sent.
+                input_text=load_worker_transfer_source(),
+                timeout_seconds=timeout,
+            )
+        except SshError as exc:
+            detail = str(exc)
+            if TRANSFER_IN_PROGRESS_MARKER in detail:
+                raise ArtifactTransferInProgressError(
+                    f"Another transfer still owns {destination!r} on worker {worker_id}: {detail}"
+                ) from exc
+            if _not_materialized(detail):
+                # Absent or partial: a caller may safely download it again.
+                return None
+            raise _transfer_failure(worker_id, VERIFY_OPERATION, exc) from exc
+        parsed = parse_transfer_output(result.stdout, expected_operation=VERIFY_OPERATION)
+        if parsed.path != destination:
+            raise ArtifactTransferError(
+                f"Worker {worker_id} verified a different path than it was asked about"
+            )
+        return parsed
+
     def _execute(
         self,
         worker_id: str,
-        presigned: PresignedUrl,
-        operation: str,
-        arguments: list[str],
         *,
+        operation: str,
+        presign: Callable[[], PresignedUrl],
+        arguments: list[str],
         wait_timeout_seconds: float | None,
         command_timeout_seconds: float | None,
     ) -> ArtifactTransferResult:
-        ready = self._waiter.wait(worker_id, timeout_seconds=wait_timeout_seconds)
-        timeout = (
+        """Wait for the worker, then sign, then run one bounded transfer attempt.
+
+        Readiness is established before the URL exists, because waiting for SSH would
+        otherwise consume the credential's lifetime before the transfer was allowed to use
+        it. The attempt's bound is derived from the lifetime that was actually granted, so
+        the URL stays valid for every request the attempt can still issue.
+        """
+
+        try:
+            ready = self._waiter.wait(worker_id, timeout_seconds=wait_timeout_seconds)
+        except SshError as exc:
+            raise _transfer_failure(worker_id, operation, exc) from exc
+        presigned = presign()
+        requested = (
             self._config.transfer_timeout_seconds
             if command_timeout_seconds is None
             else command_timeout_seconds
         )
+        timeout = _bounded_attempt_seconds(requested, presigned.expires_in_seconds)
         try:
             result = self._executor.run_checked(
                 ready.connection,
@@ -270,10 +358,19 @@ class WorkerArtifactTransfer:
                 input_text=_worker_input(presigned),
                 timeout_seconds=timeout,
             )
-        except SshCommandError as exc:
-            raise ArtifactTransferError(
-                f"{operation.capitalize()} failed on RunPod worker {worker_id}: {exc}"
-            ) from exc
+        except SshError as exc:
+            detail = str(exc)
+            if TRANSFER_IN_PROGRESS_MARKER in detail:
+                raise ArtifactTransferInProgressError(
+                    f"{operation.capitalize()} did not start on worker {worker_id} because "
+                    f"another transfer already owns that destination: {detail}"
+                ) from exc
+            if DESTINATION_EXISTS_MARKER in detail:
+                raise ArtifactDestinationExistsError(
+                    f"{operation.capitalize()} did not start on worker {worker_id} because the "
+                    f"destination already exists: {detail}"
+                ) from exc
+            raise _transfer_failure(worker_id, operation, exc) from exc
         try:
             parsed = parse_transfer_output(result.stdout, expected_operation=operation)
             if parsed.path != arguments[1]:
@@ -281,6 +378,53 @@ class WorkerArtifactTransfer:
             return parsed
         except ArtifactTransferError as exc:
             raise ArtifactTransferError(f"{exc}; {_remote_diagnostics(result)}") from exc
+
+
+def _bounded_attempt_seconds(requested: float, url_lifetime_seconds: int) -> float:
+    """Derive one attempt's command bound so its bearer URL always outlives it."""
+
+    ceiling = float(url_lifetime_seconds) - PRESIGN_SAFETY_MARGIN_SECONDS
+    if ceiling < 1.0:
+        raise ArtifactTransferError(
+            f"A presigned URL lifetime of {url_lifetime_seconds} seconds cannot cover a "
+            f"bounded transfer attempt; it must exceed the "
+            f"{PRESIGN_SAFETY_MARGIN_SECONDS:.0f}-second safety margin"
+        )
+    return min(requested, ceiling)
+
+
+def _not_materialized(detail: str) -> bool:
+    """Return whether a verify failure means 'nothing complete is placed yet'."""
+
+    return DESTINATION_ABSENT_MARKER in detail or DESTINATION_INCOMPLETE_MARKER in detail
+
+
+def _transfer_failure(
+    worker_id: str,
+    operation: str,
+    exc: SshError,
+) -> InfraError:
+    """Classify one unsuccessful transfer command without inventing a remote outcome.
+
+    Three outcomes never mean "this artifact failed": the controller lost contact with a
+    process that may still run, the worker kept resumable state after a bounded attempt ran
+    out of retries, or an unclassified SSH failure said nothing at all. An integrity,
+    authorization, or protocol failure the worker reports is definitive.
+    """
+
+    capitalized = operation.capitalize()
+    detail = str(exc)
+    if TRANSIENT_FAILURE_MARKER in detail:
+        return ArtifactTransferTransientError(
+            f"{capitalized} attempt on RunPod worker {worker_id} did not complete and can be "
+            f"resumed: {detail}"
+        )
+    if remote_outcome_is_unknown(exc):
+        return RemoteOperationInterruptedError(
+            f"The controller stopped waiting for {operation} on RunPod worker {worker_id} "
+            f"({exc}); the worker-side process may still be running, so its outcome is unknown"
+        )
+    return ArtifactTransferError(f"{capitalized} failed on RunPod worker {worker_id}: {exc}")
 
 
 def _worker_input(presigned: PresignedUrl) -> str:

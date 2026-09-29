@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import threading
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -254,3 +255,182 @@ def test_readiness_transitions_persist_health_and_reset_when_stopped(tmp_path: P
     stopped = store.get("pod-123")
     assert stopped is not None
     assert stopped.readiness_state is WorkerReadinessState.NOT_READY
+
+
+# --- readiness is a ladder, not a last-writer-wins flag ----------------------------
+
+
+def _ready_worker_pair():
+    """Return one running worker plus the direct endpoint it answers on."""
+
+    connection = WorkerConnectionInfo(
+        provider_worker_id="pod-123",
+        kind="direct",
+        host="203.0.113.9",
+        port=30222,
+        username="root",
+    )
+    worker = _worker(state=WorkerState.RUNNING, native_status="RUNNING", ssh_direct=connection)
+    return worker, connection
+
+
+def _health_report(connection: WorkerConnectionInfo, readiness: WorkerReadinessState):
+    return WorkerHealthReport(
+        provider_worker_id="pod-123",
+        provider_state=WorkerState.RUNNING,
+        readiness_state=readiness,
+        connection=connection,
+        bootstrap_version_expected="1",
+        bootstrap_version_observed="1",
+        checks=(
+            WorkerHealthCheck(name="shell", status=HealthCheckStatus.PASS, detail="shell works"),
+        ),
+    )
+
+
+def test_successful_ssh_probe_keeps_established_readiness(tmp_path: Path) -> None:
+    """A read-only SSH observation must never downgrade a stronger proven capability."""
+
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+    running, connection = _ready_worker_pair()
+    store.record_created(_plan(), running)
+    store.mark_ssh_ready(running, connection)
+    store.mark_bootstrapped("pod-123", "1")
+    store.mark_gpu_healthy("pod-123")
+    store.record_health(_health_report(connection, WorkerReadinessState.READY))
+
+    for _ in range(3):
+        record = store.mark_ssh_ready(running, connection)
+
+    assert record is not None
+    assert record.readiness_state is WorkerReadinessState.READY
+    assert record.last_ssh_ready_at == NOW
+
+
+def test_successful_ssh_probe_keeps_bootstrapped_readiness(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+    running, connection = _ready_worker_pair()
+    store.record_created(_plan(), running)
+    store.mark_bootstrapped("pod-123", "1")
+
+    record = store.mark_ssh_ready(running, connection)
+
+    assert record is not None
+    assert record.readiness_state is WorkerReadinessState.BOOTSTRAPPED
+
+
+def test_successful_ssh_probe_promotes_a_weaker_readiness(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+    running, connection = _ready_worker_pair()
+    store.record_created(_plan(), running)
+
+    fresh = store.mark_ssh_ready(running, connection)
+    failed_then_probed = store.mark_ssh_ready(running, connection)
+
+    assert fresh is not None and fresh.readiness_state is WorkerReadinessState.SSH_READY
+    assert failed_then_probed is not None
+    assert failed_then_probed.readiness_state is WorkerReadinessState.SSH_READY
+
+
+def test_ssh_probe_replaces_a_failed_health_marker(tmp_path: Path) -> None:
+    """FAILED means the last inspection found a problem, not that SSH stopped working."""
+
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+    running, connection = _ready_worker_pair()
+    store.record_created(_plan(), running)
+    store.record_health(_health_report(connection, WorkerReadinessState.FAILED))
+
+    record = store.mark_ssh_ready(running, connection)
+
+    assert record is not None
+    assert record.readiness_state is WorkerReadinessState.SSH_READY
+    assert record.health_status == "FAILED"
+
+
+def test_gpu_checkpoint_never_downgrades_established_readiness(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+    running, connection = _ready_worker_pair()
+    store.record_created(_plan(), running)
+    store.record_health(_health_report(connection, WorkerReadinessState.READY))
+
+    record = store.mark_gpu_healthy("pod-123")
+
+    assert record is not None
+    assert record.readiness_state is WorkerReadinessState.READY
+
+
+def test_genuine_invalidation_still_resets_readiness(tmp_path: Path) -> None:
+    """A stopped, destroyed, or unhealthy worker must lose its READY evidence."""
+
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+    running, connection = _ready_worker_pair()
+    store.record_created(_plan(), running)
+    store.record_health(_health_report(connection, WorkerReadinessState.READY))
+
+    store.observe(_worker(state=WorkerState.STOPPED, native_status="EXITED"))
+    assert store.get("pod-123").readiness_state is WorkerReadinessState.NOT_READY
+
+    store.record_health(_health_report(connection, WorkerReadinessState.READY))
+    store.mark_destroyed("pod-123")
+    assert store.get("pod-123").readiness_state is WorkerReadinessState.NOT_READY
+
+    store.record_health(_health_report(connection, WorkerReadinessState.READY))
+    store.record_health(_health_report(connection, WorkerReadinessState.FAILED))
+    assert store.get("pod-123").readiness_state is WorkerReadinessState.FAILED
+
+
+def test_a_concurrent_ssh_probe_cannot_regress_a_health_result(tmp_path: Path) -> None:
+    """Two controller processes must not lose the stronger readiness either wrote.
+
+    Without the document lock the probe's read-decide-write window lets the health result
+    land first and then be overwritten by the probe's stale observation, leaving a READY
+    worker recorded as merely SSH_READY.
+    """
+
+    path = tmp_path / "workers.json"
+    running, connection = _ready_worker_pair()
+    probe_store = WorkerStateStore(path, now=lambda: NOW)
+    probe_store.record_created(_plan(), running)
+    health_store = WorkerStateStore(path, now=lambda: NOW)
+    probe_ready = threading.Event()
+    health_attempted = threading.Event()
+
+    original_load = probe_store._load
+    original_write = probe_store._write
+
+    def noticed_load():  # type: ignore[no-untyped-def]
+        # Announced once the probe has read the document inside its lock, which is exactly
+        # the window the health writer must not be able to enter.
+        document = original_load()
+        probe_ready.set()
+        return document
+
+    def delayed_write(document):  # type: ignore[no-untyped-def]
+        assert probe_ready.is_set()
+        # The health decision is issued now, while the probe still holds the lock.
+        health_attempted.set()
+        original_write(document)
+
+    probe_store._load = noticed_load  # type: ignore[method-assign]
+    probe_store._write = delayed_write  # type: ignore[method-assign]
+
+    probe_results: list[object] = []
+
+    def probe() -> None:
+        probe_results.append(probe_store.mark_ssh_ready(running, connection))
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    try:
+        assert probe_ready.wait(timeout=30)
+        health_store.record_health(_health_report(connection, WorkerReadinessState.READY))
+    finally:
+        thread.join(timeout=60)
+
+    assert not thread.is_alive(), "the probe was blocked by the health writer"
+    final = health_store.get("pod-123")
+    assert final is not None
+    assert final.readiness_state is WorkerReadinessState.READY
+    # Neither writer's evidence was lost.
+    assert final.health_status == "READY"
+    assert final.last_ssh_ready_at == NOW

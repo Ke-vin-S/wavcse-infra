@@ -38,6 +38,13 @@ Usage on the worker:
     python3 - download --destination <absolute-path> [--expected-size N]
                        [--expected-sha256 HEX] [--concurrency N] [--overwrite]
     python3 - upload --source <absolute-path>
+    python3 - verify --destination <absolute-path> [--expected-size N] [--expected-sha256 HEX]
+
+`verify` never downloads and never writes: it reports the size and SHA-256 of an artifact
+that is already placed, fails if it is absent, incomplete, or mismatched, and reports
+whether another transfer currently holds the destination lock. A controller that stopped
+waiting for a download uses it to decide, from worker evidence, whether the transfer
+finished, is still running, or died.
 
 Result protocol on stdout, one tab-separated key per line:
 
@@ -79,6 +86,18 @@ SCHEMA_VERSION = "1"
 ERROR_KEY = "wavcse_transfer_error"
 DOWNLOAD_OPERATION = "download"
 UPLOAD_OPERATION = "upload"
+VERIFY_OPERATION = "verify"
+# These markers are the machine-readable part of the sanitized error line for a
+# destination that already exists. The controller imports them from this module, so the
+# worker and the controller always agree on the classification of an inspect result.
+TRANSFER_IN_PROGRESS_MARKER = "is already in progress on this worker"
+DESTINATION_EXISTS_MARKER = "already exists; pass --overwrite to replace it deliberately"
+DESTINATION_ABSENT_MARKER = "destination is absent"
+DESTINATION_INCOMPLETE_MARKER = "destination is incomplete"
+DESTINATION_MISMATCH_MARKER = "destination does not match"
+# A bounded attempt that ran out of retries is not a failed artifact: the resumable state
+# beside the destination is kept, so the caller retries with freshly issued credentials.
+TRANSIENT_FAILURE_MARKER = "transient transfer failure; resumable state was kept"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 CHUNK_SIZE_BYTES = 1024 * 1024
 MAX_SINGLE_PUT_BYTES = 5_000_000_000
@@ -231,6 +250,29 @@ def sha256_file(path: str, *, chunk_size: int = CHUNK_SIZE_BYTES) -> tuple[int, 
     return size, digest.hexdigest()
 
 
+def sha256_descriptor(descriptor: int, *, chunk_size: int = CHUNK_SIZE_BYTES) -> tuple[int, str]:
+    """Stream an already-open descriptor and return its size and SHA-256 digest.
+
+    Reading from the descriptor, rather than re-opening the pathname, is what makes a
+    verification unable to be redirected: the bytes hashed are the bytes of the inode that
+    was inspected, whatever else happens to the name afterwards.
+    """
+
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(descriptor, chunk_size)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    except OSError as exc:
+        raise TransferError(f"could not read the artifact: {_safe_text(exc)}") from exc
+    return size, digest.hexdigest()
+
+
 def download_concurrency(value: int) -> int:
     """Return an accepted bounded worker download concurrency."""
 
@@ -243,6 +285,101 @@ def download_concurrency(value: int) -> int:
             f"download concurrency must be an integer between 1 and {MAX_DOWNLOAD_CONCURRENCY}"
         )
     return value
+
+
+def transfer_active(destination: str) -> bool:
+    """Return whether another process currently holds one destination's transfer lock.
+
+    The lock is an advisory `flock` that outlives the staging file it protects, so asking
+    the kernel is the only reliable liveness test for a transfer that a controller may have
+    stopped waiting for.
+    """
+
+    path = f"{destination}{_LOCK_SUFFIX}"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        _validate_staging_file(descriptor, path)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def verify_existing(
+    destination: str,
+    *,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
+) -> dict[str, str]:
+    """Report one already-placed artifact, failing unless it satisfies the expectations.
+
+    This never downloads, never writes, and never removes anything: it is the read-only
+    evidence a controller needs after its own bounded command stopped waiting for a
+    transfer it started. A destination that does not exist, is still growing, or does not
+    match is reported as a failure so a caller cannot mistake it for a completed artifact.
+    """
+
+    target = validate_worker_path(destination, label="verify destination")
+    expected_digest = _optional_sha256(expected_sha256)
+    if expected_size is not None and expected_size < 0:
+        raise TransferInputError("expected size must not be negative")
+    if transfer_active(target):
+        raise TransferError(
+            f"verify: another transfer for {target!r} {TRANSFER_IN_PROGRESS_MARKER}"
+        )
+    # One no-follow open supplies every fact below. The artifact is never re-opened by
+    # name, so nothing that happens to the pathname afterwards can change which bytes are
+    # inspected, hashed, or reported.
+    try:
+        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError as exc:
+        staging = os.path.lexists(f"{target}{_PARTIAL_SUFFIX}")
+        marker = DESTINATION_INCOMPLETE_MARKER if staging else DESTINATION_ABSENT_MARKER
+        raise TransferVerificationError(f"verify: {marker}: {target!r}") from exc
+    except OSError as exc:
+        raise TransferVerificationError(
+            f"verify: {DESTINATION_MISMATCH_MARKER}: {target!r} could not be opened "
+            f"for verification: {_safe_text(exc)}"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise TransferVerificationError(
+                f"verify: {DESTINATION_MISMATCH_MARKER}: {target!r} is not a regular file"
+            )
+        if expected_size is not None and opened.st_size != expected_size:
+            raise TransferVerificationError(
+                f"verify: {DESTINATION_INCOMPLETE_MARKER}: {target!r} is {opened.st_size} "
+                f"bytes, but {expected_size} bytes were expected"
+            )
+        size, digest = sha256_descriptor(descriptor)
+        try:
+            named = os.stat(target, follow_symlinks=False)
+        except OSError as exc:
+            raise TransferError(
+                f"{TRANSIENT_FAILURE_MARKER}: {target!r} disappeared while it was being "
+                f"verified: {_safe_text(exc)}"
+            ) from exc
+        if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+            raise TransferError(
+                f"{TRANSIENT_FAILURE_MARKER}: {target!r} was replaced while it was being "
+                "verified; nothing is known about the entry now at that path"
+            )
+    finally:
+        os.close(descriptor)
+    if expected_digest is not None and digest != expected_digest:
+        raise TransferVerificationError(
+            f"verify: {DESTINATION_MISMATCH_MARKER}: {target!r} has SHA-256 {digest}, "
+            f"but {expected_digest} was expected"
+        )
+    return {"path": target, "size_bytes": str(size), "sha256": digest}
 
 
 def download(
@@ -300,9 +437,7 @@ def _require_destination_absent(target: str, overwrite: bool) -> None:
     """Refuse any existing destination entry, including a dangling symlink."""
 
     if not overwrite and os.path.lexists(target):
-        raise TransferVerificationError(
-            f"{target!r} already exists; pass --overwrite to replace it deliberately"
-        )
+        raise TransferVerificationError(f"{target!r} {DESTINATION_EXISTS_MARKER}")
 
 
 def _validate_staging_file(descriptor: int, path: str) -> None:
@@ -447,7 +582,7 @@ def _acquire_destination_lock(target: str) -> int:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             raise TransferError(
-                f"another transfer for {target!r} is already in progress on this worker"
+                f"another transfer for {target!r} {TRANSFER_IN_PROGRESS_MARKER}"
             ) from exc
     except BaseException:
         os.close(descriptor)
@@ -747,7 +882,8 @@ def _fetch_range_with_retries(
         except _RetryableRangeError as exc:
             if attempt >= DEFAULT_RANGE_ATTEMPTS:
                 raise TransferError(
-                    f"byte range {start}-{end} failed after {attempt} attempts: {_safe_text(exc)}"
+                    f"{TRANSIENT_FAILURE_MARKER}: byte range {start}-{end} failed after "
+                    f"{attempt} attempts: {_safe_text(exc)}"
                 ) from exc
             time.sleep(min(delay, MAX_RETRY_BACKOFF_SECONDS))
             delay *= 2
@@ -1183,9 +1319,13 @@ def upload(
             f"the storage endpoint rejected the upload with HTTP {exc.code}"
         ) from exc
     except urllib.error.URLError as exc:
-        raise TransferError(f"the upload request failed: {_safe_text(exc.reason)}") from exc
+        raise TransferError(
+            f"{TRANSIENT_FAILURE_MARKER}: the upload request failed: {_safe_text(exc.reason)}"
+        ) from exc
     except (TimeoutError, OSError) as exc:
-        raise TransferError(f"the upload failed: {_safe_text(exc)}") from exc
+        raise TransferError(
+            f"{TRANSIENT_FAILURE_MARKER}: the upload failed: {_safe_text(exc)}"
+        ) from exc
     return {"path": origin, "size_bytes": str(size), "sha256": digest}
 
 
@@ -1233,31 +1373,42 @@ def main(
     options = parser.parse_args(sys.argv[1:] if argv is None else argv)
     operation = options.operation
     try:
-        presigned = validate_presigned_url(url if url is not None else WAVCSE_PRESIGNED_URL)
-        if operation == DOWNLOAD_OPERATION:
-            fields = download(
-                presigned,
+        if operation == VERIFY_OPERATION:
+            fields = verify_existing(
                 options.destination,
                 expected_size=options.expected_size,
                 expected_sha256=options.expected_sha256,
-                overwrite=options.overwrite,
-                concurrency=options.concurrency,
             )
         else:
-            fields = upload(
-                presigned,
-                options.source,
-                if_none_match=WAVCSE_IF_NONE_MATCH,
-                allowed_root=options.allowed_root,
-            )
+            presigned = validate_presigned_url(url if url is not None else WAVCSE_PRESIGNED_URL)
+            if operation == DOWNLOAD_OPERATION:
+                fields = download(
+                    presigned,
+                    options.destination,
+                    expected_size=options.expected_size,
+                    expected_sha256=options.expected_sha256,
+                    overwrite=options.overwrite,
+                    concurrency=options.concurrency,
+                )
+            else:
+                fields = upload(
+                    presigned,
+                    options.source,
+                    if_none_match=WAVCSE_IF_NONE_MATCH,
+                    allowed_root=options.allowed_root,
+                )
     except TransferError as exc:
         err.write(f"{ERROR_KEY}\t{_safe_text(exc)}\n")
         return 1
     except Exception as exc:
         # Defensive: an unexpected failure must still exit through the sanitized protocol
-        # instead of printing a traceback that could echo the bearer URL. It fails the
-        # transfer; nothing is retried or ignored.
-        err.write(f"{ERROR_KEY}\tunexpected transfer failure: {_safe_text(exc)}\n")
+        # instead of printing a traceback that could echo the bearer URL. It is reported as
+        # transient because an unclassified failure is not evidence about the artifact: the
+        # controller must decide from a fresh observation rather than record a failure.
+        err.write(
+            f"{ERROR_KEY}\t{TRANSIENT_FAILURE_MARKER}: unexpected transfer failure: "
+            f"{_safe_text(exc)}\n"
+        )
         return 1
     out.write(_render(operation, fields))
     return 0
@@ -1300,9 +1451,13 @@ def _stream_download(
             f"the storage endpoint rejected the download with HTTP {exc.code}"
         ) from exc
     except urllib.error.URLError as exc:
-        raise TransferError(f"the download request failed: {_safe_text(exc.reason)}") from exc
+        raise TransferError(
+            f"{TRANSIENT_FAILURE_MARKER}: the download request failed: {_safe_text(exc.reason)}"
+        ) from exc
     except (TimeoutError, OSError) as exc:
-        raise TransferError(f"the download failed: {_safe_text(exc)}") from exc
+        raise TransferError(
+            f"{TRANSIENT_FAILURE_MARKER}: the download failed: {_safe_text(exc)}"
+        ) from exc
     return written, digest.hexdigest()
 
 
@@ -1313,9 +1468,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
     subcommands = parser.add_subparsers(dest="operation", required=True)
     fetch = subcommands.add_parser(DOWNLOAD_OPERATION, help="Materialize one artifact.")
-    fetch.add_argument("--destination", required=True, help="Absolute destination file path.")
-    fetch.add_argument("--expected-size", type=int, default=None, help="Expected byte size.")
-    fetch.add_argument("--expected-sha256", default=None, help="Expected SHA-256 digest.")
+    _add_destination_arguments(fetch)
     fetch.add_argument(
         "--concurrency",
         type=int,
@@ -1327,10 +1480,21 @@ def _argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace an existing destination file deliberately.",
     )
+    inspect_existing = subcommands.add_parser(
+        VERIFY_OPERATION,
+        help="Report one already-placed artifact without downloading anything.",
+    )
+    _add_destination_arguments(inspect_existing)
     send = subcommands.add_parser(UPLOAD_OPERATION, help="Upload one local artifact.")
     send.add_argument("--source", required=True, help="Absolute source file path.")
     send.add_argument("--allowed-root", help="Confine a job output to this workspace.")
     return parser
+
+
+def _add_destination_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--destination", required=True, help="Absolute destination file path.")
+    parser.add_argument("--expected-size", type=int, default=None, help="Expected byte size.")
+    parser.add_argument("--expected-sha256", default=None, help="Expected SHA-256 digest.")
 
 
 def _render(operation: str, fields: dict[str, str]) -> str:

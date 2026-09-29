@@ -528,6 +528,14 @@ and it does not touch the first one's state. The lock is an advisory `flock`, so
 released automatically if the transfer process dies; an empty lock file (0 bytes) left
 beside the destination is normal and harmless.
 
+The same module answers a read-only `verify` question for one destination
+(`python3 - verify --destination <path> [--expected-size N] [--expected-sha256 HEX]`): it
+reports the size and SHA-256 of an artifact that is already placed, fails when nothing
+complete is there, reports whether another transfer currently holds the lock, and never
+downloads or writes anything. A controller whose bounded command stopped waiting uses it
+to decide, from worker evidence, whether the transfer finished in the background, is still
+running, or died. It carries no presigned URL at all.
+
 Placement creates the destination from the verified staging inode rather than by moving a
 pathname. That also means `--overwrite` is a two-step replace — the previous entry is
 removed, then the destination is created from the verified inode — so the destination name
@@ -735,6 +743,8 @@ infra worker health <exact-worker-id>
 infra job submit jobs/dg-0004-seed-42.json --worker <exact-worker-id>
 
 # 4. Inspect it. status reconciles with the worker and persists declared outputs.
+#    A job that is still PREPARING is driven forward from worker evidence, so status may
+#    resume an interrupted input materialization and start a command that never started.
 infra job status <job-id>
 infra job logs <job-id> --tail-bytes 65536
 
@@ -742,8 +752,10 @@ infra job logs <job-id> --tail-bytes 65536
 infra job cancel <job-id>
 ```
 
-`infra job status` exits 1 when the job is `FAILED`, and 0 for `RUNNING`, `SUCCEEDED`, or
-`CANCELLED`. `--json` renders the complete durable record.
+`infra job status` exits 1 when the job is `FAILED`, and 0 for `RUNNING`, `PREPARING`,
+`SUCCEEDED`, or `CANCELLED`. `infra job submit` exits 1 when the job is `FAILED`,
+`CANCELLED`, or still `PREPARING` with `reconciliation_required` set. `--json` renders the
+complete durable record.
 
 ### Job state machine
 
@@ -762,6 +774,62 @@ and provenance are preserved, and optional outputs are still persisted for debug
 The executed commit is verified at launch; the research command and setup must be
 trusted not to replace source code during their own execution.
 
+`PREPARING` is a real, resumable phase rather than a waypoint. A bounded controller wait, a
+dropped SSH session, or a worker phase that may still be running records
+`reconciliation_required` with the preparation phase (`installing_runner`,
+`preparing_source`, `materializing_inputs`, `starting_command`), the interruption time, and
+no `failure_reason`. `infra job status` then completes the attempt from worker evidence:
+
+- an input whose download finished after the controller stopped watching is verified
+  (size, then SHA-256) and reused, never re-downloaded;
+- a download that is still running is reported, and a second one is never started for it;
+- a download that died is resumed from the ranges already recorded on the worker;
+- a command launch that is still starting, or whose identity cannot be verified, keeps the
+  job reconcilable instead of guessing;
+- a command that may already have been launched is never launched again.
+
+`FAILED` therefore always means the system has evidence: a reported command failure, a
+recorded process that is gone with no outcome, a workspace that is absent after the
+controller had issued preparation steps for it, or a launch that provably never recorded a
+process (and which the runner can never run the command without).
+
+The same rule covers every other observation the controller makes:
+
+- **Stopped or restarting worker.** A provider stop says the worker is unreachable, not that
+  the command failed. The job keeps its state and `reconciliation_required`, and the next
+  `infra job status` after the worker is `RUNNING` again reads the outcome the command
+  already recorded on its disk. Only `TERMINATING`, `DESTROYED`, and `ERROR` — states in
+  which the workspace is gone for good — end the job, and their reason says the outcome can
+  no longer be read rather than claiming the command failed.
+- **Input materialization.** Every declared input is verified from worker evidence (size,
+  then SHA-256) immediately before the command may start, except one established by a
+  transfer in that same pass, which the worker verified end to end as it placed it. An
+  input recorded as materialized by an earlier attempt is re-verified rather than trusted:
+  a valid one is not transferred again, a missing or partial one is materialized again, and
+  one that no longer matches its declared size or digest is replaced with a verified copy.
+- **Required outputs.** An upload whose outcome the controller lost is not a persistence
+  failure. The job stays reconcilable and the next pass either retries the upload or, when
+  the object is already at the declared key, reads it back from canonical storage and
+  accepts it only when the stored bytes match the worker-side file's size and SHA-256. Its
+  existence, its size, and its age are never sufficient: only its bytes are.
+- **Declared output structure.** The durable record always keeps exactly one slot per
+  declared output, in declaration order, so an interruption part-way through a multi-output
+  job leaves the structure intact: the outputs already reconciled stay recorded and only
+  the unresolved one is retried. A controller restart re-reads that record rather than
+  rebuilding it.
+- **Terminal means nothing is left running.** The supervisor terminates the process groups
+  it recorded before it writes an outcome, and refuses to write one while any of them is
+  still alive. Such a job stays nonterminal and its live group is reported, so a leftover
+  process from an unkillable run is visible instead of being hidden behind a finished
+  record.
+- **Transient controller-side failures.** A throttled or failed canonical-storage
+  observation, an interrupted transfer, an attempt that exhausted its bounded retries, and
+  a worker that never became reachable are all reported as uncertainty. The worker's own
+  retries stay bounded; the recovery opportunity is the next job-level attempt, which
+  signs fresh credentials and resumes from the ranges already recorded on the worker.
+
+`infra job cancel` is the explicit way to end a job that must not continue.
+
 ### Local state and logs
 
 ```text
@@ -777,8 +845,13 @@ Remote state lives in the job workspace on the worker:
 ├── inputs/           materialized Phase 5 artifacts
 ├── outputs/          declared experiment outputs
 ├── logs/job.log      combined stdout/stderr
-└── state/            pid, finished, cancelled, and non-secret descriptor copies
+└── state/            pid, finished, cancelled, started, and non-secret descriptor copies
 ```
+
+`state/start.lock` records the identity (PID, start ticks, timestamp) that owns the job's
+single launch slot, so a controller can prove later whether a launch is still running,
+completed, or died before recording a process. `state/prepare.lock` is an advisory lock
+that serializes the checkout phase and is released by the kernel if its process dies.
 
 Logs are worker-side; the local copy is written when a job reaches a terminal state and is
 bounded by `jobs.log_tail_bytes`. Durable logs beyond that must be declared as outputs.
@@ -962,12 +1035,42 @@ Expected: `State: FAILED`, `Exit code: 9`, the log containing `intentional failu
   local record and any captured log copy are preserved.
 - `Warning: worker ... could not be inspected`: transient; the job may still be running.
   Retry `infra job status` before drawing a conclusion.
+- `State: PREPARING` with `Reconciliation required: yes`: the controller stopped watching a
+  worker phase that may still be running. Run `infra job status <job-id>` to reconcile it;
+  `infra job cancel <job-id>` ends it deliberately. Do not submit the work again: a new
+  submission is a new job ID and would duplicate the transfer or the run.
+- `stays RUNNING because the outcome it recorded on the worker cannot be read`: the worker is
+  stopped or restarting. Its disk, and any outcome the command already wrote there, survive
+  that; start the worker explicitly and run `infra job status` again.
+- `the command launch for job ... is in progress ... and owns the job`: the launch won the
+  race against cancellation. Nothing was cancelled; retry `infra job cancel` to terminate
+  the process the launch is creating.
+- `did not establish the cancellation ... nothing was recorded`: the worker could not
+  confirm the cancellation, so no terminal state was invented. Run `infra job status` and
+  retry once the worker answers.
+- `required output persistence could not be confirmed`: the command finished but its upload
+  outcome is unknown. Run `infra job status` again; the canonical object is checked before
+  anything is concluded.
+- `Could not read metadata for ... this is a service observation failure`: the controller
+  could not observe canonical storage. Nothing about the artifact is concluded; retry.
+- `the job workspace ... is absent ... after this controller had already issued
+  preparation steps for it`: the workspace was removed or the worker was rebuilt after
+  preparation had been issued. The command is never re-run implicitly, because it may
+  already have executed; inspect the worker and submit a new job if the run must be
+  repeated.
+- `the command launch ... did not complete: the runner recorded no process`: the launch was
+  interrupted before the runner recorded a supervisor. The supervisor refuses to execute a
+  command it was never named in, so nothing ran; submit a new job.
+- `recorded a job process ... that is no longer running, and recorded no outcome`: the
+  process vanished (external kill or worker restart) without writing `finished.json`. The
+  command result cannot be verified; inspect `logs/job.log` on the worker.
 - `refusing to signal process ...`: the recorded PID no longer matches this job; nothing
   was killed. Inspect the worker session manually.
-- `No such file or directory` for the runner path: the worker filesystem was reset or the
-  worker was rebuilt. `infra job submit` installs the reviewed runner, so submit a new job
-  after re-bootstrapping (`infra worker bootstrap <worker-id>`); the previous job's outcome
-  is unrecoverable and should be recorded as unknown.
+- `No such file or directory` for the runner path: the worker root filesystem was reset.
+  Re-run `infra worker bootstrap <worker-id>`, then `infra job status <job-id>`: the next
+  preparation pass reinstalls the reviewed runner. If the job workspace is gone as well,
+  status reports the outcome as unknown instead of re-running a command that may have
+  executed.
 
 ## Controller reconstruction
 
@@ -1033,9 +1136,16 @@ artifacts from S3, and experiment metadata from MLflow/DagsHub.
   segments, a leading separator, whitespace, `?`/`#`, or a repeated prefix.
 - Presigned upload refused: an object already exists at that key. Inspect it, then pass
   `--overwrite` only if replacing persisted data is intended.
-- Presigned URL expired: the transfer took longer than the URL lifetime. Raise
-  `--expires-in` (up to 604800 seconds) and, for a long transfer,
-  `ssh.transfer_timeout_seconds` together.
+- Presigned URL expired: the transfer took longer than the URL lifetime. Readiness is
+  established before a URL is signed, and one bounded attempt is never allowed to outlive
+  its URL, so this means a single range request was issued too close to expiry. Retry the
+  transfer: a new URL is presigned and the recorded ranges are resumed.
+- `too soon to sign a usable transfer URL`: the controller's own temporary credentials are
+  about to expire, so no URL could be honoured. Renew them (an attached instance profile
+  refreshes automatically) and retry; this is not a statement about the artifact.
+- `transient transfer failure; resumable state was kept`: a bounded attempt ran out of
+  retries. The partial artifact is kept and the next attempt resumes from it. Run
+  `infra job status`, which signs a fresh URL.
 - Artifact download checksum or size mismatch: nothing is materialized at the
   destination and the temporary file is removed. Verify which digest is authoritative
   before retrying; do not accept a mismatch on a persisted artifact.
@@ -1045,8 +1155,12 @@ artifacts from S3, and experiment metadata from MLflow/DagsHub.
   `infra worker bootstrap <id>`; the transfer module needs the Python 3 that bootstrap
   guarantees.
 - Worker transfer fails during a large download: confirm the worker has free disk
-  space, then raise `--expires-in` and `ssh.transfer_timeout_seconds` if the transfer
-  itself was cut short.
+  space. A large artifact does not need a longer URL lifetime or a longer command bound:
+  a bounded attempt that is cut short is retried with a fresh URL and continues from the
+  ranges already recorded beside the destination.
+- A job whose input materialization was interrupted by the controller keeps its state and
+  is completed by `infra job status`, which verifies or resumes the transfer instead of
+  repeating it.
 - Tool check failure: rerun bootstrap, then `make check`.
 - OMP/Codex/AGF check failure: run `make install-agents`, start a new login shell, and
   rerun `infra doctor`.

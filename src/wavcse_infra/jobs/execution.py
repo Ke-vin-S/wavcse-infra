@@ -23,10 +23,20 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wavcse_infra.config import JobsConfig, SshConfig
-from wavcse_infra.errors import JobExecutionError, SshCommandError
+from wavcse_infra.errors import (
+    JobExecutionError,
+    JobLaunchExcludedError,
+    RemoteOperationInterruptedError,
+    SshError,
+)
 from wavcse_infra.redaction import redact
 from wavcse_infra.workers.bootstrap import BOOTSTRAP_VERSION
-from wavcse_infra.workers.ssh import SshCommandResult, SshExecutor, WorkerSshWaiter
+from wavcse_infra.workers.ssh import (
+    SshCommandResult,
+    SshExecutor,
+    WorkerSshWaiter,
+    remote_outcome_is_unknown,
+)
 
 SCHEMA_KEY = "wavcse_job_schema"
 SCHEMA_VERSION = "1"
@@ -85,6 +95,16 @@ _REQUIRED_INSPECT_FIELDS = frozenset(
     }
 )
 
+# Refusals from the worker-side runner that mean "another controller attempt already owns
+# this phase of this job". The runner serializes `prepare` and `start` per job, and these
+# exact phrases are the machine-readable part of its sanitized message.
+PREPARE_IN_PROGRESS_MARKER = "another prepare for this job is already in progress on this worker"
+START_IN_PROGRESS_MARKER = "was already started; inspect its state instead of starting it again"
+# The runner's per-job lifecycle lock serializes creating a job's process against
+# cancelling a job that has none yet: it answers "busy" rather than interleaving them.
+LIFECYCLE_BUSY_MARKER = "is already in progress on this worker"
+CANCELLED_BEFORE_START_MARKER = "was cancelled before it started"
+
 
 class PrepareResult(BaseModel):
     """Verified source materialization for one job."""
@@ -121,6 +141,21 @@ class RemoteJobStatus(BaseModel):
     finished_at: datetime | None = None
     executed_commit: str | None = None
     log_bytes: int | None = Field(default=None, ge=0)
+    # Preparation evidence. These stay `None` when the installed worker runner predates
+    # them, so a controller never mistakes silence for proof that nothing happened.
+    job_directory_exists: bool | None = None
+    prepared: bool | None = None
+    started: bool | None = None
+    launch_alive: bool | None = None
+    # A member of this job's own verified process group is still alive, even though the
+    # stage leader it was created under has exited.
+    group_pid: int | None = Field(default=None, ge=1)
+    # The worker durably recorded that this job's launch was excluded before it started.
+    # That is affirmative evidence that no command ran, which is what lets a cancellation
+    # whose acknowledgement was lost still be reconciled as CANCELLED. It stays False when
+    # the installed runner predates it, so an old runner is never credited with evidence
+    # it did not report.
+    pre_start: bool = False
 
 
 class CancelResult(BaseModel):
@@ -133,6 +168,11 @@ class CancelResult(BaseModel):
     pid: int | None = Field(default=None, ge=1)
     cancelled_at: datetime | None = None
     exit_code: int | None = None
+    # `pre_start` is affirmative evidence that the launch is excluded rather than killed;
+    # `launch_in_progress` is the opposite answer, meaning the launch owns the job and the
+    # operator must retry cancellation against the process it is creating.
+    pre_start: bool = False
+    launch_in_progress: bool = False
 
 
 def load_worker_job_runner_source() -> str:
@@ -183,10 +223,8 @@ class JobExecutor:
                 input_text=source,
                 timeout_seconds=min(self._ssh.bootstrap_timeout_seconds, _INSTALL_TIMEOUT_SECONDS),
             )
-        except SshCommandError as exc:
-            raise JobExecutionError(
-                f"Could not install the reviewed job runner on worker {worker_id}: {redact(exc)}"
-            ) from exc
+        except SshError as exc:
+            raise _phase_failure(worker_id, "install", exc) from exc
         values = _parse_runner_output(result, worker_id)
         status = values.get(INSTALL_KEY)
         if status not in {"installed", "unchanged"}:
@@ -296,6 +334,12 @@ class JobExecutor:
                 finished_at=_optional_timestamp(values["finished_at"]),
                 executed_commit=values["executed_commit"] or None,
                 log_bytes=_optional_int(values["log_bytes"]),
+                job_directory_exists=_optional_bool(values.get("job_directory_exists")),
+                prepared=_optional_bool(values.get("prepared")),
+                started=_optional_bool(values.get("started")),
+                launch_alive=_optional_bool(values.get("launch_alive")),
+                group_pid=_optional_int(values["group_pid"]) if values.get("group_pid") else None,
+                pre_start=values.get("pre_start") == "true",
             )
         except ValidationError as exc:
             raise JobExecutionError(
@@ -318,7 +362,7 @@ class JobExecutor:
                 input_text=json.dumps(descriptor),
                 timeout_seconds=self._ssh.transfer_timeout_seconds,
             )
-        except SshCommandError as exc:
+        except SshError as exc:
             raise JobExecutionError(
                 f"Could not read logs for job {job_id} on worker {worker_id}: {redact(exc)}"
             ) from exc
@@ -340,6 +384,8 @@ class JobExecutor:
                 pid=_optional_int(values.get("pid", "")),
                 cancelled_at=_optional_timestamp(values.get("cancelled_at", "")),
                 exit_code=_optional_int(values.get("exit_code", "")),
+                pre_start=values.get("pre_start") == "true",
+                launch_in_progress=values.get("launch_in_progress") == "true",
             )
         except ValidationError as exc:
             raise JobExecutionError(
@@ -364,10 +410,8 @@ class JobExecutor:
                 input_text=json.dumps(descriptor),
                 timeout_seconds=self._ssh.bootstrap_timeout_seconds,
             )
-        except SshCommandError as exc:
-            raise JobExecutionError(
-                f"Job {subcommand} failed on RunPod worker {worker_id}: {redact(exc)}"
-            ) from exc
+        except SshError as exc:
+            raise _phase_failure(worker_id, subcommand, exc) from exc
         values = _parse_runner_output(result, worker_id)
         missing = required - set(values)
         if missing:
@@ -404,6 +448,68 @@ def _parse_runner_output(result: SshCommandResult, worker_id: str) -> dict[str, 
 
 def _optional_int(value: str) -> int | None:
     return int(value) if value.strip() else None
+
+
+def _optional_bool(value: str | None) -> bool | None:
+    """Read one tri-state evidence flag; absence means the worker did not report it."""
+
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    return text == "true"
+
+
+def _phase_failure(
+    worker_id: str,
+    subcommand: str,
+    exc: SshError,
+) -> JobExecutionError | RemoteOperationInterruptedError:
+    """Classify one unsuccessful runner phase without inventing a remote outcome.
+
+    Three outcomes must never be recorded as a job failure:
+
+    * the SSH command was cut short by the controller's own bound or by a dropped
+      connection, in which case the worker-side phase may still be running;
+    * the worker refused the phase because an earlier attempt of this same phase is still
+      running (the runner serializes `prepare` and `start` per job);
+    * the worker did not become reachable in time, which says nothing about the job.
+
+    Authentication, host-key, endpoint, and local SSH configuration failures are controller
+    problems that will not resolve by themselves, and the remote runner's own reported
+    failure is definitive evidence; both stay terminal.
+    """
+
+    detail = redact(exc)
+    if subcommand == "install":
+        label = "the reviewed job runner installation"
+        definitive = (
+            f"Could not install the reviewed job runner on RunPod worker {worker_id}: {detail}"
+        )
+    else:
+        label = f"job {subcommand}"
+        definitive = f"Job {subcommand} failed on RunPod worker {worker_id}: {detail}"
+    if (
+        LIFECYCLE_BUSY_MARKER in detail
+        or START_IN_PROGRESS_MARKER in detail
+        or PREPARE_IN_PROGRESS_MARKER in detail
+    ):
+        return RemoteOperationInterruptedError(
+            f"Another controller attempt is already running {label} on RunPod worker "
+            f"{worker_id}: {detail}"
+        )
+    if CANCELLED_BEFORE_START_MARKER in detail:
+        return JobLaunchExcludedError(
+            f"Worker {worker_id} refuses to launch {label} because cancellation already "
+            f"excluded it: {detail}"
+        )
+    if remote_outcome_is_unknown(exc):
+        return RemoteOperationInterruptedError(
+            f"The controller stopped waiting for {label} on RunPod worker {worker_id} "
+            f"({detail}); the worker-side phase may still be running, so its outcome is unknown"
+        )
+    return JobExecutionError(definitive)
 
 
 def _optional_timestamp(value: str) -> datetime | None:

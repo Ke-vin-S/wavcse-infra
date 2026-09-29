@@ -365,15 +365,19 @@ def test_cancel_terminates_only_the_job_process_tree(tmp_path: Path, fake_git, w
         _await_marker(marker, timeout=30)
 
         first = _capture_stdout(runner.cancel, _descriptor(job_directory))
-        second = _capture_stdout(runner.cancel, _descriptor(job_directory))
 
         assert "cancelled\ttrue" in first
-        assert "already_finished\ttrue" in second
         assert unrelated.poll() is None
-        rows = _await_terminal(job_directory, timeout=60)
+        # The cancellation is recorded immediately; the supervisor's own outcome follows.
+        _await_marker(job_directory / "state" / "finished.json", timeout=60)
+        rows = _rows(_capture_stdout(runner.inspect, _descriptor(job_directory)))
         assert rows["status"] == "finished"
         assert rows["cancelled"] == "true"
         assert rows["exit_code"] != "0"
+        # Idempotence is asserted once the outcome is recorded, so it does not depend on
+        # how quickly the supervisor reaches its own final write.
+        second = _capture_stdout(runner.cancel, _descriptor(job_directory))
+        assert "already_finished\ttrue" in second
     finally:
         unrelated.terminate()
         unrelated.wait(timeout=30)
@@ -434,14 +438,25 @@ def test_repeated_start_refuses_to_launch_the_same_job_twice(
         runner.start(descriptor)
 
 
-def test_cancel_refuses_to_claim_a_vanished_job_was_cancelled(tmp_path: Path) -> None:
+def test_cancel_of_a_job_that_never_started_excludes_every_later_launch(
+    tmp_path: Path, fake_git, worker_home
+) -> None:
+    """A cancellation that wins the race makes the launch impossible, not merely unlikely."""
+
+    fake_git(_head_script())
     job_directory = tmp_path / "jobs" / "job-0123456789abcdef"
-    (job_directory / "state").mkdir(parents=True)
+    runner.prepare(_descriptor(job_directory))
 
-    with pytest.raises(runner.RunnerError, match="no process"):
-        runner.cancel(_descriptor(job_directory))
+    rows = _rows(_capture_stdout(runner.cancel, _descriptor(job_directory)))
 
-    assert not (job_directory / "state" / "cancelled.json").exists()
+    assert rows["cancelled"] == "true"
+    assert rows["already_finished"] == "false"
+    assert rows["pre_start"] == "true"
+    recorded = json.loads((job_directory / "state" / "cancelled.json").read_text(encoding="utf-8"))
+    assert recorded["pre_start"] is True
+    with pytest.raises(runner.RunnerError, match="cancelled before it started"):
+        runner.start(_descriptor(job_directory, command={"argv": [sys.executable, "-c", "pass"]}))
+    assert not (job_directory / "state" / "pid.json").exists()
 
 
 def test_logs_returns_a_bounded_tail(tmp_path: Path) -> None:
@@ -561,3 +576,146 @@ def test_shell_metacharacters_in_argv_are_never_interpreted(
     assert marker.read_text(encoding="utf-8") == literal
     assert not canary.exists()
     assert not list(job_directory.glob("outputs/pwned*"))
+
+
+# --- preparation evidence a controller reconciles from ------------------------------
+
+
+def test_start_records_the_identity_that_owns_the_launch_slot(
+    tmp_path: Path, fake_git, worker_home
+) -> None:
+    fake_git(_head_script())
+    job_directory = tmp_path / "jobs" / "job-0123456789abcdef"
+    descriptor = _descriptor(
+        job_directory, command={"argv": [sys.executable, "-c", "pass"]}, timeout_seconds=30
+    )
+    runner.prepare(descriptor)
+
+    runner.start(descriptor)
+
+    lock = json.loads((job_directory / "state" / "start.lock").read_text(encoding="utf-8"))
+    assert lock["pid"] == os.getpid()
+    assert isinstance(lock["starttime"], int)
+    assert lock["started_at"]
+
+
+def test_inspect_reports_which_preparation_step_the_workspace_reached(
+    tmp_path: Path, fake_git, worker_home
+) -> None:
+    fake_git(_head_script())
+    job_directory = tmp_path / "jobs" / "job-0123456789abcdef"
+    descriptor = _descriptor(job_directory)
+
+    before = _rows(_capture_stdout(runner.inspect, descriptor))
+    runner.prepare(descriptor)
+    prepared = _rows(_capture_stdout(runner.inspect, descriptor))
+    runner.start(
+        _descriptor(
+            job_directory, command={"argv": [sys.executable, "-c", "pass"]}, timeout_seconds=30
+        )
+    )
+    started = _rows(_capture_stdout(runner.inspect, descriptor))
+
+    assert before["job_directory_exists"] == "false"
+    assert before["prepared"] == "false"
+    assert before["started"] == "false"
+    assert prepared["job_directory_exists"] == "true"
+    assert prepared["prepared"] == "true"
+    assert prepared["started"] == "false"
+    assert "launch_alive" not in prepared
+    assert started["started"] == "true"
+
+
+def test_inspect_verifies_a_launch_identity_that_is_still_alive(tmp_path: Path) -> None:
+    job_directory = tmp_path / "jobs" / "job-0123456789abcdef"
+    (job_directory / "state").mkdir(parents=True)
+    (job_directory / "job.json").write_text(
+        json.dumps({"job_id": "job-0123456789abcdef"}), encoding="utf-8"
+    )
+    (job_directory / "state" / "start.lock").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "starttime": runner._process_starttime(os.getpid()),
+                "started_at": "2026-09-28T12:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = _rows(_capture_stdout(runner.inspect, _descriptor(job_directory)))
+
+    assert rows["status"] == "unknown"
+    assert rows["started"] == "true"
+    assert rows["launch_alive"] == "true"
+
+
+def test_inspect_proves_a_launch_that_died_before_recording_a_process(tmp_path: Path) -> None:
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait(timeout=30)
+    job_directory = tmp_path / "jobs" / "job-0123456789abcdef"
+    (job_directory / "state").mkdir(parents=True)
+    (job_directory / "job.json").write_text(
+        json.dumps({"job_id": "job-0123456789abcdef"}), encoding="utf-8"
+    )
+    (job_directory / "state" / "start.lock").write_text(
+        json.dumps({"pid": finished.pid, "starttime": 1}),
+        encoding="utf-8",
+    )
+
+    rows = _rows(_capture_stdout(runner.inspect, _descriptor(job_directory)))
+
+    assert rows["started"] == "true"
+    assert rows["launch_alive"] == "false"
+    assert rows["pid"] == ""
+
+
+def test_inspect_does_not_guess_from_an_unreadable_launch_slot(tmp_path: Path) -> None:
+    """A start slot written by an older build stays unverifiable instead of assumed dead."""
+
+    job_directory = tmp_path / "jobs" / "job-0123456789abcdef"
+    (job_directory / "state").mkdir(parents=True)
+    (job_directory / "job.json").write_text(
+        json.dumps({"job_id": "job-0123456789abcdef"}), encoding="utf-8"
+    )
+    (job_directory / "state" / "start.lock").write_text("", encoding="utf-8")
+
+    rows = _rows(_capture_stdout(runner.inspect, _descriptor(job_directory)))
+
+    assert rows["started"] == "true"
+    assert "launch_alive" not in rows
+
+
+def test_prepare_refuses_to_race_a_prepare_that_is_already_running(
+    tmp_path: Path, fake_git, worker_home
+) -> None:
+    fake_git(_head_script())
+    job_directory = tmp_path / "jobs" / "job-0123456789abcdef"
+    paths = runner._job_paths(str(job_directory))
+    runner._ensure_directories(paths)
+    holder = runner._acquire_prepare_lock(paths)
+
+    try:
+        with pytest.raises(runner.RunnerError, match="another prepare for this job"):
+            runner.prepare(_descriptor(job_directory))
+    finally:
+        os.close(holder)
+
+    runner.prepare(_descriptor(job_directory))
+    assert (job_directory / "job.json").is_file()
+
+
+def test_prepare_lock_is_released_when_its_process_dies(
+    tmp_path: Path, fake_git, worker_home
+) -> None:
+    """A controller that stopped waiting can always retry prepare."""
+
+    fake_git(_head_script())
+    job_directory = tmp_path / "jobs" / "job-0123456789abcdef"
+    paths = runner._job_paths(str(job_directory))
+    runner._ensure_directories(paths)
+    os.close(runner._acquire_prepare_lock(paths))
+
+    runner.prepare(_descriptor(job_directory))
+
+    assert (job_directory / "job.json").is_file()

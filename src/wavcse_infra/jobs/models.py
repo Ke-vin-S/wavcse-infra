@@ -98,6 +98,20 @@ TERMINAL_JOB_STATES: frozenset[JobState] = frozenset(
 )
 
 
+class JobPreparationPhase(StrEnum):
+    """Durable controller record of which preparation step it had reached.
+
+    This is evidence, not state: it says what the *controller* had issued when it last
+    wrote the record, which is what lets a later reconciliation tell "the command never
+    started" apart from "the command may have started and the workspace is gone".
+    """
+
+    INSTALLING_RUNNER = "installing_runner"
+    PREPARING_SOURCE = "preparing_source"
+    MATERIALIZING_INPUTS = "materializing_inputs"
+    STARTING_COMMAND = "starting_command"
+
+
 def can_transition(current: JobState, target: JobState) -> bool:
     """Return whether one job state change is legal."""
 
@@ -550,6 +564,9 @@ class JobRecord(BaseModel):
     worker_absent: bool = False
     remote_status: str | None = None
     log_bytes: int | None = Field(default=None, ge=0)
+    preparation_phase: JobPreparationPhase | None = None
+    interrupted_at: datetime | None = None
+    reconciliation_required: bool = False
     provenance: JobProvenance
     inputs: tuple[JobInputRecord, ...] = ()
     outputs: tuple[JobOutputRecord, ...] = ()

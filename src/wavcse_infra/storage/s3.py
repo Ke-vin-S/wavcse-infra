@@ -9,15 +9,22 @@ profile. No credential value is ever read, serialized, or handed to a worker.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import partial
 from typing import Any, Literal, Protocol
 
 import boto3
 from botocore.config import Config as BotocoreConfig
-from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+from botocore.credentials import RefreshableCredentials
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+    NoCredentialsError,
+    ParamValidationError,
+)
 from pydantic import BaseModel, ConfigDict, Field
 
 from wavcse_infra.config import Settings
@@ -28,6 +35,7 @@ from wavcse_infra.errors import (
     StorageObjectExistsError,
     StorageObjectNotFoundError,
     StoragePermissionError,
+    StorageUnavailableError,
     StorageVerificationError,
 )
 from wavcse_infra.redaction import redact
@@ -46,10 +54,17 @@ DEFAULT_PRESIGN_EXPIRY_SECONDS = 3600
 MIN_PRESIGN_EXPIRY_SECONDS = 60
 # Signature Version 4 refuses a presigned URL lifetime above seven days.
 MAX_PRESIGN_EXPIRY_SECONDS = 604800
+# A URL signed with the controller's temporary credentials dies when the session token
+# does too, so the signed lifetime is capped by the credential's own remaining validity and
+# this margin is kept clear of both boundaries.
+PRESIGN_CREDENTIAL_MARGIN_SECONDS = 30
 DEFAULT_LIST_LIMIT = 100
 MAX_LIST_LIMIT = 1000
 MAX_MANIFEST_BYTES = 1024 * 1024
 _LIST_PAGE_SIZE = 1000
+# Reading an object body to prove its bytes must not buffer it: a declared output can be
+# large, so the body is streamed through one hash in bounded chunks.
+CONTENT_HASH_CHUNK_BYTES = 8 * 1024 * 1024
 
 DEFAULT_VERIFICATION_LIMITATIONS: tuple[str, ...] = (
     "Object content was not downloaded, so a recorded SHA-256 is not cryptographically "
@@ -58,7 +73,38 @@ DEFAULT_VERIFICATION_LIMITATIONS: tuple[str, ...] = (
     "Durability is inferred from object metadata and storage class, not from reading the body.",
 )
 
+CONTENT_VERIFICATION_LIMITATIONS: tuple[str, ...] = (
+    "The object body was read once and hashed, and the read was bound to the version the "
+    "metadata read reported when the bucket provided one; a replacement after that read is "
+    "not detected by this verification.",
+    "Durability is inferred from object metadata and storage class, not from reading the body.",
+)
+
 _NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+# Server-side, throttling, and connection codes are observations about the service rather
+# than about the object, so they must never be reported as a failed artifact. A generic
+# malformed-request 400 is deliberately absent: only a named retryable condition is
+# transient, because a request S3 rejects as invalid will be rejected identically forever.
+_TRANSIENT_CODES = frozenset(
+    {
+        "408",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "500InternalError",
+        "InternalError",
+        "RequestTimeout",
+        "RequestTimeTooSkewed",
+        "ServiceUnavailable",
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+        "TooManyRequests",
+    }
+)
+_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 _PERMISSION_CODES = frozenset(
     {"AccessDenied", "403", "InvalidAccessKeyId", "SignatureDoesNotMatch"}
 )
@@ -88,10 +134,13 @@ class StoredObject(BaseModel):
     etag: str | None = None
     last_modified: datetime | None = None
     storage_class: str | None = None
+    # Present only when the bucket is versioned; it is what binds a later body read to the
+    # exact version a metadata read observed.
+    version_id: str | None = None
 
 
 class StorageVerification(BaseModel):
-    """Result of a metadata-level verification of one stored artifact."""
+    """Result of a verification of one stored artifact."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -102,7 +151,8 @@ class StorageVerification(BaseModel):
     expected_size_checked: bool = False
     manifest_checked: bool = False
     manifest_sha256: str | None = None
-    content_checksum_verified: Literal[False] = False
+    content_checksum_verified: bool = False
+    content_sha256: str | None = None
     limitations: tuple[str, ...] = DEFAULT_VERIFICATION_LIMITATIONS
 
 
@@ -145,11 +195,13 @@ class S3Storage:
         prefix: str,
         client: S3Client,
         presign_expiry_seconds: int = DEFAULT_PRESIGN_EXPIRY_SECONDS,
+        credential_expiry: Callable[[], datetime | None] | None = None,
     ) -> None:
         self._bucket = bucket
         self._prefix = normalize_prefix(prefix)
         self._client = client
         self._presign_expiry_seconds = presign_expiry_seconds
+        self._credential_expiry = credential_expiry
 
     @classmethod
     def from_settings(cls, settings: Settings) -> S3Storage:
@@ -177,6 +229,7 @@ class S3Storage:
             prefix=settings.storage.prefix,
             client=client,
             presign_expiry_seconds=settings.storage.presign_expiry_seconds,
+            credential_expiry=_credential_expiry_reader(_session_credentials(session)),
         )
 
     @property
@@ -186,6 +239,16 @@ class S3Storage:
     @property
     def prefix(self) -> str:
         return self._prefix
+
+    @property
+    def presign_expiry_seconds(self) -> int:
+        """Return the default lifetime of a URL this storage generates.
+
+        Callers that must outlive a single request (a bounded transfer attempt) derive
+        their own bound from this value so a URL can never expire mid-attempt.
+        """
+
+        return self._presign_expiry_seconds
 
     def object_key(self, key: str) -> str:
         """Resolve one artifact key relative to the configured prefix."""
@@ -369,6 +432,58 @@ class S3Storage:
             manifest_sha256=manifest_sha256,
         )
 
+    def verify_object_content(
+        self,
+        key: str,
+        *,
+        expected_size: int | None = None,
+        expected_sha256: str | None = None,
+    ) -> StorageVerification:
+        """Read one stored object and prove its bytes, not just its metadata.
+
+        Metadata cannot say what an object's bytes are: an object at the right key with the
+        right size may be a different file entirely, so recording a digest from anywhere
+        else would misattribute its provenance. This reads the object body once, streaming
+        it through one SHA-256, and rejects anything whose bytes do not match. When the
+        bucket reports a version id, the body read is bound to the exact version the
+        metadata read observed, so an object replaced between the two reads is still
+        verified against the bytes that were actually read.
+
+        The body read costs one full transfer of the object; that is the price of a
+        cryptographic claim about what canonical storage contains.
+        """
+
+        resolved = self.object_key(key)
+        stored = self.object_metadata(key)
+        if stored is None:
+            raise StorageObjectNotFoundError(
+                f"S3 object s3://{self._bucket}/{resolved} does not exist"
+            )
+        parameters: dict[str, Any] = {"Bucket": self._bucket, "Key": resolved}
+        if stored.version_id is not None:
+            parameters["VersionId"] = stored.version_id
+        size, digest = self._hash_object_body(resolved, parameters)
+        if expected_size is not None and size != expected_size:
+            raise StorageVerificationError(
+                f"s3://{self._bucket}/{resolved} contains {size} bytes, but {expected_size} "
+                "bytes were expected"
+            )
+        if expected_sha256 is not None and digest != expected_sha256.lower():
+            raise StorageVerificationError(
+                f"s3://{self._bucket}/{resolved} does not contain the expected bytes: its "
+                f"SHA-256 is {digest}, but {expected_sha256.lower()} was expected"
+            )
+        return StorageVerification(
+            key=resolved,
+            size_bytes=size,
+            etag=stored.etag,
+            last_modified=stored.last_modified,
+            expected_size_checked=expected_size is not None,
+            content_checksum_verified=True,
+            content_sha256=digest,
+            limitations=CONTENT_VERIFICATION_LIMITATIONS,
+        )
+
     def _presign(
         self,
         operation: Literal["get", "put"],
@@ -389,7 +504,24 @@ class S3Storage:
                 Params=parameters,
                 ExpiresIn=expiry,
             )
-        except (ClientError, BotoCoreError, ValueError) as exc:
+        except NoCredentialsError as exc:
+            # No credential at all is a controller configuration problem, not an artifact
+            # observation, so it stays definitive.
+            raise _credentials_failure() from exc
+        except ParamValidationError as exc:
+            # Signing refused the request itself; sending it again cannot change that.
+            raise StorageError(
+                f"Could not generate a presigned {operation.upper()} URL for "
+                f"s3://{self._bucket}/{resolved}: {_sanitized(exc)}"
+            ) from exc
+        except ClientError as exc:
+            raise _storage_failure("presign", resolved, exc) from exc
+        except BotoCoreError as exc:
+            # A credential refresh, a transport error, or a service interruption during
+            # signing says nothing about the object, so the caller must be free to retry
+            # with fresh credentials rather than record a terminal failure.
+            raise _transport_failure("presign", resolved, exc) from exc
+        except ValueError as exc:
             raise StorageError(
                 f"Could not generate a presigned {operation.upper()} URL for "
                 f"s3://{self._bucket}/{resolved}: {_sanitized(exc)}"
@@ -410,7 +542,33 @@ class S3Storage:
                 f"Presigned URL lifetime must be between {MIN_PRESIGN_EXPIRY_SECONDS} and "
                 f"{MAX_PRESIGN_EXPIRY_SECONDS} seconds"
             )
-        return expiry
+        return self._credential_bounded_expiry(expiry)
+
+    def _credential_bounded_expiry(self, requested: int) -> int:
+        """Cap one requested URL lifetime by the signing credential's own remaining validity.
+
+        A Signature Version 4 URL signed with temporary credentials stops working when the
+        session token expires, whatever `ExpiresIn` asked for. A URL must therefore never
+        claim more time than the credentials behind it can honour, or a transfer would fail
+        with an authorization error partway through an attempt the controller believed was
+        fully covered.
+        """
+
+        if self._credential_expiry is None:
+            return requested
+        expiry = self._credential_expiry()
+        if expiry is None:
+            return requested
+        remaining = (expiry - datetime.now(UTC)).total_seconds()
+        usable = int(remaining - PRESIGN_CREDENTIAL_MARGIN_SECONDS)
+        if usable < MIN_PRESIGN_EXPIRY_SECONDS:
+            raise StorageUnavailableError(
+                f"Controller AWS credentials expire in {remaining:.0f} seconds, which is too "
+                "soon to sign a usable transfer URL. Renew them (an attached instance "
+                "profile refreshes automatically) and retry; nothing about the artifact is "
+                "concluded from this"
+            )
+        return min(requested, usable)
 
     def _call(
         self,
@@ -426,6 +584,41 @@ class S3Storage:
             raise _credentials_failure() from exc
         except BotoCoreError as exc:
             raise _transport_failure(description, key, exc) from exc
+
+    def _hash_object_body(
+        self,
+        resolved: str,
+        parameters: Mapping[str, Any],
+    ) -> tuple[int, str]:
+        """Stream one object body through a SHA-256 and return its byte count and digest."""
+
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            response = self._client.get_object(**parameters)
+            body = response["Body"]
+            try:
+                while True:
+                    chunk = body.read(CONTENT_HASH_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    total += len(chunk)
+            finally:
+                close = getattr(body, "close", None)
+                if callable(close):
+                    close()
+        except ClientError as exc:
+            if _is_not_found(exc):
+                raise StorageObjectNotFoundError(
+                    f"S3 object s3://{self._bucket}/{resolved} does not exist"
+                ) from exc
+            raise _storage_failure("read", resolved, exc) from exc
+        except NoCredentialsError as exc:
+            raise _credentials_failure() from exc
+        except BotoCoreError as exc:
+            raise _transport_failure("read", resolved, exc) from exc
+        return total, digest.hexdigest()
 
 
 def _verify_manifest(
@@ -469,12 +662,14 @@ def _stored_object(item: Mapping[str, Any]) -> StoredObject:
     if not isinstance(size, int) or isinstance(size, bool) or size < 0:
         raise StorageError(f"S3 returned object metadata without a valid byte size for {key!r}")
     storage_class = item.get("StorageClass")
+    version_id = item.get("VersionId")
     return StoredObject(
         key=key,
         size_bytes=size,
         etag=_etag(item.get("ETag")),
         last_modified=_timestamp(item.get("LastModified")),
         storage_class=storage_class if isinstance(storage_class, str) else None,
+        version_id=version_id if isinstance(version_id, str) and version_id else None,
     )
 
 
@@ -486,6 +681,67 @@ def _etag(value: object) -> str | None:
 
 def _timestamp(value: object) -> datetime | None:
     return value if isinstance(value, datetime) else None
+
+
+def _session_credentials(session: object) -> object | None:
+    """Read the session's credential object without assuming a particular boto3 shape."""
+
+    getter = getattr(session, "get_credentials", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+def _credential_expiry_reader(credentials: object) -> Callable[[], datetime | None] | None:
+    """Return a reader for the signing credentials' actual expiry, when they expire.
+
+    Boto3's credential chain hides the authoritative expiry of temporary credentials: a
+    static `Credentials` object has none at all, and a refreshable one keeps the expiry of
+    the credentials it last obtained (after a refresh) on the refreshable object itself
+    rather than on any public attribute. Reading a fixed attribute therefore silently
+    reports "no expiry" for exactly the credentials that do expire, and a presigned URL
+    would be issued with a lifetime the session token cannot honour.
+
+    This adapter is the single place that resolves that expiry. It freezes the credentials
+    first - which is also what triggers a refresh when the chain says one is needed, using
+    the same path signing uses - and then reads the expiry of the credentials that would
+    actually sign. Credentials that carry no expiry at all produce no reader and no cap:
+    that covers static keys, and also a session token supplied directly through the
+    environment, whose expiry botocore cannot know.
+    """
+
+    if credentials is None:
+        return None
+    read = _expiry_accessor(credentials)
+    if read is None:
+        return None
+
+    def reader() -> datetime | None:
+        freeze = getattr(credentials, "get_frozen_credentials", None)
+        if callable(freeze):
+            # A refresh failure is left to signing, which reports it with provider context.
+            freeze()
+        try:
+            value = read()
+        except Exception:  # pragma: no cover - a broken resolver must not break presigning
+            return None
+        return value if isinstance(value, datetime) else None
+
+    return reader
+
+
+def _expiry_accessor(credentials: object) -> Callable[[], object] | None:
+    """Return how one credential object's own expiry is read, or None when it has none."""
+
+    if isinstance(credentials, RefreshableCredentials):
+        # The post-refresh expiry lives here; botocore exposes no public reader for it.
+        return lambda: credentials._expiry_time
+    if hasattr(credentials, "expiry_time"):
+        return lambda: credentials.expiry_time
+    return None
 
 
 def _is_not_found(exc: ClientError) -> bool:
@@ -504,6 +760,11 @@ def _storage_failure(description: str, key: str, exc: ClientError) -> StorageErr
             f"AWS identity is not permitted to {description} s3://{key} (HTTP "
             f"{status or 'unknown'}, {code}); verify the controller role policy"
         )
+    if code in _TRANSIENT_CODES or status in _TRANSIENT_STATUSES or status is None:
+        return StorageUnavailableError(
+            f"Could not {description} s3://{key} (HTTP {status or 'unknown'}, {code}); this is "
+            "a service observation failure, not evidence about the object"
+        )
     return StorageError(f"Could not {description} s3://{key} (HTTP {status or 'unknown'}, {code})")
 
 
@@ -514,8 +775,11 @@ def _credentials_failure() -> StorageError:
     )
 
 
-def _transport_failure(description: str, key: str, exc: BotoCoreError) -> StorageError:
-    return StorageError(f"Could not {description} s3://{key}: {_sanitized(exc)}")
+def _transport_failure(description: str, key: str, exc: BotoCoreError) -> StorageUnavailableError:
+    return StorageUnavailableError(
+        f"Could not {description} s3://{key}: {_sanitized(exc)}. This is a service "
+        "observation failure, not evidence about the object"
+    )
 
 
 def _sanitized(exc: Exception) -> str:

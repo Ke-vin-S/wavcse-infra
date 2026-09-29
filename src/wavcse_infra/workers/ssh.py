@@ -35,6 +35,42 @@ from wavcse_infra.state import WorkerStateStore
 
 _SSH_PROBE_MARKER = "wavcse_ssh_probe_complete\t1"
 
+# SSH failures that leave the controller without the remote outcome. A bounded command
+# timeout, a readiness timeout, and a dropped connection all mean the worker-side process
+# may still be running, so no caller may record a terminal state from them.
+_INTERRUPTED_SSH_ERRORS = (
+    SshCommandTimeoutError,
+    SshReadinessTimeoutError,
+    SshConnectionError,
+)
+# SSH failures that are definitive because they describe the controller's own
+# configuration rather than an unknown remote state. `SshCommandError` is handled
+# separately, after the more specific `SshCommandTimeoutError` is ruled out.
+_DEFINITIVE_SSH_ERRORS = (
+    SshAuthenticationError,
+    SshHostKeyError,
+    SshConfigurationError,
+    SshEndpointUnavailableError,
+)
+
+
+def remote_outcome_is_unknown(exc: SshError) -> bool:
+    """Return whether one SSH failure leaves a remote operation's outcome unknown.
+
+    Order matters: `SshAuthenticationError` is a connection error and
+    `SshCommandTimeoutError` is a command error, so the specific terminal failures are
+    tested before their parents. An unclassified SSH failure is reported as unknown,
+    because silence is never evidence that a remote operation failed.
+    """
+
+    if isinstance(exc, _DEFINITIVE_SSH_ERRORS):
+        return False
+    if isinstance(exc, _INTERRUPTED_SSH_ERRORS):
+        return True
+    # A remote command that ran and reported its own failure is evidence; anything else is
+    # silence, and silence is never evidence that a remote operation failed.
+    return not isinstance(exc, SshCommandError)
+
 
 class WorkerReader(Protocol):
     """Provider read surface needed while waiting for SSH."""

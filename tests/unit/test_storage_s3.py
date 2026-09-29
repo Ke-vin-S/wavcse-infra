@@ -1,3 +1,4 @@
+import hashlib
 import io
 from datetime import UTC, datetime
 from pathlib import Path
@@ -6,6 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 import boto3
 import pytest
 from botocore.config import Config
+from botocore.credentials import RefreshableCredentials
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 from pydantic import ValidationError
 
@@ -17,6 +19,7 @@ from wavcse_infra.errors import (
     StorageObjectExistsError,
     StorageObjectNotFoundError,
     StoragePermissionError,
+    StorageUnavailableError,
     StorageVerificationError,
 )
 from wavcse_infra.storage import s3 as s3_module
@@ -528,3 +531,277 @@ def test_storage_settings_reject_an_out_of_range_presign_expiry() -> None:
         Settings.model_validate(
             {"storage": {"bucket": BUCKET, "prefix": PREFIX, "presign_expiry_seconds": 5}}
         )
+
+
+# --- credential-bounded lifetimes and transient classification ---------------------
+
+
+def _credential_storage(client: FakeS3Client, *, remaining_seconds: float):
+    from datetime import timedelta
+
+    from wavcse_infra.storage.s3 import S3Storage
+
+    expiry = datetime.now(UTC) + timedelta(seconds=remaining_seconds)
+    return S3Storage(
+        bucket=BUCKET,
+        prefix=PREFIX,
+        client=client,
+        presign_expiry_seconds=3600,
+        credential_expiry=lambda: expiry,
+    )
+
+
+def test_a_url_is_never_signed_beyond_the_credential_that_signs_it() -> None:
+    """A temporary credential's expiry caps the lifetime, whatever ExpiresIn asked for."""
+
+    client = FakeS3Client()
+
+    presigned = _credential_storage(client, remaining_seconds=300).presign_download(KEY)
+
+    granted = client.presign_calls[0][2]
+    assert granted <= 270
+    assert presigned.expires_in_seconds == granted
+
+
+def test_static_credentials_are_not_capped() -> None:
+    client = FakeS3Client()
+
+    presigned = storage(client, presign_expiry_seconds=1800).presign_download(KEY)
+
+    assert presigned.expires_in_seconds == 1800
+
+
+def test_presigning_refuses_when_the_credential_is_about_to_expire() -> None:
+    from wavcse_infra.errors import StorageUnavailableError
+
+    client = FakeS3Client()
+
+    with pytest.raises(StorageUnavailableError, match="too soon to sign"):
+        _credential_storage(client, remaining_seconds=10).presign_download(KEY)
+
+    assert client.presign_calls == []
+
+
+def test_a_service_failure_is_reported_as_unavailable_not_as_failure() -> None:
+    """A throttled or failed observation says nothing about the object."""
+
+    from botocore.exceptions import ClientError
+
+    from wavcse_infra.errors import StorageUnavailableError
+
+    error = ClientError(
+        {"Error": {"Code": "SlowDown"}, "ResponseMetadata": {"HTTPStatusCode": 503}},
+        "HeadObject",
+    )
+    client = FakeS3Client(head=head_response(), error=error)
+
+    with pytest.raises(StorageUnavailableError, match="service observation failure"):
+        storage(client).object_metadata(KEY)
+
+
+def test_a_transport_failure_is_reported_as_unavailable() -> None:
+    from botocore.exceptions import BotoCoreError
+
+    from wavcse_infra.errors import StorageUnavailableError
+
+    client = FakeS3Client(head=head_response(), error=BotoCoreError())
+
+    with pytest.raises(StorageUnavailableError, match="not evidence about the object"):
+        storage(client).object_metadata(KEY)
+
+
+def test_a_missing_object_stays_a_definitive_absence() -> None:
+    from botocore.exceptions import ClientError
+
+    error = ClientError(
+        {
+            "Error": {"Code": "404", "Message": "Not Found"},
+            "ResponseMetadata": {"HTTPStatusCode": 404},
+        },
+        "HeadObject",
+    )
+    client = FakeS3Client(head=head_response(), error=error)
+
+    assert storage(client).object_metadata(KEY) is None
+
+
+# --- object content verification ---------------------------------------------------
+
+
+def test_verify_object_content_proves_the_stored_bytes() -> None:
+    payload = b"embedding-bytes"
+    client = FakeS3Client(head=head_response(len(payload)), body=payload)
+
+    verification = storage(client).verify_object_content(
+        KEY,
+        expected_size=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert verification.content_checksum_verified is True
+    assert verification.content_sha256 == hashlib.sha256(payload).hexdigest()
+    assert verification.size_bytes == len(payload)
+    assert verification.expected_size_checked is True
+    assert verification.key == RESOLVED_KEY
+
+
+def test_verify_object_content_rejects_different_bytes_of_the_same_size() -> None:
+    """Metadata that matches is not content: the stored bytes must match too."""
+
+    client = FakeS3Client(head=head_response(4), body=b"good")
+
+    with pytest.raises(StorageVerificationError) as error:
+        storage(client).verify_object_content(
+            KEY,
+            expected_size=4,
+            expected_sha256=hashlib.sha256(b"evil").hexdigest(),
+        )
+
+    assert "does not contain the expected bytes" in str(error.value)
+
+
+def test_verify_object_content_rejects_a_size_mismatch() -> None:
+    client = FakeS3Client(head=head_response(4), body=b"good")
+
+    with pytest.raises(StorageVerificationError) as error:
+        storage(client).verify_object_content(KEY, expected_size=8)
+
+    assert "contains 4 bytes" in str(error.value)
+    assert "8 bytes were expected" in str(error.value)
+
+
+def test_verify_object_content_binds_the_read_to_the_reported_version() -> None:
+    """An object replaced after the metadata read must not be read as the verified one."""
+
+    payload = b"versioned"
+    client = FakeS3Client(head={**head_response(len(payload)), "VersionId": "v7"}, body=payload)
+
+    verification = storage(client).verify_object_content(
+        KEY, expected_sha256=hashlib.sha256(payload).hexdigest()
+    )
+
+    assert verification.content_checksum_verified is True
+    assert client.get_calls[0]["VersionId"] == "v7"
+
+
+def test_verify_object_content_reports_a_missing_object() -> None:
+    with pytest.raises(StorageObjectNotFoundError):
+        storage(FakeS3Client()).verify_object_content(KEY)
+
+
+# --- HIGH 3: the real expiry of the signing credentials caps a URL ------------------
+
+
+def _refreshable_credentials(remaining_seconds: float):
+    from datetime import timedelta
+
+    client = FakeS3Client()
+    expiry = datetime.now(UTC) + timedelta(seconds=remaining_seconds)
+    credentials = RefreshableCredentials(
+        access_key="AKIAEXAMPLE",
+        secret_key="secret",
+        token="token",
+        expiry_time=expiry,
+        # Never refresh inside these tests: the initial expiry is what must be honoured.
+        refresh_using=lambda: {
+            "access_key": "AKIAEXAMPLE",
+            "secret_key": "secret",
+            "token": "token",
+            "expiry_time": expiry.isoformat(),
+        },
+        method="test",
+        advisory_timeout=0,
+        mandatory_timeout=0,
+    )
+    instance = S3Storage(
+        bucket=BUCKET,
+        prefix=PREFIX,
+        client=client,
+        presign_expiry_seconds=3600,
+        credential_expiry=s3_module._credential_expiry_reader(credentials),
+    )
+    return instance, client
+
+
+def test_a_real_refreshable_credential_caps_the_signed_lifetime() -> None:
+    """botocore keeps this expiry on the refreshable object, not on a public attribute."""
+
+    instance, client = _refreshable_credentials(remaining_seconds=300)
+
+    presigned = instance.presign_download(KEY)
+
+    granted = client.presign_calls[0][2]
+    assert granted <= 270
+    assert presigned.expires_in_seconds == granted
+
+
+def test_a_real_refreshable_credential_about_to_expire_refuses_to_sign() -> None:
+    instance, client = _refreshable_credentials(remaining_seconds=10)
+
+    with pytest.raises(StorageUnavailableError, match="too soon to sign"):
+        instance.presign_download(KEY)
+
+    assert client.presign_calls == []
+
+
+def test_a_real_static_credential_produces_no_cap() -> None:
+    from botocore.credentials import Credentials
+
+    assert s3_module._credential_expiry_reader(Credentials("AKIAEXAMPLE", "secret")) is None
+
+
+# --- MEDIUM 2: an unsigned request is not evidence, a bad configuration is ---------
+
+
+def test_a_transient_credential_refresh_failure_while_signing_is_unavailable() -> None:
+    from botocore.exceptions import CredentialRetrievalError
+
+    client = FakeS3Client(
+        error=CredentialRetrievalError(provider="test", error_msg="could not refresh")
+    )
+
+    with pytest.raises(StorageUnavailableError):
+        storage(client).presign_download(KEY)
+
+
+def test_missing_credentials_while_signing_stay_a_configuration_error() -> None:
+    client = FakeS3Client(error=NoCredentialsError())
+
+    with pytest.raises(ConfigurationError) as error:
+        storage(client).presign_download(KEY)
+
+    assert "instance profile" in str(error.value)
+
+
+def test_an_invalid_signing_request_stays_definitive() -> None:
+    from botocore.exceptions import ParamValidationError
+
+    client = FakeS3Client(error=ParamValidationError(report="bad parameters"))
+
+    with pytest.raises(StorageError) as error:
+        storage(client).presign_download(KEY)
+
+    assert not isinstance(error.value, StorageUnavailableError)
+    assert "Could not generate a presigned GET URL" in str(error.value)
+
+
+# --- MEDIUM 4: a generic bad request is not a transient condition -------------------
+
+
+def test_a_generic_bad_request_is_not_transient() -> None:
+    """Only named retryable conditions are transient; an invalid request stays definitive."""
+
+    client = FakeS3Client(head=head_response(), error=client_error("InvalidRequest", 400))
+
+    with pytest.raises(StorageError) as error:
+        storage(client).object_metadata(KEY)
+
+    assert not isinstance(error.value, StorageUnavailableError)
+    assert "HTTP 400" in str(error.value)
+
+
+def test_a_named_retryable_code_is_still_transient_on_a_400() -> None:
+    client = FakeS3Client(head=head_response(), error=client_error("RequestTimeout", 400))
+
+    with pytest.raises(StorageUnavailableError):
+        storage(client).object_metadata(KEY)

@@ -168,6 +168,25 @@ Each URL is scoped to:
 - a finite lifetime, default `storage.presign_expiry_seconds = 3600` and clamped to
   60–604800 seconds.
 
+The controller establishes worker readiness *before* signing anything, so waiting for SSH
+never consumes a URL's lifetime, and one bounded transfer attempt can never outlive its own
+URL: the attempt's SSH bound is derived as `min(ssh.transfer_timeout_seconds,
+granted_lifetime - 30)`. A lifetime signed with temporary credentials is additionally
+capped by the credentials' own remaining validity (read from the refreshable credential
+chain, with a 30-second margin), because such a URL stops working when the session token
+expires whatever `ExpiresIn` asked for; when the remaining validity is too short to sign
+anything usable the presign is refused as a transient condition rather than shortened
+silently. A transfer that needs longer is retried with a new URL and resumes from the
+ranges recorded beside the destination, so no single URL is ever extended to cover a whole
+large artifact. The read-only verification probe sends no URL at all.
+
+Artifact verification opens the destination once, with `O_NOFOLLOW`, and hashes the
+descriptor it opened rather than re-opening the pathname, then re-checks that the
+pathname still names that inode. A destination that is replaced, symlinked, or otherwise
+redirected while it is being verified is reported as an unverifiable observation instead
+of being accepted, so a verified digest can never describe a different file than the one
+the caller asked about.
+
 The URL is a bearer secret: anyone holding it can use it until it expires, and it can
 stop working earlier when the EC2 role session rotates. It must not be persisted. The
 project therefore keeps it out of local state, manifests, Git, documentation examples,
@@ -316,17 +335,29 @@ silently replaced after the initial HEAD check. `--overwrite` removes that condi
 An HTTP PUT success alone is not treated as durable completion. One PUT cannot exceed
 5 GB; larger objects require multipart upload, which Phase 5 does not implement.
 
+A declared job output is held to a stronger rule than that HEAD check. After the upload
+the controller reads the object back from canonical storage, streaming it through one
+SHA-256, and accepts the output only when the object's bytes match the size and digest the
+worker reported. The read is bound to the version a preceding metadata read reported when
+the bucket provides one, so an object replaced between the two reads is still verified
+against the bytes that were actually read. An object that merely exists at the declared
+key with a plausible size, or with a matching modification time, is never accepted: its
+existence is not its provenance. This costs one full read of each persisted output, which
+is the price of a cryptographic claim about what canonical storage holds.
+
 `infra storage verify` proves existence, stored size, available metadata, and — when a
 manifest is supplied — that the manifest describes exactly this object and size. It does
 not prove content, because downloading a multi-gigabyte object back to the controller to
 re-hash it is not part of this workflow. The command prints that limitation instead of
 implying a stronger guarantee, and `StorageVerification.content_checksum_verified` is
-always `false`.
+`false` for that metadata-level verification. The content-verifying path used for job
+outputs returns the same model with `content_checksum_verified` set and the observed
+`content_sha256` recorded.
 
 The trust model is therefore: a digest is only as trustworthy as the producer that
 recorded it. A worker-reported digest after upload is producer-claimed evidence, the
-stored size is provider-verified evidence, and cryptographic confirmation requires
-something that actually reads the bytes.
+stored size is provider-verified evidence, and a persisted job output additionally carries
+a controller-observed digest read back from canonical storage.
 
 ## Job execution and source integrity
 
@@ -351,8 +382,15 @@ secret values, are delivered on the SSH stdin stream and never as argv.
 Linux process start time and group identity; a pidfd pins the PID during signalling,
 and the supervisor command line is also checked.
 Cancellation never touches provider lifecycle: it cannot stop, start, or destroy a
-worker, and it refuses an unverifiable PID instead of signalling it. Phase 6 never
-destroys a worker automatically, including after a failed or cancelled job.
+worker, and it refuses an unverifiable PID or process-group identity instead of signalling
+it. A process group whose recorded identity cannot be proven is never signalled, because
+killing an unrelated workload is unrecoverable while an unidentified survivor is not.
+Phase 6 never destroys a worker automatically, including after a failed or cancelled job.
+
+A job's terminal record also means nothing of that job is still running: the supervisor
+terminates the process groups it recorded, with the same identity verification, and
+refuses to write an outcome while any of them is still alive. Such a job stays nonterminal
+and is reported for reconciliation rather than being declared finished.
 
 ## Logging and redaction
 

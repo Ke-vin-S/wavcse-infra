@@ -232,7 +232,10 @@ persist the provider ID, and poll to a bounded provider state. Phase 4 then disc
 current direct SSH endpoint, proves remote execution with a completion marker, streams
 each small reviewed script over stdin, and runs normalized health checks. A Pod can be
 RunPod `RUNNING` while its local readiness remains `NOT_READY`, `SSH_READY`,
-`BOOTSTRAPPED`, `GPU_HEALTHY`, or `FAILED`; only all required checks produce `READY`.
+`BOOTSTRAPPED`, `GPU_HEALTHY`, or `FAILED`; only all required checks produce `READY`. The
+ladder is monotone under weaker observations: a read-only SSH probe on a `READY` worker
+leaves it `READY`, while a full health inspection, a worker that leaves `RUNNING`, or a
+destroyed worker still resets it.
 Automation always disables PTY allocation and requires the mapped public-IP direct SSH
 endpoint. The RunPod basic proxy is reserved for `infra worker ssh`, which forces a PTY;
 it is never accepted by exec, bootstrap, health, or readiness probing.
@@ -285,6 +288,14 @@ Presigned URLs are bearer secrets with a bounded lifetime (default
 `storage.presign_expiry_seconds = 3600`, maximum 604800 seconds). They are scoped to one
 bucket, one exact object, and one operation; they are printed only when a command was
 asked to produce one, and their representation is redacted everywhere else.
+
+Readiness is established *before* a URL is signed, so waiting for SSH cannot consume the
+credential's lifetime; one bounded attempt never outlives the URL that authorises it,
+because the bound is `min(ssh.transfer_timeout_seconds, granted_lifetime - 30)`. A URL
+signed with temporary credentials is additionally capped by those credentials' own
+remaining validity, since the URL stops working when the session token does. Longer
+transfers are handled by retrying with a freshly presigned URL, which the resumable
+downloader continues from the ranges it already recorded.
 
 The canonical embedding layout is dataset-level plain TAR archives with one version 1
 sidecar manifest per archive:

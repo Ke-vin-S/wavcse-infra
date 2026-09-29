@@ -63,7 +63,8 @@ infra job submit jobs/dg-0004.json --worker <id>
 
 infra job status <job-id>
   -> read worker evidence (state files recording the commit verified at launch) over direct SSH
-  -> persist declared outputs through presigned PUT + controller size verification
+  -> persist declared outputs through presigned PUT + controller content verification against
+     the worker-reported size and digest, read back from canonical storage
   -> SUCCEEDED only when the command exited 0 and every required output is persisted
   -> CANCELLED when a cancellation was recorded and the command did not exit 0
   -> FAILED with the exit code, stage, and timeout flag preserved
@@ -115,7 +116,11 @@ state and the worker's own files remain authoritative; a local record is never u
   range record; small or size-unknown objects keep the single-connection path. It is also
   importable, so the same code is unit-tested on the controller.
 - `storage/transfer.py` presigns, streams that module over direct SSH stdin with the URL
-  on the same stream, parses the worker result strictly, and verifies uploaded objects.
+  on the same stream, parses the worker result strictly, and verifies uploaded objects. It
+  derives each attempt's command bound from the URL lifetime, and classifies a bounded
+  timeout or a dropped connection as an unknown remote outcome rather than as a failed
+  transfer; a transfer that another process already owns, and a destination that already
+  exists, are reported as evidence for the caller to check.
 - `redaction.py` removes authorization values, known secret assignments, and URL
   query strings from user-facing external errors, and provides the shared
   `contains_bearer_material` check used by manifests and job specifications.
@@ -123,7 +128,9 @@ state and the worker's own files remain authoritative; a local record is never u
   machine, and the durable job record; it rejects branches, short prefixes, shell command
   strings, traversal paths, reserved environment names, and bearer values.
 - `jobs/state.py` stores one atomic, non-secret JSON document per job plus a bounded local
-  log copy beneath `~/.local/state/wavcse-infra/jobs/`.
+  log copy beneath `~/.local/state/wavcse-infra/jobs/`. Each job also has a local advisory
+  lock; every mutating operation takes it and re-reads the record inside it, so two
+  controller processes on one machine cannot let the slower one overwrite newer state.
 - `jobs/execution.py` installs the reviewed worker runner (digest-verified), drives
   `prepare`/`start`/`inspect`/`logs`/`cancel` over direct SSH, and parses the runner's
   schema-versioned protocol strictly. Descriptors, including secret values, travel on
@@ -131,13 +138,38 @@ state and the worker's own files remain authoritative; a local record is never u
 - `jobs/collect.py` maps declared inputs/outputs to worker paths inside the job workspace
   and refuses any path that escapes it.
 - `jobs/submit.py` enforces worker preconditions, resolves declared secrets from the
-  controller environment, materializes inputs, verifies the commit, starts the job, and
-  records FAILED with evidence when a phase fails.
+  controller environment, and then runs one bounded, idempotent preparation pass (install
+  the runner, verify the commit, materialize inputs, start the command). The same pass
+  serves a first submission and a later reconciliation. A controller-side interruption
+  records the preparation phase and `reconciliation_required` and leaves the job in
+  PREPARING; a definitive failure is what records FAILED.
 - `jobs/status.py` reconciles job state from worker evidence, persists declared outputs,
-  captures a bounded local log copy, and implements idempotent cancellation.
+  captures a bounded local log copy, and implements idempotent cancellation. For a job
+  that is still PREPARING it either advances the same preparation pass or reports the
+  worker's own evidence (a launch still starting, a workspace absent, a process gone
+  without an outcome) instead of guessing. A worker that is stopped or restarting keeps its
+  job reconcilable; required-output persistence whose outcome is unknown is verified
+  against the canonical object rather than failed; and a job is only ever failed from
+  affirmative evidence.
+- `errors.py` names the one distinction the control plane turns on: a
+  `ReconcilableOperationError` is an interrupted observation, an exhausted resumable
+  attempt, an unfinished competing transfer, or a transient canonical-storage failure, and
+  no caller may record a terminal job result from it. Everything else — a reported remote
+  failure, an integrity mismatch, an authorization or configuration error, a definitively
+  absent object — is evidence and may be terminal.
 - `worker/job_runner.py` is the stdlib-only, Python 3.10-compatible worker program: it
   materializes the exact commit, supervises detached execution with a timeout, reports
-  status, tails logs, and terminates only its own process group.
+  status, tails logs, and terminates only its own process group. It serializes `prepare`
+  per job with an advisory lock, records the identity that owns each job's launch slot, and
+  reports preparation evidence (workspace present, prepared, started, launch alive) so a
+  controller can tell "the command never started" apart from "the workspace is gone".
+  Creating a job's process and cancelling a job that has none yet are serialized by a
+  second per-job lifecycle lock, so exactly one of them decides the outcome. `inspect`
+  derives its report from an ordered, bounded snapshot: the recorded outcome is read first,
+  the process state is observed next, and anything that appeared in between is re-read
+  before a "nothing is recorded and nothing is running" conclusion is reported. A process
+  group whose leader exited is still reported as running execution, and a command that left
+  descendants behind is reaped before its outcome is written.
 - `controller/bootstrap.sh` converges supported Ubuntu controllers on required tools
   and the locked project environment, then delegates controller agent installation.
 - `controller/install-agents.sh` installs pinned, verified OMP, Codex CLI, and AGF
@@ -252,6 +284,12 @@ RUNNING
   -> GPU_HEALTHY
   -> READY
 ```
+
+Each rung is proven by a stronger observation than the one below it, so a successful
+weaker observation never replaces a stronger one: an SSH probe records *at least*
+`SSH_READY` and leaves a `READY` worker `READY`. A full health inspection is authoritative
+in both directions, and a provider state that leaves `RUNNING`, destruction, or provider
+reconciliation resets readiness because the evidence is no longer valid.
 
 The direct endpoint is required for automation because it is the Pod's true SSH daemon
 through a mapped public `22/tcp` port. RunPod's basic proxy requires a PTY and is used

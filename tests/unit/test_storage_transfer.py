@@ -6,8 +6,15 @@ import pytest
 
 from wavcse_infra.config import SshConfig
 from wavcse_infra.errors import (
+    ArtifactDestinationExistsError,
     ArtifactTransferError,
+    ArtifactTransferInProgressError,
+    ArtifactTransferTransientError,
+    RemoteOperationInterruptedError,
+    SshAuthenticationError,
     SshCommandError,
+    SshCommandTimeoutError,
+    SshConnectionError,
     StorageObjectExistsError,
 )
 from wavcse_infra.models import Worker, WorkerConnectionInfo, WorkerState
@@ -266,7 +273,9 @@ def test_download_passes_verification_expectations_and_limits(
         DIGEST,
         "--overwrite",
     )
-    assert executor.calls[0][2] == 900
+    # The requested 900-second bound is cut to the 600-second URL lifetime minus the
+    # 30-second safety margin, so the URL can never expire while the command still runs.
+    assert executor.calls[0][2] == 570.0
 
 
 def test_download_passes_a_bounded_parallel_concurrency_to_the_worker(
@@ -532,3 +541,248 @@ def test_storage_verification_never_claims_content_verification() -> None:
 
     assert verification.content_checksum_verified is False
     assert verification.limitations
+
+
+# --- controller-side classification of a stopped remote operation -----------------
+
+
+class _ErrorExecutor(Executor):
+    """Executor double that always raises one scripted SSH failure."""
+
+    def __init__(self, error: SshCommandError) -> None:
+        super().__init__(stdout="")
+        self.error = error
+
+
+def _transfer_with_error(error: SshCommandError):
+    waiter = Waiter()
+    executor = _ErrorExecutor(error)
+    return WorkerArtifactTransfer(waiter, executor, SshConfig()), executor  # type: ignore[arg-type]
+
+
+def test_a_bounded_command_timeout_is_an_interruption_not_a_failed_transfer() -> None:
+    transfer, _ = _transfer_with_error(SshCommandTimeoutError("SSH command exceeded 3540 seconds"))
+
+    with pytest.raises(RemoteOperationInterruptedError, match="may still be running"):
+        transfer.download("pod-123", storage=FakeStorage(), key=KEY, destination=DESTINATION)  # type: ignore[arg-type]
+
+
+def test_a_dropped_connection_is_an_interruption_not_a_failed_transfer() -> None:
+    transfer, _ = _transfer_with_error(SshConnectionError("SSH could not connect"))
+
+    with pytest.raises(RemoteOperationInterruptedError, match="outcome is unknown"):
+        transfer.download("pod-123", storage=FakeStorage(), key=KEY, destination=DESTINATION)  # type: ignore[arg-type]
+
+
+def test_authentication_failure_stays_a_definitive_transfer_failure() -> None:
+    transfer, _ = _transfer_with_error(SshAuthenticationError("permission denied"))
+
+    with pytest.raises(ArtifactTransferError) as failure:
+        transfer.download("pod-123", storage=FakeStorage(), key=KEY, destination=DESTINATION)  # type: ignore[arg-type]
+
+    assert not isinstance(failure.value, RemoteOperationInterruptedError)
+
+
+def test_a_transfer_that_already_owns_the_destination_is_reported_as_evidence() -> None:
+    from wavcse_infra.storage.worker_transfer import TRANSFER_IN_PROGRESS_MARKER
+
+    transfer, _ = _transfer_with_error(
+        SshCommandError(f"another transfer for {DESTINATION!r} {TRANSFER_IN_PROGRESS_MARKER}")
+    )
+
+    with pytest.raises(ArtifactTransferInProgressError, match="already owns that destination"):
+        transfer.download("pod-123", storage=FakeStorage(), key=KEY, destination=DESTINATION)  # type: ignore[arg-type]
+
+
+def test_an_existing_destination_is_reported_as_evidence_the_caller_must_check() -> None:
+    from wavcse_infra.storage.worker_transfer import DESTINATION_EXISTS_MARKER
+
+    transfer, _ = _transfer_with_error(
+        SshCommandError(f"{DESTINATION!r} {DESTINATION_EXISTS_MARKER}")
+    )
+
+    with pytest.raises(ArtifactDestinationExistsError):
+        transfer.download("pod-123", storage=FakeStorage(), key=KEY, destination=DESTINATION)  # type: ignore[arg-type]
+
+
+def test_a_remote_reported_failure_stays_a_definitive_transfer_failure() -> None:
+    transfer, _ = _transfer_with_error(SshCommandError("the storage endpoint rejected it", 1))
+
+    with pytest.raises(ArtifactTransferError, match="Download failed on RunPod worker"):
+        transfer.download("pod-123", storage=FakeStorage(), key=KEY, destination=DESTINATION)  # type: ignore[arg-type]
+
+
+def test_verify_reports_the_artifact_the_worker_hashed() -> None:
+    executor = Executor(
+        "wavcse_transfer_schema\t1\n"
+        f"operation\tverify\nstatus\tok\npath\t{DESTINATION}\n"
+        f"size_bytes\t3072\nsha256\t{DIGEST}\n"
+    )
+    transfer = WorkerArtifactTransfer(Waiter(), executor, SshConfig())  # type: ignore[arg-type]
+
+    result = transfer.verify(
+        "pod-123", destination=DESTINATION, expected_size=3072, expected_sha256=DIGEST
+    )
+
+    assert result is not None
+    assert result.size_bytes == 3072
+    assert result.sha256 == DIGEST
+    remote_argv, input_text, _ = executor.calls[0]
+    assert remote_argv[2] == "verify"
+    assert input_text is not None
+    assert "X-Amz-Signature" not in input_text
+    assert "wavcse_transfer_schema" in input_text
+
+
+def test_verify_returns_none_when_nothing_complete_is_placed() -> None:
+    from wavcse_infra.storage.worker_transfer import DESTINATION_ABSENT_MARKER
+
+    transfer, _ = _transfer_with_error(SshCommandError(DESTINATION_ABSENT_MARKER))
+
+    assert transfer.verify("pod-123", destination=DESTINATION) is None
+
+
+def test_verify_reports_a_still_running_transfer() -> None:
+    from wavcse_infra.storage.worker_transfer import TRANSFER_IN_PROGRESS_MARKER
+
+    transfer, _ = _transfer_with_error(SshCommandError(TRANSFER_IN_PROGRESS_MARKER))
+
+    with pytest.raises(ArtifactTransferInProgressError):
+        transfer.verify("pod-123", destination=DESTINATION)
+
+
+def test_a_verify_mismatch_is_a_definitive_failure() -> None:
+    from wavcse_infra.storage.worker_transfer import DESTINATION_MISMATCH_MARKER
+
+    transfer, _ = _transfer_with_error(
+        SshCommandError(f"verify: {DESTINATION_MISMATCH_MARKER}: digest differs")
+    )
+
+    with pytest.raises(ArtifactTransferError):
+        transfer.verify("pod-123", destination=DESTINATION)
+
+
+def test_a_minimum_lifetime_url_still_allows_a_positive_attempt_bound() -> None:
+    """The shortest configured URL lifetime must not produce a zero-second attempt."""
+
+    transfer = WorkerArtifactTransfer(Waiter(), Executor(_protocol()), SshConfig())  # type: ignore[arg-type]
+
+    transfer.download(  # type: ignore[arg-type]
+        "pod-123",
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        key=KEY,
+        destination=DESTINATION,
+        expires_in_seconds=60,
+    )
+
+    _, _, timeout = transfer._executor.calls[0]  # type: ignore[attr-defined]
+    assert timeout == 30.0
+
+
+# --- credential lifetime and readiness ordering ------------------------------------
+
+
+def test_readiness_is_established_before_the_url_is_signed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Waiting for SSH must not consume the lifetime of a URL that does not exist yet."""
+
+    events: list[str] = []
+    waiter = Waiter()
+    storage = FakeStorage()
+    executor = Executor(_protocol())
+    original_wait = waiter.wait
+
+    def wait(worker_id: str, *, timeout_seconds: float | None = None):  # type: ignore[no-untyped-def]
+        events.append("wait")
+        return original_wait(worker_id, timeout_seconds=timeout_seconds)
+
+    original_presign = storage.presign_download
+
+    def presign(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        events.append("presign")
+        return original_presign(*args, **kwargs)
+
+    original_run = executor.run_checked
+
+    def run_checked(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        events.append("run")
+        return original_run(*args, **kwargs)
+
+    waiter.wait = wait  # type: ignore[method-assign]
+    storage.presign_download = presign  # type: ignore[method-assign]
+    executor.run_checked = run_checked  # type: ignore[method-assign]
+    transfer = WorkerArtifactTransfer(waiter, executor, SshConfig())  # type: ignore[arg-type]
+
+    transfer.download(  # type: ignore[arg-type]
+        "pod-123",
+        storage=storage,
+        key=KEY,
+        destination=DESTINATION,
+        expected_size=3072,
+        expected_sha256=DIGEST,
+    )
+
+    assert events == ["wait", "presign", "run"]
+
+
+def test_a_readiness_failure_never_signs_a_url() -> None:
+    """A worker that never becomes reachable must not burn a credential for nothing."""
+
+    from wavcse_infra.errors import SshReadinessTimeoutError
+
+    class UnreadyWaiter(Waiter):
+        def wait(self, worker_id: str, *, timeout_seconds: float | None = None):  # type: ignore[no-untyped-def]
+            raise SshReadinessTimeoutError("worker did not become SSH-ready within 180 seconds")
+
+    storage = FakeStorage()
+    transfer = WorkerArtifactTransfer(UnreadyWaiter(), Executor(_protocol()), SshConfig())  # type: ignore[arg-type]
+
+    with pytest.raises(RemoteOperationInterruptedError, match="outcome is unknown"):
+        transfer.download(  # type: ignore[arg-type]
+            "pod-123", storage=storage, key=KEY, destination=DESTINATION
+        )
+
+    assert storage.presign_download_calls == []
+
+
+def test_the_attempt_bound_comes_from_the_lifetime_that_was_granted() -> None:
+    """A credential-shortened URL shortens the attempt with it."""
+
+    executor = Executor(_protocol())
+    transfer = WorkerArtifactTransfer(Waiter(), executor, SshConfig())  # type: ignore[arg-type]
+
+    transfer.download(  # type: ignore[arg-type]
+        "pod-123",
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        key=KEY,
+        destination=DESTINATION,
+        expires_in_seconds=300,
+    )
+
+    _, _, timeout = executor.calls[0]
+    assert timeout == 270.0
+
+
+def test_a_transient_attempt_exhaustion_is_reconcilable() -> None:
+    from wavcse_infra.storage.worker_transfer import TRANSIENT_FAILURE_MARKER
+
+    transfer, _ = _transfer_with_error(
+        SshCommandError(
+            f"{TRANSIENT_FAILURE_MARKER}: byte range 0-16777215 failed after 4 attempts"
+        )
+    )
+
+    with pytest.raises(ArtifactTransferTransientError, match="can be resumed"):
+        transfer.download("pod-123", storage=FakeStorage(), key=KEY, destination=DESTINATION)  # type: ignore[arg-type]
+
+
+def test_a_transient_verification_is_reconcilable_rather_than_a_verdict() -> None:
+    from wavcse_infra.storage.worker_transfer import TRANSIENT_FAILURE_MARKER
+
+    transfer, _ = _transfer_with_error(
+        SshCommandError(f"{TRANSIENT_FAILURE_MARKER}: {DESTINATION!r} was replaced")
+    )
+
+    with pytest.raises(ArtifactTransferTransientError):
+        transfer.verify("pod-123", destination=DESTINATION)

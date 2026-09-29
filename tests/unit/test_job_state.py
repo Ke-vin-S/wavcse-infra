@@ -180,3 +180,24 @@ def test_persisted_record_never_contains_bearer_material(tmp_path: Path, monkeyp
 
     assert not contains_bearer_material(text)
     assert "leaked" not in text
+
+
+def test_a_record_written_before_the_reconciliation_fields_existed_still_loads(
+    tmp_path: Path,
+) -> None:
+    """Durable records are long-lived: a new field must never invalidate an old file."""
+
+    store = JobStateStore(tmp_path / "jobs", now=lambda: NOW)
+    record = store.create(_record("job-0123456789abcdef", JobState.PREPARING))
+    path = store.path_for(record.job_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for field in ("preparation_phase", "interrupted_at", "reconciliation_required"):
+        payload.pop(field)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    reloaded = store.require(record.job_id)
+
+    assert reloaded.state is JobState.PREPARING
+    assert reloaded.preparation_phase is None
+    assert reloaded.interrupted_at is None
+    assert reloaded.reconciliation_required is False

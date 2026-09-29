@@ -493,7 +493,9 @@ def test_download_command_presigns_and_streams_the_worker_module(
     assert input_text is not None
     assert input_text.startswith(f"WAVCSE_PRESIGNED_URL = {PRESIGNED_URL!r}\n")
     assert "wavcse_transfer_schema" in input_text
-    assert timeout == 3600
+    # One attempt may never outlive its bearer URL: 3600 seconds of URL lifetime minus the
+    # 30-second safety margin caps the 3600-second default command bound.
+    assert timeout == 3570.0
 
 
 def test_download_command_passes_an_explicit_concurrency(

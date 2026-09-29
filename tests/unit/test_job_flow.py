@@ -58,7 +58,9 @@ def _submitted(tmp_path: Path, spec=None, **context_overrides):
 
 
 def _state_files(context) -> list[Path]:
-    return sorted(context.job_store.directory.glob("job-*"))
+    return sorted(
+        path for path in context.job_store.directory.glob("job-*") if path.suffix != ".lock"
+    )
 
 
 def _state_text(context) -> str:
@@ -403,7 +405,8 @@ def test_status_marks_success_only_after_required_outputs_are_persisted(tmp_path
     assert transfer.uploads[0]["source"].endswith("/outputs/metrics.json")
     assert result.record.outputs[0].persisted is True
     assert result.record.outputs[0].sha256 == transfer.upload_digest
-    assert result.record.outputs[0].verified_size_bytes == 7
+    assert result.record.outputs[0].verified_size_bytes == len(transfer.upload_payload)
+    assert result.record.outputs[0].size_bytes == len(transfer.upload_payload)
     assert result.record.exit_code == 0
     assert context.job_store.read_log(record.job_id) == "job output\n"
 
@@ -509,15 +512,32 @@ def test_worker_absence_fails_the_job_without_claiming_running(tmp_path: Path) -
     assert "no longer exists" in (result.record.failure_reason or "")
 
 
-def test_worker_that_stopped_before_completion_fails_the_job(tmp_path: Path) -> None:
+def test_worker_that_stopped_before_completion_keeps_the_job_reconcilable(
+    tmp_path: Path,
+) -> None:
+    """A provider stop says the worker is unreachable, not that the command failed."""
+
     provider = FakeProvider()
-    context, record = _submitted(tmp_path, provider=provider)
+    executor = FakeJobExecutor()
+    context, record = _submitted(tmp_path, provider=provider, executor=executor)
     provider.subject = worker(state=WorkerState.STOPPED)
 
-    result = JobCoordinator(context).refresh(record.job_id)
+    stopped = JobCoordinator(context).refresh(record.job_id)
 
-    assert result.record.state is JobState.FAILED
-    assert "left RUNNING" in (result.record.failure_reason or "")
+    assert stopped.record.state is JobState.RUNNING
+    assert stopped.record.failure_reason is None
+    assert stopped.record.reconciliation_required is True
+    assert stopped.warning is not None
+    assert "stays RUNNING" in stopped.warning
+
+    # When the worker is inspectable again, the outcome it recorded decides the job.
+    provider.subject = worker(state=WorkerState.RUNNING)
+    executor.status = RemoteJobStatus(status="finished", exit_code=0, executed_commit="a" * 40)
+
+    reconciled = JobCoordinator(context).refresh(record.job_id)
+
+    assert reconciled.record.state is JobState.SUCCEEDED
+    assert reconciled.record.reconciliation_required is False
 
 
 def test_unreachable_provider_reports_uncertainty_without_changing_state(tmp_path: Path) -> None:
@@ -544,15 +564,16 @@ def test_unreachable_worker_reports_uncertainty_without_changing_state(tmp_path:
     assert "could not be inspected" in result.warning
 
 
-def test_unknown_remote_state_fails_the_job(tmp_path: Path) -> None:
+def test_unknown_remote_state_fails_a_running_job(tmp_path: Path) -> None:
     executor = FakeJobExecutor()
     context, record = _submitted(tmp_path, executor=executor)
-    executor.status = RemoteJobStatus(status="unknown")
+    executor.status = RemoteJobStatus(status="unknown", pid=4321)
 
     result = JobCoordinator(context).refresh(record.job_id)
 
     assert result.record.state is JobState.FAILED
-    assert "no recorded state" in (result.record.failure_reason or "")
+    assert "no longer running" in (result.record.failure_reason or "")
+    assert "recorded no outcome" in (result.record.failure_reason or "")
 
 
 def test_terminal_jobs_are_not_re_reconciled(tmp_path: Path) -> None:

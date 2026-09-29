@@ -4,14 +4,22 @@ One JSON document per job keeps a job's history independent of every other job, 
 corrupt or partially written record cannot hide an unrelated recorded run. Writes reuse
 the same atomic same-directory replacement as worker state and never contain credentials,
 presigned URLs, or secret environment values.
+
+Each job also has a local advisory lock. Every atomic write replaces the whole document, so
+two controller processes that both read, decide, and write would otherwise let the slower
+one silently overwrite the newer state. Mutating operations therefore take the job's lock
+and re-read the current document inside it, which is the whole of the concurrency control
+this single-machine controller needs.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +36,12 @@ from wavcse_infra.jobs.models import (
 from wavcse_infra.state import write_json_atomically
 
 DEFAULT_JOB_STATE_DIRECTORY = Path("~/.local/state/wavcse-infra/jobs")
+
+# One process may hold several logical locks at once (a cancellation that reconciles, for
+# example), so the descriptor for each job is cached and its depth counted instead of
+# taking a second flock on a second descriptor, which would block against itself.
+_LOCK_DEPTH: dict[str, int] = {}
+_LOCK_DESCRIPTORS: dict[str, int] = {}
 
 
 class JobStateStore:
@@ -118,6 +132,51 @@ class JobStateStore:
         elif reason is not None:
             values["state_reason"] = reason
         return self.save(record.model_copy(update=values))
+
+    @contextmanager
+    def locked(self, job_id: str) -> Iterator[None]:
+        """Hold this job's local lock for one read-decide-write operation.
+
+        The lock is advisory and per job, and it is taken by every mutating operation
+        (submission, reconciliation, cancellation). It serializes controller processes on
+        one machine; it is not, and does not need to be, distributed consensus.
+        """
+
+        path = self.lock_path(job_id)
+        key = str(path)
+        depth = _LOCK_DEPTH.get(key, 0)
+        if depth:
+            _LOCK_DEPTH[key] = depth + 1
+            try:
+                yield
+            finally:
+                _LOCK_DEPTH[key] = depth
+            return
+        try:
+            directory = path.parent
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        except OSError as exc:
+            raise JobStateError(f"Could not open the local job lock {path}: {exc}") from exc
+        # Registered before the lock is taken, so a failed acquisition still closes it.
+        _LOCK_DESCRIPTORS[key] = descriptor
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except OSError as exc:
+                raise JobStateError(f"Could not take the local job lock {path}: {exc}") from exc
+            _LOCK_DEPTH[key] = 1
+            yield
+        finally:
+            _LOCK_DEPTH.pop(key, None)
+            held = _LOCK_DESCRIPTORS.pop(key, None)
+            if held is not None:
+                os.close(held)
+
+    def lock_path(self, job_id: str) -> Path:
+        """Return the local lock path for one canonical job ID."""
+
+        return self.directory / f"{validate_job_id(job_id)}.lock"
 
     def write_log(self, job_id: str, text: str) -> Path:
         """Store a bounded local copy of the job's own output for post-run inspection."""

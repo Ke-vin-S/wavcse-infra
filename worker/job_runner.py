@@ -30,11 +30,13 @@ The job directory layout is:
       inputs/    materialized Phase 5 artifacts
       outputs/   declared experiment outputs
       logs/job.log
-      state/     pid, finished, cancelled, and non-secret descriptor copies
+      state/     pid, finished, cancelled, started, non-secret descriptor copies, and
+                 the advisory prepare/launch locks (released automatically on death)
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -81,6 +83,11 @@ STATUS_RUNNING = "running"
 STATUS_FINISHED = "finished"
 STATUS_CANCELLED = "cancelled"
 STATUS_UNKNOWN = "unknown"
+
+# A launch and a cancellation of the same job are mutually exclusive: whichever takes the
+# per-job lifecycle lock first decides the outcome, and the other observes that decision.
+LIFECYCLE_BUSY_MARKER = "is already in progress on this worker"
+CANCELLED_BEFORE_START_MARKER = "was cancelled before it started"
 
 STAGE_SETUP = "setup"
 STAGE_COMMAND = "command"
@@ -158,6 +165,7 @@ def _job_paths(job_directory: str) -> dict[str, str]:
         "cancelled": os.path.join(job_directory, STATE_DIRNAME, CANCELLED_FILENAME),
         "descriptor": os.path.join(job_directory, STATE_DIRNAME, DESCRIPTOR_FILENAME),
         "info": os.path.join(job_directory, JOB_INFO_FILENAME),
+        "lifecycle": os.path.join(job_directory, STATE_DIRNAME, "lifecycle.lock"),
     }
 
 
@@ -201,6 +209,108 @@ def _read_json(path: str) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError) as exc:
         raise RunnerError(f"could not read job state {path!r}: {_safe_text(exc)}") from exc
     return payload if isinstance(payload, dict) else None
+
+
+def _read_optional_json(path: str) -> dict[str, Any] | None:
+    """Read state that may legitimately be absent, empty, or written by an older build.
+
+    `start.lock` is the only file with that history: it was an empty marker before it
+    started carrying the launch identity, and an unreadable or empty marker must never
+    break an inspection of a job that is otherwise fine.
+    """
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    if not text.strip():
+        return None
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _acquire_prepare_lock(paths: dict[str, str]) -> int:
+    """Take this job's prepare lock, or report that another prepare already owns it.
+
+    An advisory `flock` is released by the kernel when the process dies, so a controller
+    that stopped waiting can always retry prepare; a controller that repeats a phase the
+    worker is still running is told so instead of racing two checkouts of one directory.
+    """
+
+    path = os.path.join(paths["state"], "prepare.lock")
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        raise RunnerError(
+            f"could not open the prepare lock for this job: {_safe_text(exc)}"
+        ) from exc
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RunnerError(
+                "another prepare for this job is already in progress on this worker"
+            ) from exc
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _acquire_lifecycle_lock(paths: dict[str, str]) -> int | None:
+    """Try to take the per-job lifecycle lock; None when another operation owns it.
+
+    The lock serializes the two operations that must not interleave: creating the job's
+    process, and cancelling a job whose process does not exist yet. It is an advisory
+    `flock`, so it is released by the kernel if the holder dies, and it is only ever held
+    for the length of a claim, never across a checkout or a command.
+    """
+
+    path = paths["lifecycle"]
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        raise RunnerError(f"could not open the lifecycle lock: {_safe_text(exc)}") from exc
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def _claim_start_lock(paths: dict[str, str]) -> None:
+    """Claim this job's single launch slot, recording the process that owns it.
+
+    The identity is what lets a controller prove, later and without guessing, that a
+    launch which never recorded a supervisor can no longer be running. The creation is
+    exclusive, so a repeated launch is always refused rather than duplicated.
+    """
+
+    path = os.path.join(paths["state"], "start.lock")
+    payload = {
+        "schema_version": 1,
+        "pid": os.getpid(),
+        "starttime": _process_starttime(os.getpid()),
+        "started_at": _utc_now(),
+    }
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise RunnerError(
+            "this job was already started; inspect its state instead of starting it again"
+        ) from exc
+    except OSError as exc:
+        raise RunnerError(f"could not claim this job's launch slot: {_safe_text(exc)}") from exc
+    try:
+        os.write(descriptor, (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _safe_text(value: object) -> str:
@@ -388,19 +498,24 @@ def prepare(descriptor: dict[str, Any]) -> None:
     paths = _job_paths(job_directory)
     _ensure_directories(paths)
     _create_input_directories(paths, descriptor.get("input_destinations"))
-    executed = materialize_source(repository, requested, paths["source"])
-    _atomic_write_json(
-        paths["info"],
-        {
-            "schema_version": 1,
-            "job_id": job_id,
-            "name": descriptor.get("name"),
-            "repository": repository,
-            "requested_commit": requested,
-            "executed_commit": executed,
-            "prepared_at": _utc_now(),
-        },
-    )
+    # Serialize prepare per job so a repeated phase can never race an in-flight checkout.
+    prepare_lock = _acquire_prepare_lock(paths)
+    try:
+        executed = materialize_source(repository, requested, paths["source"])
+        _atomic_write_json(
+            paths["info"],
+            {
+                "schema_version": 1,
+                "job_id": job_id,
+                "name": descriptor.get("name"),
+                "repository": repository,
+                "requested_commit": requested,
+                "executed_commit": executed,
+                "prepared_at": _utc_now(),
+            },
+        )
+    finally:
+        os.close(prepare_lock)
     emit("executed_commit", executed)
     emit("job_directory", job_directory)
     emit("source_directory", paths["source"])
@@ -507,17 +622,20 @@ def start(descriptor: dict[str, Any]) -> None:
     if timeout is not None and (not isinstance(timeout, int) or timeout <= 0):
         raise RunnerInputError("descriptor timeout_seconds must be a positive integer")
 
-    # Acquire this before checkout: a repeated start must not force-checkout the
-    # source tree of a command that is already running.
-    try:
-        lock = os.open(
-            os.path.join(paths["state"], "start.lock"), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-        )
-    except FileExistsError as exc:
+    # Phase one: claim the launch slot before the checkout, so a repeated start cannot
+    # force-checkout the source tree of a command that is already running, and a
+    # cancellation that has already been established excludes this launch outright.
+    lock = _acquire_lifecycle_lock(paths)
+    if lock is None:
         raise RunnerError(
-            "this job was already started; inspect its state instead of starting it again"
-        ) from exc
-    os.close(lock)
+            f"another lifecycle operation for this job {LIFECYCLE_BUSY_MARKER}; retry"
+        )
+    try:
+        if os.path.lexists(paths["cancelled"]):
+            raise RunnerError(f"this job {CANCELLED_BEFORE_START_MARKER}; it will not be launched")
+        _claim_start_lock(paths)
+    finally:
+        os.close(lock)
 
     executed = materialize_source(repository, requested, paths["source"])
     working_directory = paths["source"]
@@ -548,38 +666,51 @@ def start(descriptor: dict[str, Any]) -> None:
         }
     )
 
-    _atomic_write_json(paths["descriptor"], _non_secret_descriptor(descriptor))
-    log_descriptor = os.open(paths["log"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    # Phase two: re-check the cancellation decision under the lock and create the process
+    # inside the same critical section, so a cancellation can only ever observe "no launch
+    # yet, and this one is now excluded" or "the launch already happened".
+    lock = _acquire_lifecycle_lock(paths)
+    if lock is None:
+        raise RunnerError(
+            f"another lifecycle operation for this job {LIFECYCLE_BUSY_MARKER}; retry"
+        )
     try:
-        process = subprocess.Popen(
-            [
-                sys.executable or "python3",
-                os.path.abspath(__file__),
-                "__supervise__",
-                job_directory,
-            ],
-            cwd=working_directory,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=log_descriptor,
-            stderr=log_descriptor,
-            close_fds=True,
-            start_new_session=True,
+        if os.path.lexists(paths["cancelled"]):
+            raise RunnerError(f"this job {CANCELLED_BEFORE_START_MARKER}; no process was created")
+        _atomic_write_json(paths["descriptor"], _non_secret_descriptor(descriptor))
+        log_descriptor = os.open(paths["log"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable or "python3",
+                    os.path.abspath(__file__),
+                    "__supervise__",
+                    job_directory,
+                ],
+                cwd=working_directory,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=log_descriptor,
+                stderr=log_descriptor,
+                close_fds=True,
+                start_new_session=True,
+            )
+        finally:
+            os.close(log_descriptor)
+        started_at = _utc_now()
+        _atomic_write_json(
+            paths["pid"],
+            {
+                "supervisor_pid": process.pid,
+                "supervisor_starttime": _process_starttime(process.pid),
+                "child_pid": None,
+                "child_running": False,
+                "started_at": started_at,
+                "executed_commit": executed,
+            },
         )
     finally:
-        os.close(log_descriptor)
-
-    started_at = _utc_now()
-    _atomic_write_json(
-        paths["pid"],
-        {
-            "supervisor_pid": process.pid,
-            "supervisor_starttime": _process_starttime(process.pid),
-            "child_pid": None,
-            "started_at": started_at,
-            "executed_commit": executed,
-        },
-    )
+        os.close(lock)
     emit("pid", process.pid)
     emit("started_at", started_at)
     emit("executed_commit", executed)
@@ -717,13 +848,60 @@ def terminate_group(
         os.close(pidfd)
 
 
+def terminate_job_group(
+    pgid: int,
+    *,
+    expected_starttime: int | None,
+    grace: float = KILL_GRACE_SECONDS,
+) -> bool:
+    """Terminate one job stage's process group, verified against PID reuse.
+
+    The group id is the stage leader's PID. While any member of the group is alive the
+    kernel keeps that number allocated to the group, so a live member is proof that the
+    group is this job's - and if the number has instead been reused by a different process
+    (different start ticks), nothing at all is signalled.
+
+    The recorded start ticks are required. If they are missing, the recorded number cannot
+    be shown to be this job's group at all, and signalling it could kill an unrelated
+    workload; refusing is the only safe answer, because a job that survives is recoverable
+    and an unrelated process that is killed is not.
+    """
+
+    if expected_starttime is None:
+        raise RunnerError(
+            f"refusing to signal process group {pgid}: its recorded identity cannot be "
+            "verified, so it may not be this job's group; nothing was signalled"
+        )
+    observed = _process_starttime(pgid)
+    if observed is not None and observed != expected_starttime:
+        raise RunnerError(
+            f"process group {pgid} was reused by an unrelated process; nothing was signalled"
+        )
+    if observed is not None:
+        # The leader is still alive: use the fully pinned path.
+        terminate_group(pgid, expected_starttime=expected_starttime, grace=grace)
+        return True
+    if not _group_alive(pgid):
+        return False
+    if not _signal_group(pgid, signal.SIGTERM):
+        return False
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if not _group_alive(pgid):
+            return True
+        time.sleep(POLL_SECONDS)
+    if _group_alive(pgid):
+        _signal_group(pgid, signal.SIGKILL)
+    return True
+
+
 def _run_stage(
     argv: list[str],
     *,
     cwd: str,
     timeout: int | None,
-) -> tuple[int, bool, int | None]:
-    """Run one argv stage in its own session and return (exit code, timed out, child pid)."""
+) -> tuple[int, bool, int | None, int | None]:
+    """Run one argv stage in its own session; return exit code, timeout, PID, start ticks."""
 
     process = subprocess.Popen(
         argv,
@@ -733,21 +911,22 @@ def _run_stage(
         start_new_session=True,
         close_fds=True,
     )
-    _record_child_pid(process.pid)
+    starttime = _process_starttime(process.pid)
+    _record_child_pid(process.pid, running=True)
     timed_out = False
     try:
         exit_code = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        terminate_group(process.pid, expected_starttime=_process_starttime(process.pid))
+        terminate_group(process.pid, expected_starttime=starttime)
         try:
             process.wait(timeout=KILL_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
         exit_code = TIMEOUT_EXIT_CODE
-    _record_child_pid(None)
-    return exit_code, timed_out, process.pid
+    _record_child_pid(process.pid, running=False)
+    return exit_code, timed_out, process.pid, starttime
 
 
 def _state_paths_from_environment() -> dict[str, str]:
@@ -757,13 +936,29 @@ def _state_paths_from_environment() -> dict[str, str]:
     return _job_paths(job_directory)
 
 
-def _record_child_pid(child_pid: int | None) -> None:
-    """Publish the current stage's process-group id so cancel can target it exactly."""
+def _record_child_pid(child_pid: int | None, *, running: bool) -> None:
+    """Publish the current stage's process group so cancel and inspection can target it.
+
+    The last stage's identity is kept after the stage exits, because a process group
+    outlives its leader: a descendant that is still running is still this job's process,
+    and its group id is what makes terminating it possible without guessing.
+
+    The recorded start ticks are the proof of that identity, so they are never replaced
+    with "unknown" for the same leader: a leader that has already exited has no start ticks
+    to read any more, and overwriting a verified identity with nothing would make a genuine
+    surviving descendant indistinguishable from an unrelated process group. A different
+    leader - the next stage - has its own identity, so its start ticks are recorded afresh.
+    """
 
     paths = _state_paths_from_environment()
     payload = _read_json(paths["pid"]) or {}
-    payload["child_pid"] = child_pid
-    payload["child_starttime"] = _process_starttime(child_pid) if child_pid else None
+    if child_pid is not None:
+        previous = payload.get("child_pid")
+        payload["child_pid"] = child_pid
+        observed = _process_starttime(child_pid)
+        if observed is not None or previous != child_pid:
+            payload["child_starttime"] = observed
+    payload["child_running"] = running
     _atomic_write_json(paths["pid"], payload)
 
 
@@ -824,11 +1019,16 @@ def supervise(job_directory: str) -> int:
         exit_code = 1
         sys.stdout.write("source HEAD or cleanliness changed before execution; refusing job\n")
         sys.stdout.flush()
+    stages: list[tuple[int, int | None]] = []
     if exit_code == 0 and setup_argv:
         stage = STAGE_SETUP
         sys.stdout.write("---- setup ----\n")
         sys.stdout.flush()
-        exit_code, timed_out, _ = _run_stage(setup_argv, cwd=os.getcwd(), timeout=timeout)
+        exit_code, timed_out, child_pid, child_starttime = _run_stage(
+            setup_argv, cwd=os.getcwd(), timeout=timeout
+        )
+        if child_pid is not None:
+            stages.append((child_pid, child_starttime))
     if exit_code == 0:
         stage = STAGE_COMMAND
         if not _checkout_verified(requested):
@@ -838,7 +1038,40 @@ def supervise(job_directory: str) -> int:
         else:
             sys.stdout.write("---- command ----\n")
             sys.stdout.flush()
-            exit_code, timed_out, _ = _run_stage(argv, cwd=os.getcwd(), timeout=timeout)
+            exit_code, timed_out, child_pid, child_starttime = _run_stage(
+                argv, cwd=os.getcwd(), timeout=timeout
+            )
+            if child_pid is not None:
+                stages.append((child_pid, child_starttime))
+
+    # A command that left background processes behind has not finished: a terminal record
+    # means nothing of this job is still running, so survivors are terminated before the
+    # outcome is written. Their exit does not change the command's own exit status.
+    surviving: list[int] = []
+    for group_pid, group_starttime in stages:
+        if not _group_alive(group_pid):
+            continue
+        sys.stdout.write(f"---- terminating processes that outlived stage group {group_pid} ----\n")
+        sys.stdout.flush()
+        try:
+            terminate_job_group(group_pid, expected_starttime=group_starttime)
+        except RunnerError as exc:
+            sys.stdout.write(f"could not terminate a surviving process group: {exc}\n")
+            sys.stdout.flush()
+        if _group_alive(group_pid):
+            surviving.append(group_pid)
+
+    if surviving:
+        # The bounded termination policy is exhausted and this job's own group is still
+        # alive. Writing finished.json now would claim a clean terminal outcome while the
+        # job is still executing, so no outcome is recorded: the job stays nonterminal and
+        # a later inspection reports the live group for reconciliation.
+        sys.stdout.write(
+            "refusing to record a terminal outcome while this job's own process groups "
+            f"{surviving} are still alive; the job remains running for reconciliation\n"
+        )
+        sys.stdout.flush()
+        return 1
 
     finished_at = _utc_now()
     sys.stdout.write(
@@ -861,35 +1094,154 @@ def supervise(job_directory: str) -> int:
     return 0
 
 
-def inspect(descriptor: dict[str, Any]) -> None:
-    """Report job status from the worker's own recorded evidence."""
+def _read_evidence(paths: dict[str, str]) -> dict[str, Any]:
+    """Read the job's decision-relevant state files as one labelled group."""
 
-    job_directory = _absolute_job_directory(descriptor)
-    paths = _job_paths(job_directory)
-    finished = _read_json(paths["finished"])
-    cancelled = _read_json(paths["cancelled"])
-    pid_state = _read_json(paths["pid"]) or {}
-    supervisor_pid = pid_state.get("supervisor_pid")
+    return {
+        "finished": _read_json(paths["finished"]),
+        "cancelled": _read_json(paths["cancelled"]),
+        "pid": _read_json(paths["pid"]) or {},
+        "start": _read_optional_json(os.path.join(paths["state"], "start.lock")),
+    }
+
+
+def _child_alive(pid_state: dict[str, Any]) -> bool:
+    """Return whether the recorded stage leader itself is still running.
+
+    An exited process stays visible in `/proc` until it is reaped, so its state is checked
+    as well: a zombie holds no execution, and reporting one as live would leave a job that
+    can never finish looking like it is still running.
+    """
+
     child_pid = pid_state.get("child_pid")
-    supervisor_alive = (
-        isinstance(supervisor_pid, int)
-        and _same_process(supervisor_pid, pid_state.get("supervisor_starttime"))
-        and _process_alive(supervisor_pid)
-    )
-    child_alive = (
-        isinstance(child_pid, int)
+    if not isinstance(child_pid, int):
+        return False
+    running = pid_state.get("child_running")
+    if running is None:
+        # A record written before this field existed only carries a live leader.
+        running = True
+    return (
+        bool(running)
         and _same_process(child_pid, pid_state.get("child_starttime"))
         and _process_alive(child_pid)
     )
 
-    if finished is not None:
-        status = STATUS_FINISHED
-    elif cancelled is not None:
-        status = STATUS_CANCELLED
-    elif supervisor_alive or child_alive:
-        status = STATUS_RUNNING
+
+def _process_identity_incomplete(pid_state: dict[str, Any]) -> bool:
+    """Whether a recorded child PID lacks the start ticks that identify it.
+
+    A record written before start ticks were published cannot prove that the process it
+    names is still that process, so neither cancelling it nor declaring that nothing is
+    running is safe from it.
+    """
+
+    child_pid = pid_state.get("child_pid")
+    return isinstance(child_pid, int) and not isinstance(pid_state.get("child_starttime"), int)
+
+
+def _live_job_group(pid_state: dict[str, Any]) -> int | None:
+    """Return the job's own process group when a member of it is still alive.
+
+    The group id is the recorded stage leader's PID. A live member proves the group is
+    this job's, because the kernel keeps that number allocated to the group for as long as
+    any member exists; a reused number with different start ticks is never reported.
+
+    The recorded start ticks are required, not optional. Without them a numeric group
+    cannot be distinguished from an unrelated process group that happens to carry the same
+    id, so the answer is "no group I can prove is this job's" rather than a guess. That
+    only ever makes the runner more conservative: an unprovable group is reported as
+    unknown, and it is never signalled.
+    """
+
+    child_pid = pid_state.get("child_pid")
+    if not isinstance(child_pid, int) or child_pid <= 0:
+        return None
+    recorded = pid_state.get("child_starttime")
+    if not isinstance(recorded, int):
+        return None
+    observed = _process_starttime(child_pid)
+    if observed is not None and observed != recorded:
+        return None
+    return child_pid if _group_alive(child_pid) else None
+
+
+def inspect(descriptor: dict[str, Any]) -> None:
+    """Report job status from the worker's own recorded evidence.
+
+    The state files and the process table change independently, so the report is derived
+    from an ordered, bounded snapshot: the outcome is read first, the process state is
+    observed next, and anything that appeared while the process state was being observed is
+    re-read before a "nothing is recorded and nothing is running" conclusion is reported.
+    A conclusion of that kind is never reached from one inconsistent read, because the
+    controller treats it as terminal evidence.
+    """
+
+    job_directory = _absolute_job_directory(descriptor)
+    paths = _job_paths(job_directory)
+
+    supervisor_pid: Any = None
+    supervisor_alive = False
+    child_alive = False
+    group_pid = _live_job_group(_read_json(paths["pid"]) or {})
+    status = STATUS_UNKNOWN
+    evidence: dict[str, Any] = {}
+    for _pass in range(2):
+        evidence = _read_evidence(paths)
+        finished = evidence["finished"]
+        cancelled = evidence["cancelled"]
+        if finished is not None:
+            status = STATUS_FINISHED
+            break
+        if cancelled is not None:
+            status = STATUS_CANCELLED
+            break
+        pid_state = evidence["pid"]
+        supervisor_pid = pid_state.get("supervisor_pid")
+        supervisor_alive = (
+            isinstance(supervisor_pid, int)
+            and _same_process(supervisor_pid, pid_state.get("supervisor_starttime"))
+            and _process_alive(supervisor_pid)
+        )
+        child_alive = _child_alive(pid_state)
+        if supervisor_alive or child_alive:
+            status = STATUS_RUNNING
+            break
+        group_pid = _live_job_group(pid_state)
+        if group_pid is not None:
+            # A descendant that outlived its leader is still this job's execution.
+            status = STATUS_RUNNING
+            break
+        # Nothing is running and nothing terminal is recorded. Re-read the evidence before
+        # the controller may treat that as the final word: an outcome or launch record
+        # written while the process state was observed is newer than what was read first.
+        if _read_evidence(paths) == evidence:
+            status = STATUS_UNKNOWN
+            break
     else:
         status = STATUS_UNKNOWN
+
+    finished = evidence.get("finished")
+    cancelled = evidence.get("cancelled")
+    pid_state = evidence.get("pid") or {}
+
+    # Preparation evidence: which parts of the workspace exist and whether a launch is
+    # still in progress. Reported separately from `status` so a controller can tell "the
+    # command never started" apart from "the workspace is gone".
+    job_directory_exists = os.path.isdir(job_directory)
+    info = _read_json(paths["info"])
+    prepared = (
+        job_directory_exists
+        and isinstance(info, dict)
+        and info.get("job_id") == _job_id(descriptor)
+    )
+    start_lock = evidence.get("start") or {}
+    started = os.path.lexists(os.path.join(paths["state"], "start.lock"))
+    launch_alive: bool | None = None
+    if started and not isinstance(supervisor_pid, int):
+        launch_pid = start_lock.get("pid")
+        launch_starttime = start_lock.get("starttime")
+        if isinstance(launch_pid, int) and isinstance(launch_starttime, int):
+            launch_alive = _same_process(launch_pid, launch_starttime)
 
     log_bytes = 0
     try:
@@ -909,10 +1261,21 @@ def inspect(descriptor: dict[str, Any]) -> None:
     emit("stage", finished.get("stage") if finished else "")
     emit("timed_out", "true" if finished and finished.get("timed_out") else "false")
     emit("cancelled", "true" if cancelled is not None else "false")
+    emit(
+        "pre_start",
+        "true" if cancelled is not None and cancelled.get("pre_start") is True else "false",
+    )
     emit("started_at", (finished or cancelled or pid_state).get("started_at") or "")
     emit("finished_at", (finished or cancelled or {}).get("finished_at") or "")
     emit("executed_commit", executed or "")
     emit("log_bytes", log_bytes)
+    emit("job_directory_exists", "true" if job_directory_exists else "false")
+    emit("prepared", "true" if prepared else "false")
+    emit("started", "true" if started else "false")
+    if launch_alive is not None:
+        emit("launch_alive", "true" if launch_alive else "false")
+    if group_pid is not None:
+        emit("group_pid", group_pid)
 
 
 def logs(descriptor: dict[str, Any]) -> None:
@@ -938,26 +1301,65 @@ def logs(descriptor: dict[str, Any]) -> None:
 
 
 def cancel(descriptor: dict[str, Any]) -> None:
-    """Terminate the job's own process tree without touching anything else."""
+    """Terminate the job's own process tree, or make a later launch impossible.
+
+    Creating the job's process and cancelling a job that has no process yet are the same
+    decision made from two sides, so both take the per-job lifecycle lock. Whichever takes
+    it first wins outright: a cancellation that finds no launch slot records a durable
+    cancellation (which every later launch refuses), and a launch that has already created
+    its process is instead terminated through the identity it recorded. Neither outcome can
+    leave a command running after the controller recorded CANCELLED.
+    """
 
     job_directory = _absolute_job_directory(descriptor)
     paths = _job_paths(job_directory)
+    if not os.path.isdir(paths["state"]):
+        # Nothing was ever prepared here, so nothing can be launched: a launch requires the
+        # workspace this job would have created.
+        _emit_pre_start_cancellation()
+        return
+    lock = _acquire_lifecycle_lock(paths)
+    if lock is None:
+        raise RunnerError(
+            f"another lifecycle operation for this job {LIFECYCLE_BUSY_MARKER}; retry"
+        )
+    try:
+        _cancel_locked(descriptor, paths, job_directory)
+    finally:
+        os.close(lock)
+
+
+def _emit_pre_start_cancellation() -> None:
+    emit("cancelled", "true")
+    emit("already_finished", "false")
+    emit("pre_start", "true")
+    emit("pid", "")
+
+
+def _cancel_locked(
+    descriptor: dict[str, Any],
+    paths: dict[str, str],
+    job_directory: str,
+) -> None:
+    """Decide and apply one cancellation while holding the lifecycle lock."""
+
     pid_state = _read_json(paths["pid"]) or {}
     finished = _read_json(paths["finished"])
     supervisor_pid = pid_state.get("supervisor_pid")
     child_pid = pid_state.get("child_pid")
-    child_alive = (
-        isinstance(child_pid, int)
-        and _same_process(child_pid, pid_state.get("child_starttime"))
-        and _process_alive(child_pid)
-    )
     supervisor_alive = (
         isinstance(supervisor_pid, int)
         and _same_process(supervisor_pid, pid_state.get("supervisor_starttime"))
         and _process_alive(supervisor_pid)
     )
+    child_alive = _child_alive(pid_state)
+    group_pid = _live_job_group(pid_state)
+    start_lock = _read_optional_json(os.path.join(paths["state"], "start.lock"))
+    started = os.path.lexists(os.path.join(paths["state"], "start.lock"))
 
-    if finished is not None and not child_alive:
+    if finished is not None and group_pid is None:
+        # The outcome is recorded and nothing of this job's process tree is left: the
+        # supervisor may still be winding down, which is not something to cancel.
         emit("cancelled", "false")
         emit("already_finished", "true")
         emit("exit_code", finished.get("exit_code"))
@@ -967,13 +1369,43 @@ def cancel(descriptor: dict[str, Any]) -> None:
     if _read_json(paths["cancelled"]) is not None:
         emit("cancelled", "true")
         emit("already_finished", "false")
+        emit("pre_start", "false")
         emit("pid", supervisor_pid if isinstance(supervisor_pid, int) else "")
         return
-    if not child_alive and not supervisor_alive:
-        raise RunnerError(
-            "no process with this job's recorded identity is running; inspect job status "
-            "before claiming cancellation"
-        )
+
+    if not started and not child_alive and group_pid is None and not supervisor_alive:
+        # No launch slot was ever claimed and nothing is running: cancelling here is what
+        # makes every later launch refuse.
+        _record_pre_start_cancellation(paths)
+        return
+
+    if started and not supervisor_alive and not child_alive and group_pid is None:
+        if _process_identity_incomplete(pid_state):
+            # A child PID is recorded without the start ticks that would prove whether it
+            # is still that process. Recording a pre-start cancellation here would claim
+            # that no command ran while a recorded process might still be running, so the
+            # cancellation is reported as unestablished instead of guessed.
+            raise RunnerError(
+                f"refusing to cancel job at {paths['pid']}: its recorded process identity "
+                "cannot be verified, so whether a command is running is unknown"
+            )
+        launch_pid = start_lock.get("pid")
+        launch_starttime = start_lock.get("starttime")
+        if (
+            isinstance(launch_pid, int)
+            and isinstance(launch_starttime, int)
+            and _same_process(launch_pid, launch_starttime)
+        ):
+            # The launch is in flight and will create the process itself; the operator
+            # retries cancellation against the launched process instead of racing it.
+            emit("cancelled", "false")
+            emit("already_finished", "false")
+            emit("launch_in_progress", "true")
+            emit("pid", "")
+            return
+        # The launch is gone and never recorded a process, so it can never run one.
+        _record_pre_start_cancellation(paths)
+        return
 
     if child_alive:
         if not _is_our_child(child_pid, pid_state.get("child_starttime")):
@@ -982,6 +1414,9 @@ def cancel(descriptor: dict[str, Any]) -> None:
                 "recorded command"
             )
         terminate_group(child_pid, expected_starttime=pid_state.get("child_starttime"))
+    elif group_pid is not None:
+        # The stage leader is gone but a descendant of the job's own process group is not.
+        terminate_job_group(group_pid, expected_starttime=pid_state.get("child_starttime"))
     if (
         supervisor_alive
         and _same_process(supervisor_pid, pid_state.get("supervisor_starttime"))
@@ -1000,7 +1435,7 @@ def cancel(descriptor: dict[str, Any]) -> None:
                         f"refusing to signal process {supervisor_pid}: it does not match "
                         "this job's recorded supervisor"
                     )
-                if not child_alive:
+                if not child_alive and group_pid is None:
                     with suppress(ProcessLookupError):
                         signal.pidfd_send_signal(supervisor_fd, signal.SIGTERM)
                     deadline = time.monotonic() + KILL_GRACE_SECONDS
@@ -1014,11 +1449,27 @@ def cancel(descriptor: dict[str, Any]) -> None:
     cancelled_at = _utc_now()
     _atomic_write_json(
         paths["cancelled"],
-        {"cancelled_at": cancelled_at, "exit_code": CANCELLED_EXIT_CODE},
+        {"cancelled_at": cancelled_at, "exit_code": CANCELLED_EXIT_CODE, "pre_start": False},
     )
     emit("cancelled", "true")
     emit("already_finished", "false")
+    emit("pre_start", "false")
     emit("pid", supervisor_pid if isinstance(supervisor_pid, int) else "")
+    emit("cancelled_at", cancelled_at)
+
+
+def _record_pre_start_cancellation(paths: dict[str, str]) -> None:
+    """Record the durable decision that this job must never be launched."""
+
+    cancelled_at = _utc_now()
+    _atomic_write_json(
+        paths["cancelled"],
+        {"cancelled_at": cancelled_at, "exit_code": CANCELLED_EXIT_CODE, "pre_start": True},
+    )
+    emit("cancelled", "true")
+    emit("already_finished", "false")
+    emit("pre_start", "true")
+    emit("pid", "")
     emit("cancelled_at", cancelled_at)
 
 

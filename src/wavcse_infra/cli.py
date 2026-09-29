@@ -1114,6 +1114,10 @@ def submit_job(
 
     The worker must already exist and be READY. Phase 6 never creates, bootstraps,
     starts, or destroys a worker implicitly, and it never reruns a failed job.
+
+    If the controller stops watching a preparation step that may still be running, the
+    job is left PREPARING with `reconciliation_required` and this command exits 1: the
+    job was neither failed nor lost, and `infra job status` reconciles it.
     """
 
     settings = _load_cli_settings(_context(context))
@@ -1142,6 +1146,15 @@ def submit_job(
     except InfraError as exc:
         _job_failure(exc, job_id=None)
     _print_job(record, json_output=json_output)
+    if record.reconciliation_required:
+        typer.echo(
+            f"Job {record.job_id} is {record.state.value} on RunPod worker {record.worker_id}: the "
+            "controller stopped watching a worker phase that may still be running. The job was "
+            "neither failed nor lost, and it is never retried implicitly; run "
+            f"`infra job status {record.job_id}` to reconcile it.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     if record.state in {JobState.FAILED, JobState.CANCELLED}:
         raise typer.Exit(code=1)
 
@@ -1154,7 +1167,14 @@ def status_job(
         bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
     ] = False,
 ) -> None:
-    """Reconcile one job with real worker evidence and report its durable state."""
+    """Reconcile one job with real worker evidence and report its durable state.
+
+    A job that is still PREPARING is driven forward from worker evidence, because every
+    preparation step is idempotent: this may resume an interrupted input materialization
+    (verifying anything already on the worker before trusting it) and start the command
+    that never started. A job whose outcome cannot be determined stays PREPARING with a
+    warning instead of being reported as failed.
+    """
 
     settings = _load_cli_settings(_context(context))
     canonical = _canonical_job_id(job_id)
@@ -1234,7 +1254,13 @@ def cancel_job(
         bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
     ] = False,
 ) -> None:
-    """Cancel one running job process on its worker; the worker itself is untouched."""
+    """Cancel one running job process on its worker; the worker itself is untouched.
+
+    A job whose command never started is cancelled from the controller's own decision; a
+    job with a live recorded process is cancelled through the worker runner's identity
+    check. Input materialization that is still draining on the worker is reported, never
+    silently assumed to have stopped.
+    """
 
     settings = _load_cli_settings(_context(context))
     canonical = _canonical_job_id(job_id)
@@ -1350,6 +1376,9 @@ def _print_job(record: JobRecord, *, json_output: bool) -> None:
         ("Started", record.started_at.isoformat() if record.started_at else None),
         ("Finished", record.finished_at.isoformat() if record.finished_at else None),
         ("Remote status", record.remote_status),
+        ("Preparation phase", record.preparation_phase),
+        ("Interrupted", record.interrupted_at.isoformat() if record.interrupted_at else None),
+        ("Reconciliation required", "yes" if record.reconciliation_required else "no"),
         ("Reason", record.state_reason),
         ("Failure", record.failure_reason),
         ("Worker absent", "yes" if record.worker_absent else "no"),

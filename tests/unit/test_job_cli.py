@@ -19,6 +19,7 @@ from typer.testing import CliRunner
 
 from wavcse_infra import cli
 from wavcse_infra.cli import app
+from wavcse_infra.errors import ArtifactTransferInProgressError
 from wavcse_infra.jobs.execution import RemoteJobStatus
 from wavcse_infra.jobs.models import JobState
 
@@ -399,3 +400,95 @@ def test_fake_transfer_and_storage_are_untouched_by_status_only_flows(cli_job_co
 
     # The valid specification declares no outputs, so nothing may be uploaded.
     assert context.transfer.uploads == []
+
+
+def _interrupted_context(tmp_path: Path, transfer: FakeTransfer):
+    storage = FakeStorage()
+    storage.objects["embeddings/v1/probe.tar"] = 4096
+    context = job_context(
+        tmp_path,
+        transfer=transfer,
+        storage=storage,
+        environ={"MLFLOW_TRACKING_PASSWORD": "secret-value"},
+    )
+    return context
+
+
+def _interrupting_spec(tmp_path: Path) -> Path:
+    document = job_spec_document(
+        inputs=[
+            {
+                "artifact": "embeddings/v1/probe.tar",
+                "destination": "probe.tar",
+                "sha256": "e" * 64,
+            }
+        ]
+    )
+    return write_spec(tmp_path / "job.json", document)
+
+
+def test_submit_reports_an_interrupted_preparation_without_claiming_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transfer = FakeTransfer()
+    transfer.download_interrupts = 1
+    context = _interrupted_context(tmp_path, transfer)
+    monkeypatch.setattr(cli, "_job_context", lambda client, settings: context)
+    monkeypatch.setattr(cli, "_job_store", lambda: context.job_store)
+    monkeypatch.setattr(cli, "_optional_storage", lambda settings: context.storage)
+    spec_path = _interrupting_spec(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["job", "submit", str(spec_path), "--worker", "pod-123"],
+        obj=cli.CliContext(config_path=None, cli_overrides={}, verbose=False),
+    )
+
+    output = _strip_ansi(result.output)
+    assert result.exit_code == 1
+    assert "State: PREPARING" in output
+    assert "Reconciliation required: yes" in output
+    assert "Preparation phase: materializing_inputs" in output
+    assert "neither failed nor lost" in output
+    stored = context.job_store.list_records()[0]
+    assert stored.state is JobState.PREPARING
+    assert stored.failure_reason is None
+
+
+def test_status_reports_preparation_evidence_and_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transfer = FakeTransfer()
+    transfer.download_error = ArtifactTransferInProgressError(
+        "another transfer for the destination is already in progress on this worker"
+    )
+    context = _interrupted_context(tmp_path, transfer)
+    monkeypatch.setattr(cli, "_job_context", lambda client, settings: context)
+    monkeypatch.setattr(cli, "_job_store", lambda: context.job_store)
+    monkeypatch.setattr(cli, "_optional_storage", lambda settings: context.storage)
+    spec_path = _interrupting_spec(tmp_path)
+    runner.invoke(
+        app,
+        ["job", "submit", str(spec_path), "--worker", "pod-123"],
+        obj=cli.CliContext(config_path=None, cli_overrides={}, verbose=False),
+    )
+    job_id = next(iter(context.job_store.list_records())).job_id
+    context.executor.status = RemoteJobStatus(
+        status="unknown",
+        job_directory_exists=True,
+        prepared=True,
+        started=False,
+    )
+
+    result = runner.invoke(
+        app,
+        ["job", "status", job_id],
+        obj=cli.CliContext(config_path=None, cli_overrides={}, verbose=False),
+    )
+
+    output = _strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "State: PREPARING" in output
+    assert "Reconciliation required: yes" in output
+    assert "Preparation phase: materializing_inputs" in output
+    assert "reconciliation required" in output
