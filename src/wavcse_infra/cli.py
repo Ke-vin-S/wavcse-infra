@@ -1736,6 +1736,63 @@ def cancel_job(
     _print_job(record, json_output=False)
 
 
+@job_app.command("list")
+def list_jobs(
+    context: typer.Context,
+    state: Annotated[
+        JobState | None,
+        typer.Option("--state", case_sensitive=False, help="Only jobs in this state."),
+    ] = None,
+    worker: Annotated[
+        str | None,
+        typer.Option("--worker", help="Only jobs recorded against this exact worker ID."),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """List recorded jobs, oldest first, without touching a provider or a worker.
+
+    Read-only: it reads the durable controller-local records only, so it works
+    when a worker is absent and never reconciles, resumes, or cancels anything.
+    An automation caller uses it to rediscover job identities after a restart,
+    which is otherwise impossible because a job ID is only returned by submit.
+    """
+
+    try:
+        records = _job_store().list_records()
+    except StateError as exc:
+        _job_failure(exc, job_id=None)
+    if state is not None:
+        records = [record for record in records if record.state is state]
+    if worker is not None:
+        records = [record for record in records if record.worker_id == worker]
+    if json_output:
+        _print_json([record.model_dump(mode="json") for record in records])
+        return
+    if not records:
+        typer.echo(
+            "No recorded jobs."
+            if state is None and worker is None
+            else "No recorded jobs match the filter."
+        )
+        return
+    typer.echo("JOB ID\tSTATE\tWORKER\tEXIT\tNAME\tCREATED")
+    for record in records:
+        typer.echo(
+            "\t".join(
+                (
+                    record.job_id,
+                    record.state.value,
+                    record.worker_id,
+                    "-" if record.exit_code is None else str(record.exit_code),
+                    record.name,
+                    record.created_at.isoformat(),
+                )
+            )
+        )
+
+
 def _load_job_spec_file(path: Path) -> JobSpec:
     try:
         text = path.read_text(encoding="utf-8")
