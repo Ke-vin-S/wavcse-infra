@@ -39,12 +39,25 @@ Usage on the worker:
                        [--expected-sha256 HEX] [--concurrency N] [--overwrite]
     python3 - upload --source <absolute-path>
     python3 - verify --destination <absolute-path> [--expected-size N] [--expected-sha256 HEX]
+    python3 - cache-materialize --root <absolute-cache-root> --expected-sha256 HEX
+                                [--expected-size N] --destination <absolute-path> [--overwrite]
+    python3 - cache-populate --root <absolute-cache-root> --source <absolute-path>
+                             --expected-sha256 HEX [--expected-size N] [--artifact KEY]
+    python3 - cache-stats --root <absolute-cache-root>
 
 `verify` never downloads and never writes: it reports the size and SHA-256 of an artifact
 that is already placed, fails if it is absent, incomplete, or mismatched, and reports
 whether another transfer currently holds the destination lock. A controller that stopped
 waiting for a download uses it to decide, from worker evidence, whether the transfer
 finished, is still running, or died.
+
+The `cache-*` operations manage the rebuildable content-addressed cache that lives on a
+mounted network volume, so a disposable worker can materialize a declared input without
+downloading it again. None of them takes a presigned URL: bytes only ever enter the cache
+from a file the canonical download already verified, so no bearer material is ever written
+to persistent storage. The cache is an optimization over canonical storage, never a source
+of truth: an entry is used only when its recorded digest, recorded size, and actual bytes
+all agree with the request, and anything else is quarantined and rebuilt.
 
 Result protocol on stdout, one tab-separated key per line:
 
@@ -55,7 +68,21 @@ Result protocol on stdout, one tab-separated key per line:
     size_bytes	21474836480
     sha256	<64 lowercase hexadecimal characters>
 
-Failures write `wavcse_transfer_error	<redacted message>` to stderr and exit nonzero.
+`cache-stats` reports facts instead of one artifact, so it replaces the last three lines:
+
+    wavcse_transfer_schema	1
+    operation	cache-stats
+    status	ok
+    root	/workspace/cache
+    entries	4
+    cached_bytes	17179869184
+    staging_bytes	0
+    unverified_entries	0
+    marker_schema_version	1
+
+Failures write `wavcse_transfer_error	<redacted message>` to stderr and exit nonzero. A
+cache miss is an expected outcome rather than a failure: it exits with status
+`CACHE_MISS_EXIT_CODE` so a caller may fall through to the canonical download.
 """
 
 import argparse
@@ -68,6 +95,7 @@ import re
 import secrets
 import stat
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -150,6 +178,47 @@ _PROC_FD_ROOT = "/proc/self/fd"
 _DELETE_CHARACTER = 127
 _PRINTABLE_ASCII_START = 32
 
+# --- Rebuildable artifact cache on a mounted network volume -------------------------------
+#
+# Layout beneath the cache root (the mount point of a network volume):
+#
+#   cache.json                                  marker: schema version and purpose
+#   artifacts/sha256/<first-two-hex>/<digest>/content
+#   artifacts/sha256/<first-two-hex>/<digest>/metadata.json
+#   staging/                                    in-progress work; safe to delete
+#
+# An entry directory exists only after a complete, verified artifact has been renamed into
+# place, so a partially written artifact can never be mistaken for a complete one. The
+# digest is the identity, never a filename, so two artifacts with the same name and
+# different content occupy different directories and can never collide.
+CACHE_SCHEMA_VERSION = "1"
+CACHE_MARKER_NAME = "cache.json"
+CACHE_MARKER_PURPOSE = "rebuildable artifact cache; canonical storage is S3"
+CACHE_ARTIFACTS_RELATIVE = "artifacts/sha256"
+CACHE_STAGING_RELATIVE = "staging"
+CACHE_ENTRY_CONTENT_NAME = "content"
+CACHE_ENTRY_METADATA_NAME = "metadata.json"
+CACHE_ENTRY_METADATA_SCHEMA_VERSION = 1
+CACHE_MATERIALIZE_OPERATION = "cache-materialize"
+CACHE_POPULATE_OPERATION = "cache-populate"
+CACHE_STATS_OPERATION = "cache-stats"
+CACHE_STATS_FIELDS = (
+    "root",
+    "entries",
+    "cached_bytes",
+    "staging_bytes",
+    "unverified_entries",
+    "marker_schema_version",
+)
+# A miss is ordinary control flow - the caller falls through to the canonical download - so
+# it needs an exit status that cannot be confused with a real failure.
+CACHE_MISS_EXIT_CODE = 3
+# Markers are the machine-readable part of the sanitized error line, imported by the
+# controller so both sides agree on how an outcome is classified.
+CACHE_MISS_MARKER = "no verified cache entry for this artifact digest"
+CACHE_CORRUPT_MARKER = "cache entry contradicted its recorded identity and was quarantined"
+CACHE_ROOT_MISSING_MARKER = "cache root is not an available directory"
+
 
 class TransferError(Exception):
     """Base class for worker-side transfer failures with user-facing messages."""
@@ -161,6 +230,26 @@ class TransferInputError(TransferError):
 
 class TransferVerificationError(TransferError):
     """Raised when a transferred artifact fails its size or checksum requirement."""
+
+
+class CacheMissError(TransferError):
+    """Raised when the cache holds no verified entry for the requested artifact.
+
+    This is an expected outcome, not a failure: the caller downloads from canonical storage
+    instead. It exists as a type so the exit status and marker can say so unambiguously.
+    """
+
+
+class CacheIntegrityFailure(TransferError):
+    """Raised when a cache entry's bytes contradict the identity it claims.
+
+    The entry is quarantined before this is raised, so a corrupt entry can never be accepted
+    and can never wedge every later lookup for the same digest.
+    """
+
+
+class CacheRootError(TransferInputError):
+    """Raised when the cache root is missing, unsafe, or not usable as a directory."""
 
 
 class _RetryableRangeError(TransferError):
@@ -1329,6 +1418,165 @@ def upload(
     return {"path": origin, "size_bytes": str(size), "sha256": digest}
 
 
+def cache_materialize(
+    root: str,
+    destination: str,
+    *,
+    expected_sha256: str,
+    expected_size: int | None = None,
+    overwrite: bool = False,
+) -> dict[str, str]:
+    """Place one artifact at a destination from a verified cache entry, never from the name.
+
+    The entry's recorded identity, recorded size, and actual bytes must all agree with the
+    request before a single byte is copied. The copy is then verified again as it is written
+    and placed atomically through the same inode-anchored path a canonical download uses, so
+    a cache hit is exactly as strong a guarantee as a fresh download. A cache that cannot
+    satisfy that is reported as a miss, and the caller downloads instead.
+    """
+
+    origin = validate_worker_path(destination, label="destination")
+    digest = _required_sha256(expected_sha256, operation="cache-materialize")
+    root_directory = _require_cache_root(root)
+    content, _size = _verified_cache_entry(
+        root_directory,
+        digest,
+        expected_size=expected_size,
+    )
+    # One destination has one writer, for every transport, and an existing destination is
+    # refused rather than replaced on a guess. A cache hit must obey the same rules as a
+    # download, otherwise the two paths would disagree about a destination they share.
+    lock = _acquire_destination_lock(origin)
+    try:
+        _require_destination_absent(origin, overwrite)
+        staging = f"{origin}{_PARTIAL_SUFFIX}-{os.getpid()}-{secrets.token_hex(6)}"
+        descriptor = os.open(
+            staging,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            _validate_staging_file(descriptor, staging)
+            copied_size, copied_digest = _copy_verified(content, descriptor)
+            if copied_digest != digest:
+                # The entry changed underneath the copy. That is a cache integrity event, not
+                # an artifact failure: quarantine it so the next attempt rebuilds from
+                # canonical storage instead of failing this artifact.
+                _quarantine_cache_entry(root_directory, os.path.dirname(content), digest)
+                raise CacheIntegrityFailure(
+                    f"{CACHE_CORRUPT_MARKER}: the cached artifact for {digest} changed while "
+                    "it was copied"
+                )
+            _place_staging(staging, descriptor, origin, overwrite)
+        finally:
+            os.close(descriptor)
+            _remove_quietly(staging)
+    finally:
+        os.close(lock)
+    return {"path": origin, "size_bytes": str(copied_size), "sha256": copied_digest}
+
+
+def cache_populate(
+    root: str,
+    source: str,
+    *,
+    expected_sha256: str,
+    expected_size: int | None = None,
+    artifact: str | None = None,
+) -> dict[str, str]:
+    """Publish one already-downloaded artifact into the cache, atomically and idempotently.
+
+    The artifact is copied into `staging/`, verified as it is copied, described by a metadata
+    document that records the identity it satisfied, and only then renamed into its final
+    digest-addressed directory in one step. A concurrent writer that published first wins:
+    the loser verifies the winner's entry and reports it rather than replacing anything. This
+    is why two writers can never produce a falsely complete artifact, and why a partial
+    artifact can never appear at an entry path.
+    """
+
+    digest = _required_sha256(expected_sha256, operation="cache-populate")
+    root_directory = _require_cache_root(root)
+    source_path = validate_worker_path(source, label="populate source")
+    entry_directory = _cache_prefix_directory(root_directory, digest)
+
+    existing = _adoptable_cache_entry(root_directory, digest, expected_size=expected_size)
+    if existing is not None:
+        return {"path": entry_directory, "size_bytes": str(existing[1]), "sha256": digest}
+
+    staging_root = _cache_staging_root(root_directory)
+    stage_directory = tempfile.mkdtemp(prefix=f"populate-{digest[:12]}-", dir=staging_root)
+    try:
+        content_path = os.path.join(stage_directory, CACHE_ENTRY_CONTENT_NAME)
+        size, copied_digest = _copy_source_into(source_path, content_path)
+        if copied_digest != digest:
+            raise TransferVerificationError(
+                f"the artifact at {source_path!r} hashes to {copied_digest}, but {digest} was "
+                "recorded for it; nothing was published to the cache"
+            )
+        if expected_size is not None and size != expected_size:
+            raise TransferVerificationError(
+                f"the artifact at {source_path!r} is {size} bytes, but {expected_size} bytes "
+                "were recorded for it; nothing was published to the cache"
+            )
+        _write_cache_entry_metadata(
+            stage_directory,
+            digest=digest,
+            size=size,
+            artifact=artifact,
+        )
+        _fsync_directory(stage_directory)
+        # Re-validate immediately before publishing: the copy above is the longest window in
+        # which a symbolic link could have replaced one of the path components.
+        entry_directory = _cache_entry_directory(root_directory, digest)
+        try:
+            os.rename(stage_directory, entry_directory)
+        except OSError as exc:
+            adopted = _adoptable_cache_entry(root_directory, digest, expected_size=expected_size)
+            if adopted is None:
+                raise CacheRootError(
+                    f"could not publish the cache entry for {digest}: {_safe_text(exc)}"
+                ) from exc
+            return {"path": entry_directory, "size_bytes": str(adopted[1]), "sha256": digest}
+        stage_directory = ""
+        _fsync_directory(os.path.dirname(entry_directory))
+        _write_cache_marker(root_directory)
+        return {"path": entry_directory, "size_bytes": str(size), "sha256": digest}
+    finally:
+        if stage_directory:
+            _remove_tree_no_follow(stage_directory)
+
+
+def cache_stats(root: str) -> dict[str, str]:
+    """Report the cache's recorded contents without hashing a byte.
+
+    Entries are counted from their metadata documents, which is why this is fast even for a
+    full volume; the bytes are re-verified whenever an entry is actually used. An entry whose
+    metadata is missing or unreadable is counted separately instead of being reported as
+    usable.
+    """
+
+    root_directory = _require_cache_root(root)
+    entries = 0
+    cached_bytes = 0
+    unverified = 0
+    artifacts_root = _cache_artifacts_root(root_directory)
+    for entry_directory in _cache_entry_directories(artifacts_root):
+        recorded = _recorded_cache_entry_size(entry_directory)
+        if recorded is None:
+            unverified += 1
+            continue
+        entries += 1
+        cached_bytes += recorded
+    return {
+        "root": root_directory,
+        "entries": str(entries),
+        "cached_bytes": str(cached_bytes),
+        "staging_bytes": str(_staging_bytes(os.path.join(root_directory, CACHE_STAGING_RELATIVE))),
+        "unverified_entries": str(unverified),
+        "marker_schema_version": _cache_marker_version(root_directory) or "absent",
+    }
+
+
 def _open_upload_source(origin: str, allowed_root: str | None):
     """Open a job output through directory fds, rejecting every symlink component."""
 
@@ -1379,6 +1627,27 @@ def main(
                 expected_size=options.expected_size,
                 expected_sha256=options.expected_sha256,
             )
+            text = _render(operation, fields)
+        elif operation == CACHE_STATS_OPERATION:
+            text = _render_cache_facts(operation, cache_stats(options.root))
+        elif operation == CACHE_MATERIALIZE_OPERATION:
+            fields = cache_materialize(
+                options.root,
+                options.destination,
+                expected_sha256=options.expected_sha256,
+                expected_size=options.expected_size,
+                overwrite=options.overwrite,
+            )
+            text = _render(operation, fields)
+        elif operation == CACHE_POPULATE_OPERATION:
+            fields = cache_populate(
+                options.root,
+                options.source,
+                expected_sha256=options.expected_sha256,
+                expected_size=options.expected_size,
+                artifact=options.artifact,
+            )
+            text = _render(operation, fields)
         else:
             presigned = validate_presigned_url(url if url is not None else WAVCSE_PRESIGNED_URL)
             if operation == DOWNLOAD_OPERATION:
@@ -1397,6 +1666,12 @@ def main(
                     if_none_match=WAVCSE_IF_NONE_MATCH,
                     allowed_root=options.allowed_root,
                 )
+            text = _render(operation, fields)
+    except (CacheMissError, CacheIntegrityFailure) as exc:
+        # A miss and a quarantined entry are both ordinary outcomes that a caller resolves by
+        # rebuilding from canonical storage, so they never look like a failure.
+        err.write(f"{ERROR_KEY}\t{_safe_text(exc)}\n")
+        return CACHE_MISS_EXIT_CODE
     except TransferError as exc:
         err.write(f"{ERROR_KEY}\t{_safe_text(exc)}\n")
         return 1
@@ -1410,7 +1685,7 @@ def main(
             f"{_safe_text(exc)}\n"
         )
         return 1
-    out.write(_render(operation, fields))
+    out.write(text)
     return 0
 
 
@@ -1461,6 +1736,483 @@ def _stream_download(
     return written, digest.hexdigest()
 
 
+def _required_sha256(value: str | None, *, operation: str) -> str:
+    """Return the canonical digest a cache operation requires, or fail the request."""
+
+    if value is None:
+        raise TransferInputError(
+            f"{operation} requires an expected SHA-256: a content-addressed cache cannot "
+            "identify an artifact without one"
+        )
+    return _optional_sha256(value) or ""
+
+
+def _require_cache_root(root: str) -> str:
+    """Return the cache root when it is a real directory, and never a symlink."""
+
+    validated = validate_worker_path(root, label="cache root")
+    if os.path.islink(validated) or not os.path.isdir(validated):
+        raise CacheRootError(f"{CACHE_ROOT_MISSING_MARKER}: {validated!r}")
+    return validated
+
+
+def _cache_entry_directory(root: str, digest: str) -> str:
+    """Build the digest-addressed entry path, refusing any path that could escape the root.
+
+    The digest is validated as 64 hexadecimal characters and every intermediate component
+    comes from a constant, so traversal is impossible by construction. The remaining risk is
+    a symlink substituted for one of those components, which is refused explicitly and then
+    double-checked against the resolved root.
+    """
+
+    _cache_artifacts_root(root)
+    current = _reject_symlink_components(
+        root, (*CACHE_ARTIFACTS_RELATIVE.split("/"), digest[:2], digest)
+    )
+    real_root = os.path.realpath(root)
+    real_entry = os.path.realpath(current)
+    if real_entry != os.path.join(real_root, CACHE_ARTIFACTS_RELATIVE, digest[:2], digest):
+        raise CacheRootError(
+            f"cache entry path for {digest} resolves outside the cache root {root!r}"
+        )
+    return current
+
+
+def _verified_cache_entry(
+    root: str,
+    digest: str,
+    *,
+    expected_size: int | None,
+) -> tuple[str, int]:
+    """Return one entry's verified content path and size, or raise a classified failure.
+
+    Every part of the claim is checked against the bytes: the metadata must parse, name a
+    supported schema, and agree with the requested digest and size, and the content must be a
+    regular file whose actual size and actual SHA-256 match. Anything else is quarantined and
+    reported, because the only safe responses to a cache that contradicts itself are to
+    rebuild it or to fail explicitly.
+    """
+
+    entry_directory = _cache_entry_directory(root, digest)
+    if not os.path.isdir(entry_directory) or os.path.islink(entry_directory):
+        raise CacheMissError(f"{CACHE_MISS_MARKER}: {digest}")
+    content_path = os.path.join(entry_directory, CACHE_ENTRY_CONTENT_NAME)
+    try:
+        descriptor = os.open(content_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        _quarantine_cache_entry(root, entry_directory, digest)
+        raise CacheIntegrityFailure(
+            f"{CACHE_CORRUPT_MARKER}: {digest} has no readable content file ({_safe_text(exc)})"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            _quarantine_cache_entry(root, entry_directory, digest)
+            raise CacheIntegrityFailure(
+                f"{CACHE_CORRUPT_MARKER}: {digest} content is not a regular file"
+            )
+        recorded = _recorded_cache_entry(entry_directory, digest)
+        if recorded is None:
+            _quarantine_cache_entry(root, entry_directory, digest)
+            raise CacheIntegrityFailure(
+                f"{CACHE_CORRUPT_MARKER}: {digest} has no usable metadata document"
+            )
+        recorded_size = recorded.get("size_bytes")
+        if (
+            expected_size is not None
+            and recorded_size is not None
+            and recorded_size != expected_size
+        ):
+            _quarantine_cache_entry(root, entry_directory, digest)
+            raise CacheIntegrityFailure(
+                f"{CACHE_CORRUPT_MARKER}: {digest} records {recorded_size} bytes, but "
+                f"{expected_size} bytes were expected"
+            )
+        size, actual_digest = sha256_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+    if actual_digest != digest or (expected_size is not None and size != expected_size):
+        _quarantine_cache_entry(root, entry_directory, digest)
+        raise CacheIntegrityFailure(
+            f"{CACHE_CORRUPT_MARKER}: {digest} holds {size} bytes hashing to {actual_digest}"
+        )
+    if recorded_size is not None and recorded_size != size:
+        _quarantine_cache_entry(root, entry_directory, digest)
+        raise CacheIntegrityFailure(
+            f"{CACHE_CORRUPT_MARKER}: {digest} records {recorded_size} bytes but holds {size}"
+        )
+    return content_path, size
+
+
+def _adoptable_cache_entry(
+    root: str,
+    digest: str,
+    *,
+    expected_size: int | None,
+) -> tuple[str, int] | None:
+    """Return an entry that already verifies, or `None` when there is nothing to adopt."""
+
+    try:
+        return _verified_cache_entry(root, digest, expected_size=expected_size)
+    except (CacheMissError, CacheIntegrityFailure):
+        return None
+
+
+def _recorded_cache_entry(entry_directory: str, digest: str) -> dict[str, int] | None:
+    """Read one entry's metadata document and return its recorded size, when it is coherent."""
+
+    metadata_path = os.path.join(entry_directory, CACHE_ENTRY_METADATA_NAME)
+    try:
+        descriptor = os.open(metadata_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as metadata_file:
+            payload = json.load(metadata_file)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    finally:
+        os.close(descriptor)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != CACHE_ENTRY_METADATA_SCHEMA_VERSION:
+        return None
+    if payload.get("sha256") != digest:
+        return None
+    size = payload.get("size_bytes")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        return None
+    return {"size_bytes": size}
+
+
+def _recorded_cache_entry_size(entry_directory: str) -> int | None:
+    """Return the recorded size of one entry directory, or `None` when it is unusable."""
+
+    digest = os.path.basename(entry_directory.rstrip(os.sep))
+    recorded = _recorded_cache_entry(entry_directory, digest)
+    return None if recorded is None else recorded["size_bytes"]
+
+
+def _write_cache_entry_metadata(
+    stage_directory: str,
+    *,
+    digest: str,
+    size: int,
+    artifact: str | None,
+) -> None:
+    """Describe one staged artifact inside the staging directory, before it is published.
+
+    The document holds only non-secret provenance: the identity that was satisfied, the size,
+    the artifact key it came from, and when it was cached. No URL, credential, or other
+    bearer material is ever written to persistent storage.
+    """
+
+    payload = {
+        "schema_version": CACHE_ENTRY_METADATA_SCHEMA_VERSION,
+        "sha256": digest,
+        "size_bytes": size,
+        "artifact": artifact,
+        "cached_at": _utc_timestamp(),
+    }
+    path = os.path.join(stage_directory, CACHE_ENTRY_METADATA_NAME)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as metadata_file:
+        json.dump(payload, metadata_file, sort_keys=True)
+        metadata_file.write("\n")
+        metadata_file.flush()
+        os.fsync(metadata_file.fileno())
+
+
+def _write_cache_marker(root: str) -> None:
+    """Create the cache root's marker document once, describing what the directory is."""
+
+    path = os.path.join(root, CACHE_MARKER_NAME)
+    if os.path.lexists(path):
+        return
+    payload = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "purpose": CACHE_MARKER_PURPOSE,
+        "cache_root": root,
+        "created_at": _utc_timestamp(),
+    }
+    staged = f"{path}.staged-{os.getpid()}-{secrets.token_hex(6)}"
+    try:
+        with open(staged, "x", encoding="utf-8") as marker_file:
+            json.dump(payload, marker_file, sort_keys=True)
+            marker_file.write("\n")
+            marker_file.flush()
+            os.fsync(marker_file.fileno())
+        os.rename(staged, path)
+    except OSError:
+        _remove_quietly(staged)
+        return
+    _fsync_directory(root)
+
+
+def _cache_marker_version(root: str) -> str | None:
+    """Return the marker's schema version, or `None` when there is no readable marker."""
+
+    path = os.path.join(root, CACHE_MARKER_NAME)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as marker_file:
+            payload = json.load(marker_file)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    finally:
+        os.close(descriptor)
+    if not isinstance(payload, dict):
+        return None
+    version = payload.get("schema_version")
+    return version if isinstance(version, str) else None
+
+
+def _quarantine_cache_entry(root: str, entry_directory: str, digest: str) -> None:
+    """Move one unusable entry aside so it can be inspected and cannot block a rebuild.
+
+    Moving rather than deleting keeps the failing bytes available for diagnosis, and puts
+    them under `staging/`, which is documented as safe to delete. If even the move fails,
+    the failure is still reported: a cache problem must never become silent.
+    """
+
+    try:
+        staging_root = _cache_staging_root(root)
+        target = os.path.join(staging_root, f"quarantine-{digest}-{secrets.token_hex(6)}")
+        os.rename(entry_directory, target)
+    except (OSError, TransferError):
+        return
+
+
+def _cache_entry_directories(artifacts_root: str) -> list[str]:
+    """List entry directories two levels below the artifacts root, without following links."""
+
+    entries: list[str] = []
+    for prefix in _safe_listdir(artifacts_root):
+        prefix_path = os.path.join(artifacts_root, prefix)
+        if os.path.islink(prefix_path) or not os.path.isdir(prefix_path):
+            continue
+        for digest in _safe_listdir(prefix_path):
+            entry = os.path.join(prefix_path, digest)
+            if os.path.islink(entry) or not os.path.isdir(entry):
+                continue
+            entries.append(entry)
+    return entries
+
+
+def _safe_listdir(path: str) -> list[str]:
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+def _staging_bytes(staging_root: str) -> int:
+    """Total bytes staged but not yet published, counted without following any link.
+
+    The top of the walk is checked explicitly: `os.walk` follows its own argument when that
+    argument is a symbolic link, so without this a link planted at `staging` would make a
+    read-only statistics command walk an arbitrary tree (including the filesystem root).
+    All other cache paths refuse a symlinked component; this keeps the diagnostic consistent
+    with them, and a path the cache would never stage into holds no staged bytes.
+    """
+
+    if os.path.islink(staging_root) or not os.path.isdir(staging_root):
+        return 0
+    total = 0
+    for directory, directory_names, file_names in os.walk(staging_root, followlinks=False):
+        directory_names[:] = [
+            name for name in directory_names if not os.path.islink(os.path.join(directory, name))
+        ]
+        for name in file_names:
+            try:
+                total += os.lstat(os.path.join(directory, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _copy_verified(source_path: str, sink_descriptor: int) -> tuple[int, str]:
+    """Copy a cache entry's already-open content into a staging descriptor, hashing it."""
+
+    try:
+        source_descriptor = os.open(source_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise CacheMissError(
+            f"{CACHE_MISS_MARKER}: cached content became unreadable ({_safe_text(exc)})"
+        ) from exc
+    try:
+        return _copy_descriptor(source_descriptor, sink_descriptor)
+    finally:
+        os.close(source_descriptor)
+
+
+def _copy_source_into(source_path: str, destination_path: str) -> tuple[int, str]:
+    """Copy one regular file into a new staging file, returning its size and SHA-256."""
+
+    try:
+        source_descriptor = os.open(source_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise TransferInputError(
+            f"populate source {source_path!r} could not be opened: {_safe_text(exc)}"
+        ) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+            raise TransferInputError(f"populate source {source_path!r} is not a regular file")
+        sink_descriptor = os.open(
+            destination_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o644,
+        )
+        try:
+            return _copy_descriptor(source_descriptor, sink_descriptor)
+        finally:
+            os.close(sink_descriptor)
+    finally:
+        os.close(source_descriptor)
+
+
+def _copy_descriptor(source_descriptor: int, sink_descriptor: int) -> tuple[int, str]:
+    """Stream one descriptor into another, returning the copied size and its SHA-256."""
+
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        os.lseek(source_descriptor, 0, os.SEEK_SET)
+        os.ftruncate(sink_descriptor, 0)
+        os.lseek(sink_descriptor, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(source_descriptor, CHUNK_SIZE_BYTES)
+            if not chunk:
+                break
+            written = 0
+            while written < len(chunk):
+                written += os.write(sink_descriptor, chunk[written:])
+            digest.update(chunk)
+            total += len(chunk)
+        os.fsync(sink_descriptor)
+    except OSError as exc:
+        raise _LocalWriteError(f"could not copy an artifact locally: {_safe_text(exc)}") from exc
+    return total, digest.hexdigest()
+
+
+def _remove_tree_no_follow(path: str) -> None:
+    """Remove a directory tree this module created, refusing to follow any symbolic link."""
+
+    if not os.path.isdir(path) or os.path.islink(path):
+        return
+    for directory, directory_names, file_names in os.walk(path, topdown=False, followlinks=False):
+        for name in directory_names:
+            child = os.path.join(directory, name)
+            if os.path.islink(child):
+                _remove_quietly(child)
+                continue
+            try:
+                os.rmdir(child)
+            except OSError:
+                continue
+        for name in file_names:
+            _remove_quietly(os.path.join(directory, name))
+    try:
+        os.rmdir(path)
+    except OSError:
+        return
+
+
+def _utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _render_cache_facts(operation: str, fields: dict[str, str]) -> str:
+    lines = [f"{SCHEMA_KEY}\t{SCHEMA_VERSION}", f"operation\t{operation}", "status\tok"]
+    lines.extend(f"{key}\t{value}" for key, value in fields.items())
+    return "\n".join(lines) + "\n"
+
+
+def _reject_symlink_components(root: str, parts: tuple[str, ...]) -> str:
+    """Walk one cache-relative path and refuse any component that is a symbolic link."""
+
+    current = root
+    for part in parts:
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            raise CacheRootError(
+                f"cache path {current!r} is a symbolic link; the cache never follows one"
+            )
+    return current
+
+
+def _cache_artifacts_root(root: str) -> str:
+    """Return the artifacts root, refusing a symbolic link anywhere along it."""
+
+    path = _reject_symlink_components(root, tuple(CACHE_ARTIFACTS_RELATIVE.split("/")))
+    if os.path.exists(path) and not os.path.isdir(path):
+        raise CacheRootError(f"cache path {path!r} is not a directory")
+    return path
+
+
+def _cache_staging_root(root: str) -> str:
+    """Return the staging directory, creating it without ever following a symbolic link.
+
+    `os.makedirs(..., exist_ok=True)` is not usable here: its existence check follows a
+    symbolic link, so a `staging` link planted on the volume would be accepted and every
+    staged write - and every quarantined entry - would land outside the cache root.
+    """
+
+    return _make_cache_directory(root, CACHE_STAGING_RELATIVE)
+
+
+def _make_cache_directory(parent: str, name: str) -> str:
+    """Create one cache subdirectory without following or accepting a symbolic link.
+
+    `os.makedirs(..., exist_ok=True)` and `os.mkdir` on a path with missing parents are both
+    unusable here: the first accepts a symbolic link because its existence check follows one,
+    and the second cannot create a chain. Each component is therefore created and validated
+    on its own, so a link planted anywhere along the path is refused rather than followed.
+    """
+
+    path = os.path.join(parent, name)
+    if os.path.islink(path):
+        raise CacheRootError(f"cache path {path!r} is a symbolic link; the cache never follows one")
+    try:
+        os.mkdir(path, 0o755)
+    except FileExistsError:
+        if os.path.islink(path) or not os.path.isdir(path):
+            raise CacheRootError(
+                f"cache path {path!r} is not a directory; the cache will not use it"
+            ) from None
+    except OSError as exc:
+        raise CacheRootError(
+            f"could not create the cache directory {path!r}: {_safe_text(exc)}"
+        ) from exc
+    return path
+
+
+def _cache_prefix_directory(root: str, digest: str) -> str:
+    """Create one digest shard and re-validate the whole entry path around it.
+
+    The chain is built component by component, then the full entry path is re-validated
+    immediately afterwards, so a symbolic link can never be introduced between creation and
+    use.
+    """
+
+    current = _make_cache_directory(root, CACHE_ARTIFACTS_RELATIVE.split("/")[0])
+    for part in CACHE_ARTIFACTS_RELATIVE.split("/")[1:]:
+        current = _make_cache_directory(current, part)
+    _make_cache_directory(current, digest[:2])
+    return _cache_entry_directory(root, digest)
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wavcse-artifact-transfer",
@@ -1488,6 +2240,31 @@ def _argument_parser() -> argparse.ArgumentParser:
     send = subcommands.add_parser(UPLOAD_OPERATION, help="Upload one local artifact.")
     send.add_argument("--source", required=True, help="Absolute source file path.")
     send.add_argument("--allowed-root", help="Confine a job output to this workspace.")
+    materialize = subcommands.add_parser(
+        CACHE_MATERIALIZE_OPERATION,
+        help="Place one artifact from the rebuildable cache, if it is cached and verified.",
+    )
+    materialize.add_argument("--root", required=True, help="Absolute cache root directory.")
+    _add_destination_arguments(materialize)
+    materialize.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing destination file deliberately.",
+    )
+    populate = subcommands.add_parser(
+        CACHE_POPULATE_OPERATION,
+        help="Publish one already-verified artifact into the rebuildable cache.",
+    )
+    populate.add_argument("--root", required=True, help="Absolute cache root directory.")
+    populate.add_argument("--source", required=True, help="Absolute source file path.")
+    populate.add_argument("--expected-sha256", required=True, help="Required SHA-256 digest.")
+    populate.add_argument("--expected-size", type=int, default=None, help="Expected byte size.")
+    populate.add_argument("--artifact", default=None, help="Non-secret artifact key for metadata.")
+    statistics = subcommands.add_parser(
+        CACHE_STATS_OPERATION,
+        help="Report the cache's recorded contents without hashing any artifact.",
+    )
+    statistics.add_argument("--root", required=True, help="Absolute cache root directory.")
     return parser
 
 

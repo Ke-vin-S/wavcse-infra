@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -34,6 +34,7 @@ from wavcse_infra.models import (
     WorkerState,
 )
 from wavcse_infra.state import WorkerRecord, WorkerStateStore
+from wavcse_infra.storage.cache import MaterializationOutcome
 from wavcse_infra.storage.s3 import StoredObject
 from wavcse_infra.workers.ssh import SshCommandResult, SshWaitResult
 
@@ -557,9 +558,53 @@ def worker(
     )
 
 
+class FakeCache:
+    """Stand-in for the worker's rebuildable cache, delegating canonical work to a transfer.
+
+    It answers the way the real collaborator does: an artifact listed in `hits` is a verified
+    local hit, and everything else is downloaded through the injected transfer and reported as
+    canonical. `populate_error` records the warning a real cache failure produces instead.
+    """
+
+    def __init__(
+        self,
+        transfer: FakeTransfer,
+        *,
+        hits: Iterable[str] = (),
+        warn: Callable[[str], None] | None = None,
+    ) -> None:
+        self.transfer = transfer
+        self.hits = set(hits)
+        self.calls: list[dict[str, Any]] = []
+        self.populate_error: Exception | None = None
+        self.warnings: list[str] = []
+        self.warn = warn if warn is not None else self.warnings.append
+
+    def materialize(self, worker_id: str, **kwargs: Any) -> MaterializationOutcome:
+        self.calls.append({"worker_id": worker_id, **kwargs})
+        if kwargs["key"] in self.hits:
+            return MaterializationOutcome(
+                result=_TransferResult(
+                    operation="cache-materialize",
+                    path=kwargs["destination"],
+                    size_bytes=kwargs.get("expected_size") or 11,
+                    sha256=kwargs.get("expected_sha256") or "b" * 64,
+                ),
+                source="cache",
+            )
+        result = self.transfer.download(worker_id, **kwargs)
+        if self.populate_error is not None:
+            self.warn(
+                f"worker {worker_id} did not cache the verified artifact at "
+                f"{kwargs['destination']}: {self.populate_error}"
+            )
+        return MaterializationOutcome(result=result, source="canonical")
+
+
 def worker_record(
     *,
     provider_worker_id: str = WORKER_ID,
+    network_volume_mount_path: str | None = None,
 ) -> WorkerRecord:
     return WorkerRecord(
         provider_worker_id=provider_worker_id,
@@ -575,6 +620,8 @@ def worker_record(
         image="runpod/pytorch:example",
         container_disk_gb=20,
         volume_gb=0,
+        network_volume_id="vol-abc123" if network_volume_mount_path is not None else None,
+        network_volume_mount_path=network_volume_mount_path,
         creation_timestamp=NOW,
         last_observed_state=WorkerState.RUNNING,
         last_observed_at=NOW,
@@ -620,6 +667,7 @@ def job_context(
     environ: Mapping[str, str] | None = None,
     worker_store: WorkerStateStore | None = None,
     jobs_config: JobsConfig | None = None,
+    cache: Any | None = None,
 ) -> JobContext:
     return JobContext(
         provider=provider if provider is not None else FakeProvider(),
@@ -631,6 +679,7 @@ def job_context(
         jobs_config=jobs_config if jobs_config is not None else JobsConfig(),
         environ=dict(environ or {}),
         now=lambda: NOW,
+        cache=cache,
     )
 
 

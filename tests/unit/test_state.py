@@ -72,6 +72,36 @@ def _worker(**overrides) -> Worker:
     return Worker.model_validate(values)
 
 
+def test_a_mount_path_is_only_recorded_when_the_provider_reported_one(tmp_path: Path) -> None:
+    """A create answer that omits `mounts` must not fabricate a confirmed mount path.
+
+    The recorded path decides whether a later job treats a directory as cache-backed, so a
+    requested path persisted as if the provider had reported it would make an ordinary
+    container-disk directory look like the network volume.
+    """
+
+    plan = _plan()
+    spec = plan.spec.model_copy(
+        update={
+            "cloud_type": CloudType.SECURE,
+            "network_volume_id": "vol-abc123",
+            "volume_mount_path": "/workspace/cache",
+        }
+    )
+    plan = plan.model_copy(update={"spec": spec})
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+
+    silent = store.record_created(plan, _worker(cloud_type=CloudType.SECURE))
+    assert silent.network_volume_id == "vol-abc123"
+    assert silent.network_volume_mount_path is None
+
+    reported = store.record_created(
+        plan,
+        _worker(cloud_type=CloudType.SECURE, volume_mount_path="/workspace/cache"),
+    )
+    assert reported.network_volume_mount_path == "/workspace/cache"
+
+
 def test_created_worker_state_persists_requested_and_actual_metadata(tmp_path: Path) -> None:
     state_path = tmp_path / "state" / "workers.json"
     store = WorkerStateStore(state_path, now=lambda: NOW)

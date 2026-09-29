@@ -304,6 +304,108 @@ operation in the URL the controller just generated, until that URL expires. A wo
 without Python 3 cannot transfer: run `infra worker bootstrap <id>` first, which
 installs and health-checks it.
 
+## Network volumes
+
+A network volume is persistent, provider-attached storage that outlives a Pod. It is
+rebuildable working storage, not canonical storage: S3 holds the only authoritative copy
+of every artifact, and a lost volume costs a re-download rather than a lost result.
+
+Phase 6.2 uses these REST v2 operations, all confirmed live against the current API:
+
+```text
+GET    /network-volumes                           -> {"networkVolumes":[...]}
+GET    /network-volumes/{id}                      -> one NetworkVolume
+POST   /network-volumes                           -> 201, body {"name","size","dataCenter"[,"type"]}
+DELETE /network-volumes/{id}                       -> 204, no body
+GET    /catalog/datacenters[?include=GPU_AVAILABILITY]
+GET    /billing/network-volumes[?networkVolumeId=][&lastN=]
+```
+
+A network volume resource reports only `id`, `name`, `size`, `dataCenter`, and `type`.
+`size` is GB with a provider floor of 10 and ceiling of 4096. `type` is `STANDARD` or
+`HIGH_PERFORMANCE` and is immutable after creation; size can be increased but never
+reduced. Names are not required to be unique, which is why every CLI-created volume
+receives the generated `wavcse-vol-<prefix>-<12-hex>` identity that reconciliation
+matches.
+
+`GET /catalog/datacenters` carries `networkVolumeTypes` per data center, and that list is
+empty for a data center that cannot host a volume at all. `infra volume datacenters`
+prints exactly that catalog, and the same field is the pre-creation placement guard: a
+data center that does not advertise the requested tier is rejected before any request is
+issued.
+
+### The data-center invariant
+
+RunPod attaches network volumes only to Secure Cloud Pods, and a volume exists in exactly
+one data center. RunPod's own documentation states the consequence: a Pod that mounts a
+volume must be scheduled in that volume's data center, and the mount must be requested at
+Pod creation because it cannot be attached or detached later.
+
+`infra worker create --network-volume-id <id>` therefore resolves the volume first and
+constrains the Pod request to `dataCenterIds: [<volume data center>]` before the offer is
+looked up and before any paid request exists. An operator-supplied `--data-center` that
+names anything else is rejected rather than quietly overridden, and `--cloud community`
+with a network volume is rejected outright. If the requested GPU has no confirmed
+availability in that data center, the command fails while it is still free to do so, with
+a message naming the volume and its data center and stating that no Pod was created.
+
+Placement is then verified from the provider's own answer, because a scheduler can only
+accept or reject and the request is not proof of the result. A created Pod reported in a
+different data center, or reported without the requested network mount, raises an
+explicit error naming the created (billing) Pod and how to remove it. A create answer that
+omits those fields is refreshed once from `GET /pods/{id}` before any conclusion is
+drawn, so a sparse response is never mistaken for a wrong placement.
+
+### Ambiguous create and the intent record
+
+`POST /network-volumes` is issued once and never retried, exactly like a Pod create, and
+for the same reason: the provider exposes no idempotency key and no unique-name
+constraint, so a retry could create a second billable volume.
+
+Before that request the controller durably records a `PENDING_CREATE` intent under the
+volume's infra identity in `~/.local/state/wavcse-infra/volumes.json`. The intent is
+written first because the identity is known before the paid call while the provider ID is
+only known after a response arrives. If the response is lost, the client lists volumes and
+matches the complete identity: one match is adopted, several are reported as ambiguous,
+and none fails safely after bounded attempts. In that last case the intent survives, so
+`infra volume list` can match the provider's own listing later and warns on stderr about
+any intent the provider has not confirmed. An ambiguous delete is reconciled the same way
+a Pod delete is: bounded `GET /network-volumes/{id}` polling until the volume is absent.
+
+### Mount path and the rebuildable cache
+
+`volumes.mount_path` (default `/workspace/cache`) is where a network volume is mounted and
+is therefore also the worker's cache root. The default deliberately nests the mount inside
+the ephemeral workspace instead of taking `/workspace` itself, so the job workspace and
+job scratch stay on container disk while only the cache is persistent. An explicit
+`--volume-mount-path` always wins, and a Pod with no network volume keeps the historical
+`/workspace` default.
+
+The cache itself is described in [Operations](OPERATIONS.md#network-volume-operations):
+identity is an artifact's SHA-256, an entry is `artifacts/sha256/<first-two-hex>/<digest>/
+{content,metadata.json}` under the mount point, publication is a single directory rename
+after a verified staged copy, and every cache problem degrades to a canonical download.
+
+### Storage pricing
+
+RunPod exposes no network volume price field anywhere in REST v2: the resource reports
+capacity and placement only, and the only money the API reports is billing that has
+already been incurred, through `GET /billing/network-volumes`. RunPod's published list
+price for standard network volume storage is **$0.07/GB/month, quoted for volumes up to
+1 TB**, at the
+time of writing, documented on its Pod pricing page. The provider publishes a different
+rate for larger volumes of the same tier without stating the banding unambiguously, so a
+request above 1 TB prints no estimate rather than one built on an unverified scope.
+High-performance storage is
+documented only as "a premium to standard storage" whose exact per-GB rate varies by data
+center and appears only in RunPod's console, so this tool quotes no estimate for that
+tier.
+
+`infra volume create` therefore labels any figure it prints as a published list price
+rather than a provider-reported charge, and `infra volume show` reports the account's
+actual provider-billed amounts instead. The provider price is never used to decide
+whether an operation is allowed.
+
 ## Local state
 
 Created-worker metadata is written atomically to:
@@ -323,6 +425,13 @@ RunPod remains authoritative. List/show reads come from RunPod and only reconcil
 records already tracked locally. Unrelated Pods in the same account are displayed but
 are not claimed as wavcse-infra-owned. An already-absent exact-ID destroy updates local
 state when possible and does not target a similar name.
+
+A second document, `~/.local/state/wavcse-infra/volumes.json`, tracks created network
+volumes with the same atomicity and permissions. It is keyed by infra identity rather
+than provider ID, because a paid create has to be recorded before the provider answers.
+Its life cycle is `PENDING_CREATE`, `AVAILABLE`, or `DESTROYED`. Worker records
+additionally carry `network_volume_mount_path`, the provider-reported mount path of the
+Pod's network volume, which is what enables that worker's cache.
 
 ## Read retries and errors
 
@@ -354,6 +463,14 @@ query strings pass through central redaction.
   `infra worker bootstrap`) and a writable `jobs.runner_path` for the SSH account.
 - Phase 6 does not install research dependencies, provision workers automatically,
   schedule across workers, or resume a partially completed run.
+- RunPod exposes no network volume price through its API, so a pre-creation cost is a
+  published list-price estimate rather than a provider-reported charge; only incurred
+  billing is provider-reported.
+- A network volume constrains Pod placement to one data center. This is what makes it
+  useful and also what limits it: capacity in that data center is the only capacity a
+  Pod mounting it can use, and the volume cannot be moved.
+- The rebuildable cache has no automatic eviction, size cap, or cross-data-center
+  replication. Only a Pod with that volume mounted can read it.
 - No normal test or CI job calls the live API or performs a paid mutation.
 
 ## Official references
@@ -367,6 +484,13 @@ query strings pass through central redaction.
 - [Pod state transition](https://docs.runpod.io/api-reference-v2/pods/trigger-a-pod-state-transition)
 - [Terminate a Pod](https://docs.runpod.io/api-reference-v2/pods/terminate-a-pod)
 - [Pod pricing](https://docs.runpod.io/pods/pricing)
+- [Network volumes](https://docs.runpod.io/storage/network-volumes)
+- [High-performance storage](https://docs.runpod.io/storage/high-performance-storage)
+- [List network volumes](https://docs.runpod.io/api-reference-v2/network-volumes/list-network-volumes)
+- [Create a network volume](https://docs.runpod.io/api-reference-v2/network-volumes/create-a-network-volume)
+- [Delete a network volume](https://docs.runpod.io/api-reference-v2/network-volumes/delete-a-network-volume)
+- [List data centers](https://docs.runpod.io/api-reference-v2/catalog/list-data-centers)
+- [Network volume billing history](https://docs.runpod.io/api-reference-v2/billing/get-network-volume-billing-history)
 - [Connect to a Pod with SSH](https://docs.runpod.io/pods/configuration/use-ssh)
 - [RunPod GraphQL schema](https://graphql-spec.runpod.io/)
 - [RunPod CLI Pod reference](https://docs.runpod.io/runpodctl/reference/runpodctl-pod)

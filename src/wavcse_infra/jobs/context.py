@@ -18,6 +18,7 @@ from wavcse_infra.jobs.execution import JobExecutor
 from wavcse_infra.jobs.state import JobStateStore
 from wavcse_infra.models import Worker, WorkerReadinessState, WorkerState
 from wavcse_infra.state import WorkerRecord, WorkerStateStore
+from wavcse_infra.storage.cache import WorkerArtifactCache
 from wavcse_infra.storage.s3 import S3Storage
 from wavcse_infra.storage.transfer import WorkerArtifactTransfer
 
@@ -41,6 +42,21 @@ class JobContext:
     jobs_config: JobsConfig
     environ: Mapping[str, str] = field(default_factory=dict)
     now: Callable[[], datetime] = lambda: datetime.now(UTC)
+    cache: WorkerArtifactCache | None = None
+
+    def cache_root(self, worker_id: str) -> str | None:
+        """Return the worker's rebuildable cache root, or `None` when it has no volume.
+
+        The root is the mount path the provider reported for the Pod's network volume: it is
+        provider state, not a path this tool invents. A worker without a network volume has
+        no cache root at all, which is what keeps a Pod without persistent storage on exactly
+        the canonical download path it used before.
+        """
+
+        if self.cache is None:
+            return None
+        record = self.worker_state.get(worker_id)
+        return None if record is None else record.network_volume_mount_path
 
 
 def require_storage(context: JobContext) -> S3Storage:

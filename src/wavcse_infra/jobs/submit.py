@@ -324,18 +324,41 @@ class JobSubmitter:
         if existing.materialized:
             state, verified = self._input_state(record, destination, expected_size, expected_sha256)
             if state == "complete" and verified is not None:
-                return verified
+                # The evidence is re-derived from the worker, but where those bytes originally
+                # came from is a fact from the pass that materialized them.
+                return verified.model_copy(update={"source": existing.source})
             replace = state == "mismatch"
+        # A rebuildable cache is content-addressed, so it has nothing to say about an input
+        # whose content is not identified by a declared digest. Deciding that here keeps the
+        # rule visible at the call site instead of relying on the cache to decline.
+        cache = context.cache if expected_sha256 is not None else None
+        cache_root = context.cache_root(record.worker_id) if cache is not None else None
         try:
-            result = context.transfer.download(
-                record.worker_id,
-                storage=storage,
-                key=job_input.artifact,
-                destination=destination,
-                expected_size=expected_size,
-                expected_sha256=expected_sha256,
-                overwrite=replace,
-            )
+            if cache is not None and cache_root is not None:
+                outcome = cache.materialize(
+                    record.worker_id,
+                    cache_root=cache_root,
+                    storage=storage,
+                    key=job_input.artifact,
+                    destination=destination,
+                    expected_size=expected_size,
+                    expected_sha256=expected_sha256,
+                    overwrite=replace,
+                    artifact_label=job_input.artifact,
+                )
+                result = outcome.result
+                source = outcome.source
+            else:
+                result = context.transfer.download(
+                    record.worker_id,
+                    storage=storage,
+                    key=job_input.artifact,
+                    destination=destination,
+                    expected_size=expected_size,
+                    expected_sha256=expected_sha256,
+                    overwrite=replace,
+                )
+                source = "canonical"
         except ArtifactDestinationExistsError:
             # Something is already placed at the destination. Only worker evidence may
             # decide whether it is the artifact that was wanted, and it is never replaced
@@ -351,7 +374,16 @@ class JobSubmitter:
                     f"worker {record.worker_id} has an incomplete file at {destination} that is "
                     f"not the materialized input {job_input.artifact!r}; it was left in place"
                 ) from None
-            result = verified
+            return existing.model_copy(
+                update={
+                    "worker_path": destination,
+                    "materialized": True,
+                    "size_bytes": verified.size_bytes,
+                    "sha256": verified.sha256,
+                    "failure_reason": None,
+                    "source": existing.source,
+                }
+            )
         return existing.model_copy(
             update={
                 "worker_path": destination,
@@ -359,6 +391,7 @@ class JobSubmitter:
                 "size_bytes": result.size_bytes,
                 "sha256": result.sha256,
                 "failure_reason": None,
+                "source": source,
             }
         )
 

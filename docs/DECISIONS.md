@@ -1228,3 +1228,184 @@ cancelling such a job now fails loudly instead of guessing. The Phase 6 limitati
 recorded in ADR-024 - an orphaned transfer may outrun the controller, cancellation can wait
 behind an in-flight lock, a stopped worker stays reconcilable, and no scheduler, daemon,
 database, or automatic reaper exists - are unchanged and remain accepted.
+
+## ADR-026: Constrain a Pod to its network volume's data center, before and after the create
+
+- **Status:** Accepted
+- **Date:** 2026-09-29
+
+### Context
+
+A RunPod network volume exists in exactly one data center and can only be attached at Pod
+creation. The provider accepts a list of preferred data centers rather than a hard
+placement pin, and a scheduler can only accept or reject a request: a create that returns
+201 says a Pod exists, not that it exists where the attached storage lives. A Pod created
+in the wrong data center is a paid resource that cannot use the volume it was created for,
+and a request that merely names that data center among several can still be satisfied
+elsewhere.
+
+### Decision
+
+- `infra worker create --network-volume-id <id>` resolves the volume first and fails before
+  the billable create request if the volume does not exist, if the Pod is requested on
+  Community Cloud (where network volumes cannot attach), or if an operator-supplied
+  `--data-center` names anything other than the volume's own data center. A contradiction
+  is rejected rather than silently overridden, because quietly ignoring a placement
+  constraint is exactly how a Pod ends up in the wrong place. Resolving the volume is
+  itself a read-only provider call, so the guarantee is "nothing billable was attempted",
+  not "no request was made".
+- The resolved data center becomes the request's only allowed data center. Availability is
+  then checked for that data center through the same catalog guard that already refuses
+  `NONE` and unknown availability, so a request that cannot be satisfied fails while it is
+  still free to do so, naming the volume and its data center.
+- The provider's own answer is verified afterwards. A created Pod reported in another data
+  center, or reported without the requested network mount, raises an explicit error naming
+  the created, billing Pod and how to remove it. A create answer that omits placement or
+  the mount is refreshed once from `GET /pods/{id}` before any conclusion is drawn, so a
+  sparse response is never mistaken for a wrong placement, and only an affirmative
+  contradiction fails.
+
+### Alternatives rejected
+
+- Relying on the provider to reject an impossible combination: a scheduler rejection is
+  indistinguishable from absent capacity, and the operator learns nothing about which of
+  the two happened.
+- Sending the volume's data center alongside others and trusting placement: a Pod is one
+  machine in one data center, so a second candidate can only ever produce the failure this
+  ADR exists to prevent.
+- Warning instead of failing on a wrong placement: the Pod is already billing and the
+  operator must destroy it either way, so a warning would only be quieter.
+
+### Consequences
+
+A network volume constrains where its Pods can run, which is the cost of the locality it
+provides: if the volume's data center has no capacity for the chosen GPU, the correct
+outcome is to choose differently rather than to create a Pod that cannot use its storage.
+Placement is verified after the create, so a wrong placement is reported after the Pod
+exists; the record and local state are persisted before that check, so the Pod is always
+visible to `infra worker list`.
+
+## ADR-027: Make the network volume a content-addressed rebuildable cache
+
+- **Status:** Accepted
+- **Date:** 2026-09-29
+
+### Context
+
+Phase 5 materialized every declared job input by downloading it from S3 through a
+presigned URL, which re-paid the transfer cost for every experiment even though declared
+inputs are immutable. A provider-attached volume can hold them across disposable workers,
+but it is provider-coupled storage inside one data center, the provider neither reports nor
+verifies its contents, and two artifacts can legitimately share a filename.
+
+### Decision
+
+- Identity is the artifact's SHA-256, never its filename. Entries live at
+  `artifacts/sha256/<first-two-hex>/<digest>/` with the verified bytes and a metadata
+  document recording the digest, size, artifact key, and creation time. The same name with
+  different bytes occupies a different entry and can never collide.
+- A hit requires the requested identity, the recorded size, and the bytes on disk to agree.
+  The artifact is hashed when an entry is selected and again as the copy is written, and
+  placement then links that verified file rather than moving a pathname, so a cached
+  artifact carries exactly the integrity guarantee of a fresh download and the Phase 5
+  digest requirements are not weakened anywhere.
+- Publication is atomic: a copy is staged under `staging/`, verified while it is written,
+  described by its metadata document, flushed, and then published with a single directory
+  rename. A partial artifact can therefore never appear at an entry path, and concurrent
+  writers stage separately so one rename wins and the other verifies the winner's entry.
+  A symlinked cache root, shard, entry directory, content file, or staging directory is
+  refused rather than followed, and directory components are created one at a time for that
+  reason: `os.makedirs(exist_ok=True)` follows a link when it checks whether a directory
+  already exists.
+- An entry that contradicts its own recorded identity is moved into `staging/`, reported as
+  a warning, and treated as a miss. Quarantine preserves the failing bytes for diagnosis
+  and lets the next canonical download rebuild the entry; corrupt bytes are never accepted
+  because they came from provider-attached storage.
+- The cache is consulted only when a worker has a mounted volume and the artifact has a
+  declared digest. Everything else - no digest, no mount, no entry, a quarantined entry, an
+  unavailable mount, an interrupted lookup - falls back to the canonical download. Every
+  cache problem is a warning, never a job failure: the cache may only make a job faster.
+- Cache operations never receive a presigned URL. Bytes enter the cache only from a file the
+  canonical download already verified, so the mounted volume cannot become a credential
+  store, and no bearer material is ever written to it.
+- No automatic eviction is implemented. Size is inspected with `infra volume cache stats`
+  and removal is an explicit operator action.
+
+### Alternatives rejected
+
+- Trusting a filename or a directory-shape convention: neither can distinguish an artifact
+  from a same-named different artifact, and both make poisoning a matter of chance.
+- Trusting recorded metadata without re-reading the bytes: a size in a sidecar file is a
+  claim about the past, so a truncated or locally modified entry would be accepted.
+- Publishing by writing the artifact directly into its final directory: a crash or a
+  concurrent writer would leave a partially complete artifact that looks complete.
+- Deleting a corrupt entry: the failing bytes are the only evidence of what went wrong on a
+  paid volume, and `staging/` is already documented as safe to delete.
+- Treating a cache failure as a job failure: the artifact is available from canonical
+  storage, so failing a research job over an optimization would trade a slow success for a
+  guaranteed failure.
+
+### Consequences
+
+The first job on a fresh volume still pays the full canonical download, and the volume
+holds only what a Pod with that volume mounted can read, so the benefit is per data center.
+A hit costs a local copy plus two hashes instead of a network transfer, which is the
+tradeoff that makes the cache worth having for multi-GiB archives. Because verification
+happens on use rather than on write, a damaged entry is discovered when an artifact is
+materialized rather than before.
+
+## ADR-028: Charge a durable intent before a billable create, and keep the lifecycles independent
+
+- **Status:** Accepted
+- **Date:** 2026-09-29
+
+### Context
+
+RunPod's network volume names are not required to be unique and the API exposes neither an
+idempotency key nor a unique-name constraint, so a lost create response can neither be
+retried nor resolved by trusting the local record. A volume is also a persistent billable
+resource whose lifecycle differs from the Pod that mounts it: a volume outlives any Pod,
+and a Pod that mounts one cannot be moved to another data center.
+
+### Decision
+
+- A `PENDING_CREATE` intent is written durably under the generated infra identity before the
+  create request is issued, because the identity is known before the paid call while the
+  provider ID is only known after a response arrives. The create POST is issued once and
+  never retried, and a lost response is reconciled by listing volumes and matching the
+  complete identity: one match is adopted, several are reported as ambiguous, and none fails
+  safely after bounded attempts.
+- An unresolved intent is never hidden. `infra volume list` warns on stderr about an intent
+  the provider has not confirmed, so a paid resource that may exist can never look like one
+  that does not.
+- Volumes and Pods have independent lifecycles. `infra volume destroy` addresses one volume
+  by exact provider ID and never resolves a name, never deletes an S3 object, and never
+  stops or destroys a Pod; it lists the tracked Pods that mount the volume and states that
+  they are not destroyed. Destroying a Pod never destroys its volume.
+- A volume destroy requires interactive confirmation unless `--yes` is supplied, and shows
+  the exact target, its placement and size, and that the rebuildable cache is permanently
+  lost.
+- A volume create prints its data center, size, tier, the provider's published list price
+  when one applies, an estimated monthly cost, and the exact request body before asking for
+  confirmation, because it is a billable resource rather than a transient request.
+
+### Alternatives rejected
+
+- Retrying the create POST: with no idempotency key a second attempt can create a second
+  billable volume, and the cost of a duplicate exceeds the cost of asking an operator to
+  look.
+- Recording state only after a successful response: that is precisely the case the record
+  exists for, since a lost response would leave nothing to reconcile against.
+- Cascading a volume destroy into the Pods that mount it: destroying compute is a different
+  decision from destroying storage, and a Pod that cannot use its volume is still the
+  operator's to stop deliberately.
+- Letting a destroy resolve a name: names are not unique, so a name is not an identity, and
+  a destructive command that guesses is worse than one that refuses.
+
+### Consequences
+
+Local state has one more document, keyed by infra identity rather than provider ID, because
+the identity must exist before the provider answers. An operator can see an ambiguous
+create as an unresolved intent instead of as a silent absence. Cleaning up a volume and its
+Pod is deliberately two explicit steps rather than a cascade, which is more work and is the
+reason a mistake in one cannot destroy the other.

@@ -18,15 +18,19 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from wavcse_infra.errors import StateError
+from wavcse_infra.errors import StateError, UnresolvedCreateError
 from wavcse_infra.models import (
     CloudType,
+    NetworkVolume,
+    NetworkVolumeSpec,
+    VolumeType,
     Worker,
     WorkerConnectionInfo,
     WorkerCreationPlan,
@@ -37,6 +41,7 @@ from wavcse_infra.models import (
 )
 
 DEFAULT_STATE_PATH = Path("~/.local/state/wavcse-infra/workers.json")
+DEFAULT_VOLUME_STATE_PATH = Path("~/.local/state/wavcse-infra/volumes.json")
 
 # The document lock is held for one read-decide-write transition, and one transition may
 # call another (a create that upserts), so the descriptor is cached and its depth counted
@@ -46,10 +51,10 @@ _LOCK_DESCRIPTORS: dict[str, int] = {}
 
 
 def _serialized(method: Any) -> Any:
-    """Run one worker-state mutation while holding the document's local lock."""
+    """Run one state mutation while holding its document's local lock."""
 
     @wraps(method)
-    def wrapper(self: WorkerStateStore, *args: Any, **kwargs: Any) -> Any:
+    def wrapper(self: _AtomicJsonDocumentStore, *args: Any, **kwargs: Any) -> Any:
         with self.locked():
             return method(self, *args, **kwargs)
 
@@ -116,6 +121,10 @@ class WorkerRecord(BaseModel):
     container_disk_gb: int = Field(ge=1)
     volume_gb: int = Field(ge=0)
     network_volume_id: str | None = None
+    # The mount path of the network volume, when the Pod has one. It is provider-reported at
+    # creation and is the cache root the worker derives its rebuildable artifact cache from;
+    # it is `None` for Pods with no network volume, which is what disables cache use.
+    network_volume_mount_path: str | None = None
     creation_timestamp: datetime
     last_observed_state: WorkerState
     last_observed_at: datetime
@@ -145,26 +154,30 @@ class _StateDocument(BaseModel):
     workers: dict[str, WorkerRecord] = Field(default_factory=dict)
 
 
-class WorkerStateStore:
-    """Read and atomically replace a small JSON worker-state document."""
+class _AtomicJsonDocumentStore:
+    """Read and atomically replace one small JSON document under a local advisory lock.
+
+    Every mutation replaces the whole document, so a read-decide-write transition must be
+    serialized: two controller processes that both read, decide, and write would otherwise
+    let the slower one overwrite the newer state. Each mutation takes one local advisory
+    lock on the document, re-reads it inside the lock, and merges its change into what it
+    finds there - the same single-machine concurrency model the per-job store uses. It
+    serializes processes on one controller; it is not, and does not need to be, distributed
+    consensus.
+    """
 
     def __init__(
         self,
-        path: Path | None = None,
+        path: Path | None,
         *,
+        default_path: Path,
         now: Callable[[], datetime] | None = None,
     ) -> None:
-        self.path = (path or DEFAULT_STATE_PATH).expanduser()
+        self.path = (path or default_path).expanduser()
         self._now = now or (lambda: datetime.now(UTC))
 
-    def list_records(self) -> list[WorkerRecord]:
-        return list(self._load().workers.values())
-
-    def get(self, worker_id: str) -> WorkerRecord | None:
-        return self._load().workers.get(worker_id)
-
     def lock_path(self) -> Path:
-        """Return the local advisory lock path for the worker-state document."""
+        """Return the local advisory lock path for this state document."""
 
         return self.path.with_name(f"{self.path.name}.lock")
 
@@ -196,15 +209,13 @@ class WorkerStateStore:
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
         except OSError as exc:
-            raise StateError(f"Could not open the local worker-state lock {path}: {exc}") from exc
+            raise StateError(f"Could not open the local state lock {path}: {exc}") from exc
         _LOCK_DESCRIPTORS[key] = descriptor
         try:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
             except OSError as exc:
-                raise StateError(
-                    f"Could not take the local worker-state lock {path}: {exc}"
-                ) from exc
+                raise StateError(f"Could not take the local state lock {path}: {exc}") from exc
             _LOCK_DEPTH[key] = 1
             yield
         finally:
@@ -213,10 +224,35 @@ class WorkerStateStore:
             if held is not None:
                 os.close(held)
 
+
+class WorkerStateStore(_AtomicJsonDocumentStore):
+    """Read and atomically replace the supplemental created-worker document."""
+
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        super().__init__(path, default_path=DEFAULT_STATE_PATH, now=now)
+
+    def list_records(self) -> list[WorkerRecord]:
+        return list(self._load().workers.values())
+
+    def get(self, worker_id: str) -> WorkerRecord | None:
+        return self._load().workers.get(worker_id)
+
     @_serialized
     def record_created(self, plan: WorkerCreationPlan, worker: Worker) -> WorkerRecord:
         now = self._now()
         connection = worker.ssh_direct or worker.ssh_proxy
+        # Only a mount path the provider actually reported is recorded. Falling back to the
+        # requested path would make a Pod whose create answer omitted `mounts` look like it
+        # has a confirmed volume there, and a later job would treat an ordinary
+        # container-disk directory as the cache root.
+        network_mount_path = (
+            worker.volume_mount_path if plan.spec.network_volume_id is not None else None
+        )
         record = WorkerRecord(
             provider_worker_id=worker.id,
             infra_identity=plan.spec.name,
@@ -233,6 +269,7 @@ class WorkerStateStore:
             container_disk_gb=plan.spec.container_disk_gb,
             volume_gb=plan.spec.volume_gb,
             network_volume_id=plan.spec.network_volume_id,
+            network_volume_mount_path=network_mount_path,
             creation_timestamp=worker.created_at or now,
             last_observed_state=worker.state,
             last_observed_at=now,
@@ -269,6 +306,11 @@ class WorkerStateStore:
                     connection.username if connection is not None else existing.ssh_username
                 ),
                 "ssh_kind": connection.kind if connection is not None else existing.ssh_kind,
+                "network_volume_mount_path": (
+                    worker.volume_mount_path
+                    if worker.volume_mount_path is not None and worker.network_volume_id is not None
+                    else existing.network_volume_mount_path
+                ),
                 "readiness_state": (
                     existing.readiness_state
                     if worker.state is WorkerState.RUNNING
@@ -340,6 +382,12 @@ class WorkerStateStore:
                         connection.username if connection is not None else existing.ssh_username
                     ),
                     "ssh_kind": connection.kind if connection is not None else existing.ssh_kind,
+                    "network_volume_mount_path": (
+                        worker.volume_mount_path
+                        if worker.volume_mount_path is not None
+                        and worker.network_volume_id is not None
+                        else existing.network_volume_mount_path
+                    ),
                     "readiness_state": (
                         existing.readiness_state
                         if worker.state is WorkerState.RUNNING
@@ -475,6 +523,341 @@ class WorkerStateStore:
 
     def _write(self, document: _StateDocument) -> None:
         write_json_atomically(self.path, document.model_dump(mode="json"))
+
+
+class VolumeLifecycleState(StrEnum):
+    """Local lifecycle of one tracked network volume.
+
+    This is operational bookkeeping, not provider truth. `PENDING_CREATE` is the state that
+    makes an ambiguous paid create recoverable; `AVAILABLE` means the provider has confirmed
+    the volume; `DESTROYED` means this tool explicitly destroyed it.
+    """
+
+    PENDING_CREATE = "PENDING_CREATE"
+    AVAILABLE = "AVAILABLE"
+    DESTROYED = "DESTROYED"
+
+
+class VolumeRecord(BaseModel):
+    """Non-secret local metadata for one wavcse-infra-created network volume."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: str = "runpod"
+    # The generated infra identity is both the document key and the provider-side name: the
+    # provider does not require unique names, and a pending intent has no ID to key on.
+    infra_identity: str = Field(min_length=1)
+    provider_volume_id: str | None = None
+    name: str | None = None
+    requested_size_gb: int = Field(ge=1)
+    requested_data_center: str = Field(min_length=1)
+    requested_volume_type: VolumeType | None = None
+    observed_size_gb: int | None = Field(default=None, ge=0)
+    observed_data_center: str | None = None
+    observed_volume_type: VolumeType | None = None
+    creation_timestamp: datetime
+    last_observed_at: datetime
+    lifecycle_state: VolumeLifecycleState
+    provider_absent: bool = False
+
+
+class _VolumeDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: int = 1
+    volumes: dict[str, VolumeRecord] = Field(default_factory=dict)
+
+
+class VolumeStateStore(_AtomicJsonDocumentStore):
+    """Read and atomically replace the supplemental network-volume document.
+
+    Records are keyed by infra identity rather than by provider ID, because the reason this
+    document exists is an ambiguous create: the identity is known before the paid request is
+    issued, while the provider ID is only known after a response arrives. Reconcile therefore
+    matches the provider's own list against the identity, and never trusts the local copy as
+    authority about what exists.
+    """
+
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        super().__init__(path, default_path=DEFAULT_VOLUME_STATE_PATH, now=now)
+
+    def list_records(self) -> list[VolumeRecord]:
+        return list(self._load().volumes.values())
+
+    def get(self, provider_volume_id: str) -> VolumeRecord | None:
+        """Return the tracked record for one exact provider volume ID."""
+
+        for record in self._load().volumes.values():
+            if record.provider_volume_id == provider_volume_id:
+                return record
+        return None
+
+    def get_by_identity(self, infra_identity: str) -> VolumeRecord | None:
+        return self._load().volumes.get(infra_identity)
+
+    def unresolved_intents(self) -> list[VolumeRecord]:
+        """Return every paid create whose outcome the provider has not confirmed.
+
+        A pending record with no provider ID is the visible form of an ambiguous create: the
+        request was issued, and whether a billable volume exists is not yet known. Callers
+        must treat it as a reason to reconcile rather than as a reason to try again.
+        """
+
+        return [
+            record
+            for record in self._load().volumes.values()
+            if record.lifecycle_state is VolumeLifecycleState.PENDING_CREATE
+            and record.provider_volume_id is None
+        ]
+
+    @_serialized
+    def forget(self, infra_identity: str) -> VolumeRecord | None:
+        """Remove one local record without contacting the provider.
+
+        This deletes bookkeeping, never a resource. An untracked provider volume is still
+        listed by `infra volume list`; what is lost is the local link that would have let a
+        later reconciliation adopt it, which is why it is a separate, deliberate action
+        rather than something a create does implicitly.
+        """
+
+        document = self._load()
+        existing = document.volumes.get(infra_identity)
+        if existing is None:
+            return None
+        volumes = {key: record for key, record in document.volumes.items() if key != infra_identity}
+        self._write(document.model_copy(update={"volumes": volumes}))
+        return existing
+
+    @_serialized
+    def record_create_intent(self, spec: NetworkVolumeSpec) -> VolumeRecord:
+        """Persist the exact request before the paid create is issued.
+
+        This is the durable half of duplicate-create safety. If the create response is lost
+        and bounded reconciliation finds nothing, the identity and the requested placement
+        still exist locally, so a later `infra volume list` can match the provider's own
+        listing against it instead of the operator guessing whether the volume exists.
+        """
+
+        document = self._load()
+        existing = document.volumes.get(spec.name)
+        if existing is not None:
+            raise StateError(
+                f"A network volume record already exists for infra identity {spec.name!r} "
+                f"in state {existing.lifecycle_state.value}; reconcile or destroy it before "
+                "creating another"
+            )
+        # This guard must be evaluated inside the same locked transition that writes the
+        # intent, not merely before the confirmation prompt: two overlapping
+        # `infra volume create` invocations would otherwise both observe no unresolved
+        # intent, both reach the provider, and each open a billable volume whose identity is
+        # unrelated to the other's intent.
+        unresolved_elsewhere = [
+            record
+            for record in document.volumes.values()
+            if record.lifecycle_state is VolumeLifecycleState.PENDING_CREATE
+            and record.provider_volume_id is None
+        ]
+        if unresolved_elsewhere:
+            identities = ", ".join(sorted(record.infra_identity for record in unresolved_elsewhere))
+            raise UnresolvedCreateError(
+                "Refusing to record another network volume create intent while an earlier "
+                f"create is unresolved: {identities}. Run `infra volume list` to reconcile it "
+                "against the provider, or `infra volume forget <infra-identity>` if the "
+                "provider really has no such volume, before creating another"
+            )
+        now = self._now()
+        record = VolumeRecord(
+            infra_identity=spec.name,
+            requested_size_gb=spec.size_gb,
+            requested_data_center=spec.datacenter,
+            requested_volume_type=spec.volume_type,
+            creation_timestamp=now,
+            last_observed_at=now,
+            lifecycle_state=VolumeLifecycleState.PENDING_CREATE,
+        )
+        volumes = dict(document.volumes)
+        volumes[record.infra_identity] = record
+        self._write(document.model_copy(update={"volumes": volumes}))
+        return record
+
+    @_serialized
+    def record_created(self, record: VolumeRecord, volume: NetworkVolume) -> VolumeRecord:
+        """Attach the provider's answer to the intent that produced it."""
+
+        document = self._load()
+        existing = document.volumes.get(record.infra_identity) or record
+        updated = _observed_volume(existing, volume, now=self._now()).model_copy(
+            update={"lifecycle_state": VolumeLifecycleState.AVAILABLE}
+        )
+        volumes = dict(document.volumes)
+        volumes[updated.infra_identity] = updated
+        self._write(document.model_copy(update={"volumes": volumes}))
+        return updated
+
+    @_serialized
+    def observe(self, volume: NetworkVolume) -> VolumeRecord | None:
+        """Refresh one tracked record from a provider read, matched by exact identity."""
+
+        document = self._load()
+        identity = _identity_for_volume(document.volumes.values(), volume)
+        if identity is None:
+            return None
+        existing = document.volumes[identity]
+        # A provider read is confirmation that the volume exists, so a pending intent stops
+        # being pending. Only that promotion is applied: a record this tool believes it
+        # destroyed is not silently revived by an observation, which would hide a deletion
+        # the provider has not caught up with.
+        promotion = (
+            {"lifecycle_state": VolumeLifecycleState.AVAILABLE}
+            if existing.lifecycle_state is VolumeLifecycleState.PENDING_CREATE
+            else {}
+        )
+        updated = _observed_volume(existing, volume, now=self._now()).model_copy(update=promotion)
+        volumes = dict(document.volumes)
+        volumes[identity] = updated
+        self._write(document.model_copy(update={"volumes": volumes}))
+        return updated
+
+    @_serialized
+    def reconcile(self, volumes: Iterable[NetworkVolume]) -> list[VolumeRecord]:
+        """Merge local records with the provider's authoritative list.
+
+        A pending intent whose exact identity now exists is adopted. A tracked volume the
+        provider no longer lists is marked absent without being deleted locally, so the
+        history of what this tool created survives an out-of-band deletion. An identity
+        matching more than one provider volume is left untouched: the provider does not
+        require unique names, and adopting one of several would be a guess.
+        """
+
+        document = self._load()
+        if not document.volumes:
+            return []
+        provider_volumes = list(volumes)
+        now = self._now()
+        updated_records: dict[str, VolumeRecord] = {}
+        for identity, existing in document.volumes.items():
+            # Match by the name this tool requested, and also by the exact provider ID this
+            # record already linked. A provider response that omits the name, or reports a
+            # name that differs from the requested one, must not be read as "absent".
+            matches = [
+                volume
+                for volume in provider_volumes
+                if volume.name == identity
+                or (
+                    existing.provider_volume_id is not None
+                    and volume.id == existing.provider_volume_id
+                )
+            ]
+            if len(matches) > 1:
+                updated_records[identity] = existing
+                continue
+            if len(matches) == 1:
+                updated_records[identity] = _observed_volume(
+                    existing,
+                    matches[0],
+                    now=now,
+                ).model_copy(
+                    update={
+                        "lifecycle_state": VolumeLifecycleState.AVAILABLE,
+                        "provider_absent": False,
+                    }
+                )
+                continue
+            if existing.provider_volume_id is None:
+                # A pending intent with no provider match yet: nothing to conclude.
+                updated_records[identity] = existing
+                continue
+            updated_records[identity] = existing.model_copy(
+                update={
+                    "last_observed_at": now,
+                    "provider_absent": True,
+                }
+            )
+        self._write(document.model_copy(update={"volumes": updated_records}))
+        return list(updated_records.values())
+
+    @_serialized
+    def mark_destroyed(self, provider_volume_id: str) -> VolumeRecord | None:
+        """Record explicit destruction of one exact provider volume.
+
+        It never touches worker records: volume and Pod lifecycle stay independent, so
+        destroying a volume cannot imply destroying the compute that mounted it.
+        """
+
+        document = self._load()
+        identity = next(
+            (
+                key
+                for key, record in document.volumes.items()
+                if record.provider_volume_id == provider_volume_id
+            ),
+            None,
+        )
+        if identity is None:
+            return None
+        updated = document.volumes[identity].model_copy(
+            update={
+                "lifecycle_state": VolumeLifecycleState.DESTROYED,
+                "last_observed_at": self._now(),
+                "provider_absent": True,
+            }
+        )
+        volumes = dict(document.volumes)
+        volumes[identity] = updated
+        self._write(document.model_copy(update={"volumes": volumes}))
+        return updated
+
+    def _load(self) -> _VolumeDocument:
+        if not self.path.exists():
+            return _VolumeDocument()
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            return _VolumeDocument.model_validate(payload)
+        except (OSError, json.JSONDecodeError, ValidationError) as exc:
+            raise StateError(f"Could not read network volume state {self.path}: {exc}") from exc
+
+    def _write(self, document: _VolumeDocument) -> None:
+        write_json_atomically(self.path, document.model_dump(mode="json"))
+
+
+def _identity_for_volume(
+    records: Iterable[VolumeRecord],
+    volume: NetworkVolume,
+) -> str | None:
+    """Return the infra identity of the record that describes one provider volume."""
+
+    if volume.name is not None:
+        for record in records:
+            if record.infra_identity == volume.name:
+                return record.infra_identity
+    for record in records:
+        if record.provider_volume_id == volume.id:
+            return record.infra_identity
+    return None
+
+
+def _observed_volume(
+    existing: VolumeRecord,
+    volume: NetworkVolume,
+    *,
+    now: datetime,
+) -> VolumeRecord:
+    return existing.model_copy(
+        update={
+            "provider_volume_id": volume.id,
+            "name": volume.name,
+            "observed_size_gb": volume.size_gb,
+            "observed_data_center": volume.datacenter,
+            "observed_volume_type": volume.volume_type,
+            "last_observed_at": now,
+            "provider_absent": False,
+        }
+    )
 
 
 def _known_running_price(

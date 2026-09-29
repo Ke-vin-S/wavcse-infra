@@ -24,6 +24,7 @@ from wavcse_infra.errors import (
     JobSpecError,
     ProviderError,
     ProviderNotFoundError,
+    ResourceUnavailableError,
     SshEndpointUnavailableError,
     StateError,
     StorageError,
@@ -44,6 +45,10 @@ from wavcse_infra.jobs.status import JobCoordinator
 from wavcse_infra.jobs.submit import JobSubmitter
 from wavcse_infra.models import (
     CloudType,
+    NetworkVolume,
+    NetworkVolumeCreationPlan,
+    NetworkVolumeSpec,
+    VolumeType,
     Worker,
     WorkerConnectionInfo,
     WorkerCreationPlan,
@@ -51,9 +56,16 @@ from wavcse_infra.models import (
     WorkerSpec,
     WorkerState,
 )
-from wavcse_infra.providers.runpod import RunPodClient
+from wavcse_infra.providers.runpod import RunPodClient, network_volume_create_payload
 from wavcse_infra.redaction import redact
-from wavcse_infra.state import WorkerRecord, WorkerStateStore
+from wavcse_infra.state import (
+    VolumeLifecycleState,
+    VolumeRecord,
+    VolumeStateStore,
+    WorkerRecord,
+    WorkerStateStore,
+)
+from wavcse_infra.storage.cache import CacheStats, WorkerArtifactCache
 from wavcse_infra.storage.manifests import ArtifactManifest, load_manifest_json
 from wavcse_infra.storage.s3 import (
     MAX_PRESIGN_EXPIRY_SECONDS,
@@ -66,6 +78,11 @@ from wavcse_infra.storage.transfer import (
     WorkerArtifactTransfer,
 )
 from wavcse_infra.storage.worker_transfer import MAX_DOWNLOAD_CONCURRENCY
+from wavcse_infra.volumes.lifecycle import (
+    VolumeLifecycle,
+    constrain_worker_spec_to_volume,
+    volume_placement_failure_message,
+)
 from wavcse_infra.workers.bootstrap import WorkerBootstrapper
 from wavcse_infra.workers.lifecycle import WorkerLifecycle
 from wavcse_infra.workers.ssh import SshExecutor, WorkerSshWaiter, select_worker_connection
@@ -78,10 +95,20 @@ app = typer.Typer(
 )
 config_app = typer.Typer(help="Validate controller configuration.", no_args_is_help=True)
 worker_app = typer.Typer(help="Manage RunPod GPU workers.", no_args_is_help=True)
+volume_app = typer.Typer(
+    help="Manage persistent RunPod network volumes.",
+    no_args_is_help=True,
+)
+volume_cache_app = typer.Typer(
+    help="Inspect the rebuildable artifact cache on a mounted network volume.",
+    no_args_is_help=True,
+)
 storage_app = typer.Typer(help="Inspect and transfer canonical S3 artifacts.", no_args_is_help=True)
 job_app = typer.Typer(help="Submit and inspect recorded exact-commit jobs.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 app.add_typer(worker_app, name="worker")
+app.add_typer(volume_app, name="volume")
+volume_app.add_typer(volume_cache_app, name="cache")
 app.add_typer(storage_app, name="storage")
 app.add_typer(job_app, name="job")
 
@@ -334,13 +361,20 @@ def create_worker(
     container_disk: Annotated[
         int, typer.Option("--container-disk", min=1, help="Ephemeral container disk in GB.")
     ] = 20,
-    volume: Annotated[
+    volume_gb: Annotated[
         int,
         typer.Option("--volume", min=0, help="Host-local persistent volume in GB; 0 disables."),
     ] = 0,
     volume_mount_path: Annotated[
-        str, typer.Option("--volume-mount-path", help="Persistent/network volume mount path.")
-    ] = "/workspace",
+        str | None,
+        typer.Option(
+            "--volume-mount-path",
+            help=(
+                "Persistent/network volume mount path; defaults to volumes.mount_path for a "
+                "network volume and /workspace otherwise."
+            ),
+        ),
+    ] = None,
     network_volume_id: Annotated[
         str | None,
         typer.Option("--network-volume-id", help="Existing RunPod network volume ID."),
@@ -383,37 +417,61 @@ def create_worker(
         bool, typer.Option("--yes", help="Bypass only the interactive creation confirmation.")
     ] = False,
 ) -> None:
-    """Plan, confirm, create, persist, and wait for one RunPod Pod."""
+    """Plan, confirm, create, persist, and wait for one RunPod Pod.
+
+    A Pod that mounts a network volume is constrained to that volume's data center before any
+    paid request is issued, because RunPod can only place it there. If the requested GPU has
+    no confirmed capacity in that data center, the command fails while it is still free to do
+    so.
+    """
 
     settings = _load_cli_settings(_context(context))
     try:
-        spec = WorkerSpec(
-            name=_infra_worker_name(name),
-            gpu_type=gpu,
-            gpu_count=gpu_count,
-            cloud_type=cloud,
-            image=image,
-            template_id=template,
-            container_disk_gb=container_disk,
-            volume_gb=volume,
-            volume_mount_path=volume_mount_path,
-            network_volume_id=network_volume_id,
-            data_center_ids=tuple(data_center or ()),
-            interruptible=interruptible,
-            start_ssh=start_ssh,
-            require_direct_ssh=require_direct_ssh,
-        )
-    except ValidationError as exc:
-        _configuration_failure(exc)
-
-    try:
         with RunPodClient.from_settings(settings) as client:
-            lifecycle = _lifecycle(client, settings)
-            plan = lifecycle.plan_create(
-                spec,
-                max_hourly_price=_parse_price(max_price),
+            volume = (
+                _volume_lifecycle(client, settings).show(network_volume_id)
+                if network_volume_id is not None
+                else None
             )
-            _print_creation_plan(plan)
+            try:
+                spec = WorkerSpec(
+                    name=_infra_worker_name(name),
+                    gpu_type=gpu,
+                    gpu_count=gpu_count,
+                    cloud_type=cloud,
+                    image=image,
+                    template_id=template,
+                    container_disk_gb=container_disk,
+                    volume_gb=volume_gb,
+                    volume_mount_path=_resolve_volume_mount_path(
+                        volume_mount_path,
+                        volume=volume,
+                        settings=settings,
+                    ),
+                    network_volume_id=network_volume_id,
+                    data_center_ids=tuple(data_center or ()),
+                    interruptible=interruptible,
+                    start_ssh=start_ssh,
+                    require_direct_ssh=require_direct_ssh,
+                )
+            except ValidationError as exc:
+                _configuration_failure(exc)
+            if volume is not None:
+                spec = constrain_worker_spec_to_volume(spec, volume)
+
+            lifecycle = _lifecycle(client, settings)
+            try:
+                plan = lifecycle.plan_create(
+                    spec,
+                    max_hourly_price=_parse_price(max_price),
+                )
+            except ResourceUnavailableError as exc:
+                if volume is None:
+                    raise
+                raise ResourceUnavailableError(
+                    volume_placement_failure_message(spec, volume, reason=str(exc))
+                ) from exc
+            _print_creation_plan(plan, volume=volume)
             if not yes and not typer.confirm("Create this paid RunPod Pod?"):
                 typer.echo("Creation cancelled; no Pod was created.")
                 return
@@ -726,6 +784,389 @@ def destroy_worker(
         typer.echo(f"RunPod worker {worker_id} was already absent.")
     else:
         typer.echo(f"RunPod worker {worker_id} was destroyed and is now absent.")
+
+
+@volume_app.command("list")
+def list_volumes(
+    context: typer.Context,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """List network volumes and reconcile tracked local metadata."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            volumes = _volume_lifecycle(client, settings).refresh()
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    records = _volume_records()
+    if json_output:
+        _print_json(
+            {
+                "volumes": [volume.model_dump(mode="json") for volume in volumes],
+                "tracked": {
+                    record.infra_identity: _volume_record_json(record) for record in records
+                },
+            }
+        )
+        return
+    if not volumes:
+        typer.echo("No RunPod network volumes found.")
+        _print_untracked_volume_warning(volumes, records)
+        return
+
+    typer.echo("ID\tDATA CENTER\tSIZE\tTIER\tNAME")
+    for volume in volumes:
+        typer.echo(
+            "\t".join(
+                (
+                    volume.id,
+                    volume.datacenter,
+                    f"{volume.size_gb} GB",
+                    volume.volume_type.value if volume.volume_type is not None else "-",
+                    volume.name or "-",
+                )
+            )
+        )
+    _print_untracked_volume_warning(volumes, records)
+
+
+@volume_app.command("show")
+def show_volume(
+    context: typer.Context,
+    volume_id: Annotated[str, typer.Argument(help="Exact RunPod network volume ID.")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Show one network volume by exact provider ID, with its provider-reported charges."""
+
+    settings = _load_cli_settings(_context(context))
+    billing_total: Decimal | None = None
+    billing_note: str | None = None
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            lifecycle = _volume_lifecycle(client, settings)
+            volume = lifecycle.show(volume_id)
+            try:
+                billing = lifecycle.billing(volume_id=volume_id, last_n=24)
+                billing_total = billing.total_amount_usd
+            except ProviderError as exc:
+                billing_note = redact(exc)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderNotFoundError as exc:
+        _mark_volume_destroyed_locally(volume_id)
+        _provider_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    record = _volume_record(volume_id)
+    if json_output:
+        _print_json(
+            {
+                "volume": volume.model_dump(mode="json"),
+                "tracked": _volume_record_json(record) if record is not None else None,
+                "billed_usd_last_24_buckets": (
+                    str(billing_total) if billing_total is not None else None
+                ),
+            }
+        )
+        return
+    _print_volume(volume, record=record, billed_total=billing_total)
+    if billing_note is not None:
+        typer.echo(f"Provider billing unavailable: {billing_note}", err=True)
+
+
+@volume_app.command("datacenters")
+def list_volume_datacenters(
+    context: typer.Context,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """List the data centers that can host a network volume, and their storage tiers."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            data_centers = _volume_lifecycle(client, settings).data_centers()
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    if json_output:
+        _print_json([entry.model_dump(mode="json") for entry in data_centers])
+        return
+    if not data_centers:
+        typer.echo("RunPod reports no data center that can host a network volume.")
+        return
+    typer.echo("DATA CENTER\tREGION\tSTORAGE TIERS\tNAME")
+    for entry in data_centers:
+        typer.echo(
+            "\t".join(
+                (
+                    entry.id,
+                    entry.region or "-",
+                    ", ".join(volume_type.value for volume_type in entry.network_volume_types),
+                    entry.name or "-",
+                )
+            )
+        )
+
+
+@volume_app.command("create")
+def create_volume(
+    context: typer.Context,
+    data_center: Annotated[
+        str,
+        typer.Option("--data-center", help="Exact RunPod data-center ID for the volume."),
+    ],
+    size: Annotated[
+        int,
+        typer.Option("--size", min=10, max=4096, help="Volume size in GB."),
+    ],
+    tier: Annotated[
+        VolumeType | None,
+        typer.Option(
+            "--tier",
+            case_sensitive=False,
+            help="Storage tier; defaults to the data center's own default tier.",
+        ),
+    ] = None,
+    name: Annotated[
+        str | None,
+        typer.Option("--name", help="Human prefix; an infra-unique suffix is always added."),
+    ] = None,
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Bypass only the interactive creation confirmation.")
+    ] = False,
+) -> None:
+    """Plan, confirm, and create one billable persistent network volume."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        spec = NetworkVolumeSpec(
+            name=_infra_volume_name(name),
+            size_gb=size,
+            datacenter=data_center,
+            volume_type=tier,
+        )
+    except ValidationError as exc:
+        _configuration_failure(exc)
+
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            lifecycle = _volume_lifecycle(client, settings)
+            plan = lifecycle.plan_create(spec)
+            _print_volume_creation_plan(plan)
+            if not yes and not typer.confirm("Create this billable RunPod network volume?"):
+                typer.echo("Creation cancelled; no volume was created.")
+                return
+            created = lifecycle.create(plan)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+
+    typer.echo("RunPod network volume created.")
+    _print_volume(created.volume, record=created.record)
+
+
+@volume_app.command("destroy")
+def destroy_volume(
+    context: typer.Context,
+    volume_id: Annotated[
+        str,
+        typer.Argument(help="Exact RunPod network volume ID; names are not accepted."),
+    ],
+    wait_timeout: Annotated[
+        float | None,
+        typer.Option("--wait-timeout", min=0.1, help="Lifecycle polling timeout in seconds."),
+    ] = None,
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Bypass only the interactive destroy confirmation.")
+    ] = False,
+) -> None:
+    """Permanently delete one exact-ID network volume after explicit confirmation.
+
+    Nothing else is deleted. Pods that mounted this volume keep running, and every canonical
+    object in S3 is untouched; only the rebuildable cache on the volume is lost.
+    """
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            lifecycle = _volume_lifecycle(client, settings)
+            try:
+                target = client.get_network_volume(volume_id)
+            except ProviderNotFoundError:
+                _mark_volume_destroyed_locally(volume_id)
+                typer.echo(
+                    f"RunPod network volume {volume_id} is already absent; nothing was "
+                    "destroyed. This command addresses a volume by its exact provider ID, "
+                    "never by name; `infra volume list` shows both."
+                )
+                return
+            record = _volume_record(volume_id)
+            _print_volume_destroy_plan(
+                target,
+                record=record,
+                mounting_workers=_mounting_workers(target.id),
+            )
+            if not yes and not typer.confirm(
+                f"Permanently destroy exact RunPod network volume {volume_id} and its cached data?"
+            ):
+                typer.echo("Destroy cancelled; the volume was not changed.")
+                return
+            result = lifecycle.destroy(volume_id, timeout_seconds=wait_timeout)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    if result.already_absent:
+        typer.echo(f"RunPod network volume {volume_id} was already absent.")
+    else:
+        typer.echo(f"RunPod network volume {volume_id} was destroyed and is now absent.")
+    typer.echo(
+        "No Pod was stopped or destroyed, and no S3 object was deleted. "
+        "A Pod that still mounts this volume must be destroyed explicitly."
+    )
+
+
+@volume_app.command("forget")
+def forget_volume(
+    context: typer.Context,
+    infra_identity: Annotated[
+        str,
+        typer.Argument(
+            help="Infra identity of a tracked volume record, as shown by `infra volume list`.",
+        ),
+    ],
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Bypass only the interactive confirmation.")
+    ] = False,
+) -> None:
+    """Remove one local volume record without contacting or changing the provider.
+
+    This exists for one case: a create whose response was lost and whose reconciliation
+    found no matching provider volume. Forgetting the intent allows a later create, and it
+    deletes bookkeeping only. A provider volume that does exist stays visible in
+    `infra volume list`, but this controller would no longer link it to a create.
+    """
+
+    _load_cli_settings(_context(context))
+    store = _volume_state_store()
+    try:
+        record = store.get_by_identity(infra_identity)
+    except StateError as exc:
+        _operation_failure(exc)
+    if record is None:
+        typer.echo(
+            f"No tracked network volume record has infra identity {infra_identity!r}; "
+            "`infra volume list` shows the tracked identities."
+        )
+        return
+    typer.echo("Local volume record to forget")
+    typer.echo(f"Infra identity: {record.infra_identity}")
+    typer.echo(f"Provider volume id: {record.provider_volume_id or '-'}")
+    typer.echo(f"Requested: {record.requested_size_gb} GB in {record.requested_data_center}")
+    typer.echo(f"Life cycle: {record.lifecycle_state.value}")
+    typer.echo(
+        "No provider resource is changed or deleted by this command; only local bookkeeping "
+        "is removed."
+    )
+    if not yes and not typer.confirm(f"Forget the local record for {infra_identity!r}?"):
+        typer.echo("Forget cancelled; the record is unchanged.")
+        return
+    try:
+        forgotten = store.forget(infra_identity)
+    except StateError as exc:
+        _operation_failure(exc)
+    if forgotten is None:
+        typer.echo("The record was already absent; nothing changed.")
+        return
+    typer.echo(
+        f"Local record {infra_identity!r} was forgotten. Any provider volume it named is "
+        "unchanged and still appears in `infra volume list`."
+    )
+
+
+@volume_cache_app.command("stats")
+def cache_stats_command(
+    context: typer.Context,
+    worker: Annotated[
+        str,
+        typer.Option("--worker", help="Exact RunPod worker ID whose volume holds the cache."),
+    ],
+    wait_timeout: Annotated[
+        float | None,
+        typer.Option("--wait-timeout", min=0.1, help="SSH readiness timeout in seconds."),
+    ] = None,
+    command_timeout: Annotated[
+        float | None,
+        typer.Option("--command-timeout", min=0.1, help="Remote command timeout in seconds."),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Report the recorded contents of the rebuildable cache on a worker's volume.
+
+    Sizes come from each entry's own metadata document, so this stays cheap on a full volume.
+    Verification happens whenever an entry is used, which is where it matters; this command
+    proves the mount is present and reports an entry whose metadata is unusable separately.
+    """
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        with RunPodClient.from_settings(settings) as client:
+            worker_record = _state_record(worker)
+            cache_root = None if worker_record is None else worker_record.network_volume_mount_path
+            if cache_root is None:
+                raise ConfigurationError(
+                    f"Worker {worker} has no network volume mount recorded, so it has no "
+                    "rebuildable cache to inspect; create the Pod with --network-volume-id and "
+                    "bootstrap it first"
+                )
+            worker_view = client.get_worker(worker)
+            if worker_view.state is not WorkerState.RUNNING:
+                raise ConfigurationError(
+                    f"RunPod worker {worker} is {worker_view.state.value}; cache inspection "
+                    "requires provider state RUNNING"
+                )
+            executor, waiter = _ssh_access(client, settings)
+            transfer = WorkerArtifactTransfer(waiter, executor, settings.ssh)
+            cache = WorkerArtifactCache(
+                waiter,
+                executor,
+                settings.ssh,
+                transfer,
+                warn=_print_warning,
+            )
+            stats = cache.stats(
+                worker,
+                cache_root=cache_root,
+                wait_timeout_seconds=wait_timeout,
+                command_timeout_seconds=command_timeout,
+            )
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    if json_output:
+        _print_json(stats.model_dump(mode="json"))
+        return
+    _print_cache_stats(stats)
 
 
 @storage_app.command("list")
@@ -1327,15 +1768,23 @@ def _job_context(client: RunPodClient, settings: Settings) -> JobContext:
     state_store = _state_store()
     executor = SshExecutor(settings.ssh)
     waiter = WorkerSshWaiter(client, executor, state_store, settings.ssh)
+    transfer = WorkerArtifactTransfer(waiter, executor, settings.ssh)
     return JobContext(
         provider=client,
         worker_state=state_store,
         job_store=_job_store(),
         executor=JobExecutor(waiter, executor, settings.ssh, settings.jobs),
-        transfer=WorkerArtifactTransfer(waiter, executor, settings.ssh),
+        transfer=transfer,
         storage=_optional_storage(settings),
         jobs_config=settings.jobs,
         environ=os.environ,
+        cache=WorkerArtifactCache(
+            waiter,
+            executor,
+            settings.ssh,
+            transfer,
+            warn=_print_warning,
+        ),
     )
 
 
@@ -1397,6 +1846,7 @@ def _print_job(record: JobRecord, *, json_output: bool) -> None:
             f"({status}"
             + (f", {job_input.size_bytes} bytes" if job_input.size_bytes is not None else "")
             + (f", {job_input.sha256}" if job_input.sha256 else "")
+            + (f", from {job_input.source}" if job_input.source else "")
             + ")"
             + (f" [{job_input.failure_reason}]" if job_input.failure_reason else "")
         )
@@ -1479,6 +1929,96 @@ def _lifecycle(client: RunPodClient, settings: Settings) -> WorkerLifecycle:
         poll_interval_seconds=settings.runpod.poll_interval_seconds,
         max_poll_interval_seconds=settings.runpod.max_poll_interval_seconds,
     )
+
+
+def _volume_lifecycle(client: RunPodClient, settings: Settings) -> VolumeLifecycle:
+    return VolumeLifecycle(
+        client,
+        _volume_state_store(),
+        default_timeout_seconds=settings.runpod.lifecycle_timeout_seconds,
+        poll_interval_seconds=settings.runpod.poll_interval_seconds,
+        max_poll_interval_seconds=settings.runpod.max_poll_interval_seconds,
+    )
+
+
+def _volume_state_store() -> VolumeStateStore:
+    return VolumeStateStore()
+
+
+def _volume_records() -> list[VolumeRecord]:
+    try:
+        return _volume_state_store().list_records()
+    except StateError as exc:
+        typer.echo(f"State warning: {redact(exc)}", err=True)
+        return []
+
+
+def _volume_record(volume_id: str) -> VolumeRecord | None:
+    try:
+        return _volume_state_store().get(volume_id)
+    except StateError as exc:
+        typer.echo(f"State warning: {redact(exc)}", err=True)
+        return None
+
+
+def _mark_volume_destroyed_locally(volume_id: str) -> None:
+    try:
+        _volume_state_store().mark_destroyed(volume_id)
+    except StateError as exc:
+        typer.echo(f"State warning: {redact(exc)}", err=True)
+
+
+def _volume_record_json(record: VolumeRecord | None) -> dict[str, object] | None:
+    return None if record is None else record.model_dump(mode="json")
+
+
+def _mounting_workers(volume_id: str) -> list[str]:
+    """Return tracked worker IDs whose Pod was created with this exact network volume.
+
+    This is advisory evidence for the operator, never a cascade: a volume destroy does not
+    touch a Pod, and a Pod destroy does not touch a volume.
+    """
+
+    return [
+        record.provider_worker_id
+        for record in _state_records()
+        if record.network_volume_id == volume_id and not record.provider_absent
+    ]
+
+
+def _state_records() -> list[WorkerRecord]:
+    try:
+        return _state_store().list_records()
+    except StateError as exc:
+        typer.echo(f"State warning: {redact(exc)}", err=True)
+        return []
+
+
+def _resolve_volume_mount_path(
+    explicit: str | None,
+    *,
+    volume: NetworkVolume | None,
+    settings: Settings,
+) -> str:
+    """Return the mount path for one Pod request, defaulting per storage kind.
+
+    A network volume defaults to the configured cache path rather than to `/workspace`, so
+    the persistent volume holds only the rebuildable cache while job scratch and the job
+    workspace stay on ephemeral container disk. An explicit `--volume-mount-path` always
+    wins, and a Pod with no network volume keeps the historical `/workspace` default.
+    """
+
+    if explicit is not None:
+        return explicit
+    if volume is not None:
+        return settings.volumes.mount_path
+    return "/workspace"
+
+
+def _infra_volume_name(prefix: str | None) -> str:
+    normalized = re.sub(r"[^a-z0-9-]+", "-", (prefix or "cache").strip().lower())
+    normalized = normalized.strip("-")[:40] or "cache"
+    return f"wavcse-vol-{normalized}-{uuid4().hex[:12]}"
 
 
 def _state_store() -> WorkerStateStore:
@@ -1633,7 +2173,7 @@ def _format_connection(connection: WorkerConnectionInfo | None) -> str | None:
     return f"{connection.username}@{host}:{connection.port}"
 
 
-def _print_creation_plan(plan: WorkerCreationPlan) -> None:
+def _print_creation_plan(plan: WorkerCreationPlan, *, volume: NetworkVolume | None = None) -> None:
     spec = plan.spec
     offer = plan.offer
     fields = (
@@ -1663,8 +2203,160 @@ def _print_creation_plan(plan: WorkerCreationPlan) -> None:
     typer.echo("RunPod creation plan")
     for label, value in fields:
         typer.echo(f"{label}: {value if value is not None else '-'}")
+    if volume is not None:
+        typer.echo(f"Network volume data center: {volume.datacenter} (placement constrained)")
+        typer.echo(f"Network volume size: {volume.size_gb} GB")
     if offer.total_price_per_hour is None:
         typer.echo("WARNING: RunPod did not provide a reliable pre-creation GPU price.")
+    typer.echo(
+        "Storage charges are billed separately from GPU compute and continue while a "
+        "network volume and its Pod exist."
+    )
+
+
+def _print_volume(
+    volume: NetworkVolume,
+    *,
+    record: VolumeRecord | None,
+    billed_total: Decimal | None = None,
+) -> None:
+    fields = (
+        ("Provider", volume.provider),
+        ("ID", volume.id),
+        ("Name", volume.name),
+        ("Data center", volume.datacenter),
+        ("Size", f"{volume.size_gb} GB"),
+        ("Storage tier", volume.volume_type.value if volume.volume_type is not None else None),
+        (
+            "Tracked life cycle",
+            record.lifecycle_state.value if record is not None else "untracked",
+        ),
+        (
+            "Provider-reported absent",
+            "yes" if record is not None and record.provider_absent else "no",
+        ),
+    )
+    for label, value in fields:
+        typer.echo(f"{label}: {value if value is not None else '-'}")
+    if billed_total is not None:
+        typer.echo(f"Provider-billed storage (last 24 buckets): ${billed_total:.2f}")
+    typer.echo(
+        "This is rebuildable working storage, not canonical storage: S3 holds the only "
+        "authoritative copy of every artifact."
+    )
+
+
+def _print_volume_creation_plan(plan: NetworkVolumeCreationPlan) -> None:
+    spec = plan.spec
+    typer.echo("RunPod network volume creation plan")
+    typer.echo(f"Infra identity: {spec.name}")
+    typer.echo(f"Data center: {spec.datacenter}")
+    typer.echo(f"Size: {spec.size_gb} GB")
+    typer.echo(
+        "Storage tier: "
+        + (spec.volume_type.value if spec.volume_type is not None else "data center default")
+    )
+    typer.echo(
+        "Data center storage tiers: "
+        + (", ".join(tier.value for tier in plan.data_center.network_volume_types) or "unknown")
+    )
+    if plan.published_list_price_usd_per_gb_month is not None:
+        typer.echo(
+            "RunPod published list price: "
+            f"${plan.published_list_price_usd_per_gb_month}/GB/month "
+            "(published rate, not a provider-reported charge)"
+        )
+    if plan.estimated_monthly_cost_usd is not None:
+        typer.echo(f"Estimated storage cost: ${plan.estimated_monthly_cost_usd}/month")
+    elif plan.published_list_price_usd_per_gb_month is not None:
+        typer.echo(
+            "Estimated storage cost: not quoted; the published rate covers volumes up to "
+            f"{plan.published_list_price_max_size_gb} GB and this request is larger"
+        )
+    else:
+        typer.echo(
+            "Estimated storage cost: unknown; RunPod publishes no rate this tool can quote "
+            "for the requested tier"
+        )
+    typer.echo(
+        "Exact create request: " + json.dumps(network_volume_create_payload(spec), sort_keys=True)
+    )
+    typer.echo(
+        "This is a billable persistent resource: storage charges continue until the volume "
+        "is destroyed."
+    )
+
+
+def _print_volume_destroy_plan(
+    volume: NetworkVolume,
+    *,
+    record: VolumeRecord | None,
+    mounting_workers: list[str],
+) -> None:
+    typer.echo("RunPod network volume destroy target")
+    typer.echo(f"ID: {volume.id}")
+    typer.echo(f"Name: {volume.name or '-'}")
+    typer.echo(f"Data center: {volume.datacenter}")
+    typer.echo(f"Size: {volume.size_gb} GB")
+    typer.echo(
+        "Storage tier: "
+        + (volume.volume_type.value if volume.volume_type is not None else "unknown")
+    )
+    typer.echo(f"Tracked life cycle: {record.lifecycle_state.value if record else 'untracked'}")
+    if mounting_workers:
+        typer.echo(
+            "Tracked Pods that mount this volume (they are NOT destroyed): "
+            + ", ".join(sorted(mounting_workers))
+        )
+    typer.echo(
+        "The rebuildable cache on this volume is permanently lost. Canonical S3 objects are "
+        "not touched."
+    )
+
+
+def _print_untracked_volume_warning(
+    volumes: list[NetworkVolume],
+    records: list[VolumeRecord],
+) -> None:
+    """Warn about local intents the provider's list has not confirmed yet.
+
+    A pending intent with no provider match is the visible evidence of an ambiguous create.
+    None is ever hidden: a paid resource that may exist must never look like it does not.
+    """
+
+    provider_names = {volume.name for volume in volumes}
+    for record in records:
+        if (
+            record.lifecycle_state is VolumeLifecycleState.PENDING_CREATE
+            and record.infra_identity not in provider_names
+        ):
+            typer.echo(
+                f"Warning: local state records an unresolved create intent "
+                f"{record.infra_identity!r} ({record.requested_size_gb} GB in "
+                f"{record.requested_data_center}) with no matching provider volume. RunPod "
+                "may have created it; inspect the provider console before creating anything "
+                "with that identity.",
+                err=True,
+            )
+
+
+def _print_cache_stats(stats: CacheStats) -> None:
+    typer.echo(f"Cache root: {stats.root}")
+    typer.echo(f"Verified entries: {stats.entries}")
+    typer.echo(f"Recorded cached bytes: {stats.cached_bytes} ({_gibibytes(stats.cached_bytes)})")
+    typer.echo(f"Staged bytes (safe to delete): {stats.staging_bytes}")
+    typer.echo(f"Entries with unusable metadata: {stats.unverified_entries}")
+    typer.echo("Marker schema version: " + (stats.marker_schema_version or "absent"))
+    typer.echo(
+        "Recorded sizes are metadata, not a re-read: every entry is hashed whenever it is "
+        "actually used. Explicit cleanup is operator-managed: remove "
+        "a specific digest directory, or everything under staging/, with "
+        "`infra worker exec <worker-id> -- rm -rf <path>`."
+    )
+
+
+def _gibibytes(value: int) -> str:
+    return f"{value / (1024**3):.2f} GiB"
 
 
 def _print_destroy_plan(worker: Worker, record: WorkerRecord | None) -> None:

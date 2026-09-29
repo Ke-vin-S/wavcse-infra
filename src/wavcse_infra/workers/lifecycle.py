@@ -19,6 +19,7 @@ from wavcse_infra.errors import (
     ProviderValidationError,
     ResourceUnavailableError,
     StateError,
+    WorkerPlacementError,
 )
 from wavcse_infra.models import (
     Availability,
@@ -149,7 +150,12 @@ class WorkerLifecycle:
         *,
         timeout_seconds: float | None = None,
     ) -> Worker:
-        """Create once, persist the provider ID, then wait for RUNNING."""
+        """Create once, persist the provider ID, then wait for RUNNING.
+
+        A Pod created to mount a network volume is verified against the provider's own
+        placement answer before this returns: the volume exists in exactly one data center,
+        and a Pod the scheduler placed anywhere else cannot use it.
+        """
 
         worker = self._provider.create_worker(plan.spec)
         try:
@@ -158,16 +164,63 @@ class WorkerLifecycle:
             raise StateError(
                 f"RunPod Pod {worker.id} was created, but local state could not be persisted: {exc}"
             ) from exc
-        if worker.state is WorkerState.RUNNING:
+        if worker.state is not WorkerState.RUNNING:
+            worker = self._wait_for_state(
+                worker.id,
+                target_states={WorkerState.RUNNING},
+                terminal_states={WorkerState.ERROR, WorkerState.DESTROYED},
+                operation="become RUNNING after creation",
+                timeout_seconds=timeout_seconds,
+                initial_worker=worker,
+            )
+        return self._verify_network_volume_placement(plan, worker)
+
+    def _verify_network_volume_placement(
+        self,
+        plan: WorkerCreationPlan,
+        worker: Worker,
+    ) -> Worker:
+        """Require the provider to confirm the Pod landed where its volume lives.
+
+        Placement and the attached mount are both provider-reported facts, and neither is
+        assumed from the request. The checks only fire on affirmative contradiction: a Pod
+        whose data center plainly differs, or a Pod that reported a mounts document without
+        the requested volume.
+        """
+
+        volume_id = plan.spec.network_volume_id
+        if volume_id is None:
             return worker
-        return self._wait_for_state(
-            worker.id,
-            target_states={WorkerState.RUNNING},
-            terminal_states={WorkerState.ERROR, WorkerState.DESTROYED},
-            operation="become RUNNING after creation",
-            timeout_seconds=timeout_seconds,
-            initial_worker=worker,
-        )
+        expected_data_centers = plan.spec.data_center_ids
+        needs_refresh = worker.datacenter is None or worker.network_volume_id is None
+        if needs_refresh:
+            with suppress(ProviderUnavailableError):
+                worker = self._provider.get_worker(worker.id)
+        if (
+            expected_data_centers
+            and worker.datacenter is not None
+            and worker.datacenter not in expected_data_centers
+        ):
+            raise WorkerPlacementError(
+                f"RunPod placed Pod {worker.id} in data center {worker.datacenter}, but "
+                f"network volume {volume_id} exists in "
+                f"{', '.join(expected_data_centers)}. The Pod was created and is billing, "
+                "but it cannot use that volume: destroy it explicitly with "
+                f"`infra worker destroy {worker.id}` or create a replacement Pod in "
+                f"{', '.join(expected_data_centers)}"
+            )
+        if worker.mounts_reported and worker.network_volume_id != volume_id:
+            reported = (
+                "no network volume"
+                if worker.network_volume_id is None
+                else f"network volume {worker.network_volume_id}"
+            )
+            raise WorkerPlacementError(
+                f"RunPod reports Pod {worker.id} mounting {reported}, but {volume_id} was "
+                "requested. The Pod was created and is billing; it does not have the "
+                "intended working storage"
+            )
+        return worker
 
     def start(
         self,

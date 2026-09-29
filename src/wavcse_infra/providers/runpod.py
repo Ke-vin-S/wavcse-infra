@@ -30,8 +30,14 @@ from wavcse_infra.errors import (
 from wavcse_infra.models import (
     Availability,
     CloudType,
+    DataCenterInfo,
     GpuDataCenterAvailability,
     GpuOffer,
+    NetworkVolume,
+    NetworkVolumeBilling,
+    NetworkVolumeBillingRecord,
+    NetworkVolumeSpec,
+    VolumeType,
     Worker,
     WorkerConnectionInfo,
     WorkerSpec,
@@ -43,6 +49,26 @@ _RETRYABLE_STATUS_CODES = frozenset({429})
 _AMBIGUOUS_MUTATION_STATUS_CODES = frozenset({408, 429})
 _MAX_RETRY_DELAY_SECONDS = 30.0
 _LIST_PAGE_SIZE = 1000
+
+# RunPod publishes network volume storage rates in its documentation, but exposes no price
+# field on the network volume resource or in its catalog: `GET /v2/network-volumes` returns
+# only id, name, size, dataCenter, and type, and the only money the API reports is billing
+# that has already been incurred (`GET /v2/billing/network-volumes`). These published list
+# rates are therefore the only pre-creation estimate that exists. They are always labelled
+# as published list prices rather than provider-reported charges, they never decide a guard,
+# and `infra volume show` reports the account's actual billed amounts alongside them. The
+# provider documents high-performance storage as "a premium to standard storage" whose exact
+# per-GB rate varies by data center and is shown only in its console, so that tier has no
+# estimate this tool is willing to state.
+PUBLISHED_NETWORK_VOLUME_STORAGE_USD_PER_GB_MONTH: dict[VolumeType, Decimal] = {
+    VolumeType.STANDARD: Decimal("0.07"),
+}
+
+# The published per-GB rates above are quoted for volumes up to this size. RunPod publishes a
+# different (lower) rate for larger volumes of the same tier. The exact banding is not stated
+# unambiguously by the provider, so the tool quotes nothing above this bound rather than
+# applying a rate whose scope it cannot verify.
+PUBLISHED_NETWORK_VOLUME_STORAGE_MAX_TIER_GB = 1024
 
 _PUBLIC_IP_OFFERS_QUERY = """
 query PublicIpOffers($gpu: GpuTypeFilter, $price: GpuLowestPriceInput!) {
@@ -167,6 +193,54 @@ class _GpuList(_WireModel):
 
 class _GraphqlError(_WireModel):
     message: str = Field(min_length=1)
+
+
+class _NetworkVolumeWire(_WireModel):
+    id: str = Field(min_length=1)
+    name: str | None = None
+    size: int = Field(ge=0)
+    data_center: str = Field(alias="dataCenter", min_length=1)
+    type: str | None = None
+
+
+class _NetworkVolumeList(_WireModel):
+    network_volumes: list[_NetworkVolumeWire] = Field(alias="networkVolumes")
+
+
+class _DataCenterWire(_WireModel):
+    id: str = Field(min_length=1)
+    name: str | None = None
+    region: str | None = None
+    network_volume_types: list[str] = Field(default_factory=list, alias="networkVolumeTypes")
+    global_network: bool | None = Field(default=None, alias="globalNetwork")
+    gpu_availability: list[_GpuDataCenter] = Field(default_factory=list, alias="gpuAvailability")
+
+
+class _DataCenterList(_WireModel):
+    data_centers: list[_DataCenterWire] = Field(alias="dataCenters")
+
+
+class _VolumeBillingAmounts(_WireModel):
+    total_amount: Decimal = Field(alias="totalAmount")
+    standard_amount: Decimal = Field(default=Decimal(0), alias="standardAmount")
+    high_performance_amount: Decimal = Field(default=Decimal(0), alias="highPerformanceAmount")
+
+
+class _VolumeBillingRecord(_VolumeBillingAmounts):
+    network_volume_id: str = Field(alias="networkVolumeId", min_length=1)
+    start_time: datetime | None = Field(default=None, alias="startTime")
+    end_time: datetime | None = Field(default=None, alias="endTime")
+
+
+class _VolumeBillingMetadata(_WireModel):
+    totals: _VolumeBillingAmounts
+    record_count: int = Field(default=0, alias="recordCount", ge=0)
+    unique_volume_count: int = Field(default=0, alias="uniqueNetworkVolumeCount", ge=0)
+
+
+class _VolumeBillingResponse(_WireModel):
+    records: list[_VolumeBillingRecord] = Field(default_factory=list)
+    metadata: _VolumeBillingMetadata
 
 
 class _GraphqlLowestPrice(_WireModel):
@@ -511,6 +585,177 @@ class RunPodClient:
             cause=ProviderResponseError("RunPod public-IP create returned no Pod ID"),
         )
 
+    def list_network_volumes(self) -> list[NetworkVolume]:
+        """Return every network volume owned by the configured account."""
+
+        payload = self._get_json("network-volumes", operation="list network volumes")
+        try:
+            page = _NetworkVolumeList.model_validate(payload)
+        except ValidationError as exc:
+            raise ProviderResponseError(
+                f"RunPod list network volumes returned an unexpected response: "
+                f"{_validation_summary(exc)}"
+            ) from exc
+        return [_normalize_network_volume(volume) for volume in page.network_volumes]
+
+    def get_network_volume(self, volume_id: str) -> NetworkVolume:
+        """Return one network volume by exact provider ID."""
+
+        normalized_id = _volume_id(volume_id)
+        operation = f"show network volume {normalized_id}"
+        payload = self._get_json(
+            f"network-volumes/{quote(normalized_id, safe='')}",
+            operation=operation,
+            volume_id=normalized_id,
+        )
+        return _parse_network_volume(payload, operation=operation)
+
+    def create_network_volume(self, spec: NetworkVolumeSpec) -> NetworkVolume:
+        """Create one network volume without ever blindly retrying the paid POST."""
+
+        try:
+            response = self._client.post(
+                "network-volumes",
+                json=network_volume_create_payload(spec),
+            )
+        except httpx.TransportError as exc:
+            return self._reconcile_ambiguous_volume_create(spec, cause=exc)
+
+        if response.status_code >= 500 or response.status_code in _AMBIGUOUS_MUTATION_STATUS_CODES:
+            return self._reconcile_ambiguous_volume_create(
+                spec,
+                cause=ProviderOperationAmbiguousError(
+                    f"RunPod create network volume returned HTTP {response.status_code}"
+                ),
+            )
+        _raise_for_provider_status(response, "create network volume")
+        try:
+            return _parse_network_volume(response.json(), operation="create network volume")
+        except (ValueError, ProviderResponseError) as exc:
+            return self._reconcile_ambiguous_volume_create(spec, cause=exc)
+
+    def destroy_network_volume(self, volume_id: str) -> None:
+        """Permanently delete one network volume by exact provider ID."""
+
+        normalized_id = _volume_id(volume_id)
+        operation = f"destroy network volume {normalized_id}"
+        try:
+            response = self._client.delete(f"network-volumes/{quote(normalized_id, safe='')}")
+        except httpx.TransportError as exc:
+            raise ProviderOperationAmbiguousError(
+                f"RunPod {operation} lost its response; provider state must be reconciled"
+            ) from exc
+        if response.status_code >= 500 or response.status_code in _AMBIGUOUS_MUTATION_STATUS_CODES:
+            raise ProviderOperationAmbiguousError(
+                f"RunPod {operation} returned HTTP {response.status_code}; "
+                "provider state must be reconciled"
+            )
+        _raise_for_provider_status(response, operation, volume_id=normalized_id)
+        if response.status_code != 204:
+            raise ProviderResponseError(
+                f"RunPod {operation} returned unexpected HTTP {response.status_code}"
+            )
+
+    def list_data_centers(
+        self,
+        *,
+        include_gpu_availability: bool = False,
+    ) -> list[DataCenterInfo]:
+        """Return the current data-center catalog, including network volume tiers."""
+
+        params: dict[str, str] | None = (
+            {"include": "GPU_AVAILABILITY"} if include_gpu_availability else None
+        )
+        payload = self._get_json(
+            "catalog/datacenters",
+            operation="list data centers",
+            params=params,
+        )
+        try:
+            catalog = _DataCenterList.model_validate(payload)
+        except ValidationError as exc:
+            raise ProviderResponseError(
+                f"RunPod list data centers returned an unexpected response: "
+                f"{_validation_summary(exc)}"
+            ) from exc
+        return [_normalize_data_center(data_center) for data_center in catalog.data_centers]
+
+    def list_network_volume_billing(
+        self,
+        *,
+        volume_id: str | None = None,
+        last_n: int | None = None,
+    ) -> NetworkVolumeBilling:
+        """Return provider-reported storage charges, the only real storage price exposed."""
+
+        params: dict[str, str | int] = {}
+        if volume_id is not None:
+            params["networkVolumeId"] = _volume_id(volume_id)
+        if last_n is not None:
+            params["lastN"] = last_n
+        payload = self._get_json(
+            "billing/network-volumes",
+            operation="read network volume billing",
+            params=params or None,
+        )
+        try:
+            billing = _VolumeBillingResponse.model_validate(payload)
+        except ValidationError as exc:
+            raise ProviderResponseError(
+                f"RunPod network volume billing returned an unexpected response: "
+                f"{_validation_summary(exc)}"
+            ) from exc
+        return NetworkVolumeBilling(
+            records=tuple(
+                NetworkVolumeBillingRecord(
+                    volume_id=record.network_volume_id,
+                    total_amount_usd=record.total_amount,
+                    standard_amount_usd=record.standard_amount,
+                    high_performance_amount_usd=record.high_performance_amount,
+                    start_time=record.start_time,
+                    end_time=record.end_time,
+                )
+                for record in billing.records
+            ),
+            total_amount_usd=billing.metadata.totals.total_amount,
+            unique_volume_count=billing.metadata.unique_volume_count,
+        )
+
+    def _reconcile_ambiguous_volume_create(
+        self,
+        spec: NetworkVolumeSpec,
+        *,
+        cause: Exception,
+    ) -> NetworkVolume:
+        """Decide whether a paid volume create happened, without repeating the request."""
+
+        last_error: ProviderError | None = None
+        for attempt in range(1, self._config.create_reconcile_attempts + 1):
+            try:
+                matches = [
+                    volume for volume in self.list_network_volumes() if volume.name == spec.name
+                ]
+            except ProviderError as exc:
+                last_error = exc
+                matches = []
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise AmbiguousCreateError(
+                    f"RunPod network volume create result is ambiguous: {len(matches)} volumes "
+                    f"have exact infra identity {spec.name!r}; no create retry was attempted"
+                ) from cause
+            if attempt < self._config.create_reconcile_attempts:
+                self._backoff(attempt)
+
+        detail = f"; last reconciliation error: {last_error}" if last_error else ""
+        raise AmbiguousCreateError(
+            "RunPod may have created a billable network volume, but no response was received "
+            f"and exact-name reconciliation found no volume with infra identity {spec.name!r}"
+            f"{detail}. The create request was not retried; run `infra volume list` to "
+            "reconcile the recorded intent before trying again."
+        ) from cause
+
     def _graphql_json(
         self,
         query: str,
@@ -637,6 +882,7 @@ class RunPodClient:
         *,
         operation: str,
         worker_id: str | None = None,
+        volume_id: str | None = None,
         params: Mapping[str, str | int] | None = None,
     ) -> Any:
         attempts = self._config.max_read_attempts
@@ -660,7 +906,7 @@ class RunPodClient:
                 self._backoff(attempt)
                 continue
 
-            _raise_for_provider_status(response, operation, worker_id)
+            _raise_for_provider_status(response, operation, worker_id, volume_id)
             try:
                 return response.json()
             except ValueError as exc:
@@ -689,6 +935,81 @@ def _worker_id(worker_id: str) -> str:
     if not normalized_id:
         raise ProviderError("RunPod worker ID must not be empty")
     return normalized_id
+
+
+def _volume_id(volume_id: str) -> str:
+    normalized_id = volume_id.strip()
+    if not normalized_id:
+        raise ProviderError("RunPod network volume ID must not be empty")
+    return normalized_id
+
+
+def network_volume_create_payload(spec: NetworkVolumeSpec) -> dict[str, Any]:
+    """Build the documented v2 network volume create request.
+
+    It is public so the CLI can show the operator the exact body that will be sent, rather
+    than a description of it that could drift from the request.
+    """
+
+    payload: dict[str, Any] = {
+        "name": spec.name,
+        "size": spec.size_gb,
+        "dataCenter": spec.datacenter,
+    }
+    if spec.volume_type is not None:
+        payload["type"] = spec.volume_type.value
+    return payload
+
+
+def _parse_network_volume(payload: Any, *, operation: str) -> NetworkVolume:
+    try:
+        return _normalize_network_volume(_NetworkVolumeWire.model_validate(payload))
+    except ValidationError as exc:
+        raise ProviderResponseError(
+            f"RunPod {operation} returned an unexpected response: {_validation_summary(exc)}"
+        ) from exc
+
+
+def _normalize_network_volume(volume: _NetworkVolumeWire) -> NetworkVolume:
+    return NetworkVolume(
+        id=volume.id,
+        name=volume.name,
+        size_gb=volume.size,
+        datacenter=volume.data_center,
+        volume_type=_normalize_volume_type(volume.type),
+    )
+
+
+def _normalize_volume_type(native_type: str | None) -> VolumeType | None:
+    if native_type is None:
+        return None
+    try:
+        return VolumeType(native_type.strip().upper())
+    except ValueError:
+        return None
+
+
+def _normalize_data_center(data_center: _DataCenterWire) -> DataCenterInfo:
+    types: list[VolumeType] = []
+    for native_type in data_center.network_volume_types:
+        parsed = _normalize_volume_type(native_type)
+        if parsed is not None and parsed not in types:
+            types.append(parsed)
+    return DataCenterInfo(
+        id=data_center.id,
+        name=data_center.name,
+        region=data_center.region,
+        network_volume_types=tuple(types),
+        global_network=data_center.global_network,
+        gpu_availability=tuple(
+            GpuDataCenterAvailability(
+                id=entry.id,
+                name=entry.name,
+                availability=_normalize_availability(entry.availability),
+            )
+            for entry in data_center.gpu_availability
+        ),
+    )
 
 
 def _catalog_params(cloud_type: CloudType, gpu_count: int) -> dict[str, str | int]:
@@ -796,6 +1117,7 @@ def _normalize_pod(pod: _Pod) -> Worker:
             else None
         ),
         network_volume_id=network.volume_id if network is not None else None,
+        mounts_reported=pod.mounts is not None,
         created_at=pod.created_at,
         last_started_at=pod.started_at,
     )
@@ -952,6 +1274,7 @@ def _raise_for_provider_status(
     response: httpx.Response,
     operation: str,
     worker_id: str | None = None,
+    volume_id: str | None = None,
 ) -> None:
     status_code = response.status_code
     if 200 <= status_code < 300:
@@ -966,6 +1289,8 @@ def _raise_for_provider_status(
         raise ProviderPermissionError(f"RunPod denied permission to {operation} (HTTP 403){suffix}")
     if status_code == 404 and worker_id is not None:
         raise ProviderNotFoundError(f"RunPod worker {worker_id} was not found (HTTP 404)")
+    if status_code == 404 and volume_id is not None:
+        raise ProviderNotFoundError(f"RunPod network volume {volume_id} was not found (HTTP 404)")
     if status_code == 404:
         raise ProviderNotFoundError(f"RunPod could not {operation} (HTTP 404){suffix}")
     if status_code in {400, 413, 422}:

@@ -504,6 +504,10 @@ class JobInputRecord(BaseModel):
     sha256: str | None = None
     materialized: bool = False
     failure_reason: str | None = None
+    # Where the verified bytes came from. None means no materialization happened; "cache" is
+    # the worker's rebuildable network-volume cache, which is verified before and after the
+    # copy, so it is a provenance record rather than a weaker guarantee.
+    source: Literal["canonical", "cache"] | None = None
 
 
 class JobOutputRecord(BaseModel):

@@ -136,6 +136,21 @@ class StorageConfig(FrozenModel):
             raise ValueError(str(exc)) from exc
 
 
+def _absolute_worker_path(value: str) -> str:
+    """Require an unambiguous absolute container path without traversal segments."""
+
+    normalized = value.strip()
+    if normalized != value:
+        raise ValueError("worker paths must not start or end with whitespace")
+    if not normalized.startswith("/"):
+        raise ValueError("worker paths must be absolute")
+    if normalized != "/" and normalized.endswith("/"):
+        raise ValueError("worker paths must not end with a separator")
+    if any(segment in {"", ".", ".."} for segment in normalized.split("/")[1:]):
+        raise ValueError("worker paths must not contain empty, '.' or '..' segments")
+    return normalized
+
+
 class JobsConfig(FrozenModel):
     """Worker-side job workspace, reviewed runner location, and bounded defaults."""
 
@@ -153,16 +168,26 @@ class JobsConfig(FrozenModel):
     def absolute_worker_path(cls, value: str) -> str:
         """Require an unambiguous absolute worker path without traversal segments."""
 
-        normalized = value.strip()
-        if normalized != value:
-            raise ValueError("worker paths must not start or end with whitespace")
-        if not normalized.startswith("/"):
-            raise ValueError("worker paths must be absolute")
-        if normalized != "/" and normalized.endswith("/"):
-            raise ValueError("worker paths must not end with a separator")
-        if any(segment in {"", ".", ".."} for segment in normalized.split("/")[1:]):
-            raise ValueError("worker paths must not contain empty, '.' or '..' segments")
-        return normalized
+        return _absolute_worker_path(value)
+
+
+class VolumesConfig(FrozenModel):
+    """Where a Pod mounts a network volume, which is also its rebuildable cache root.
+
+    The default deliberately nests the mount inside the ephemeral workspace instead of
+    taking `/workspace` itself, so job scratch and the job workspace stay on container disk
+    while only the cache is persistent. The mount path is not a security boundary: it is
+    the provider's mount point, and every container-process-level guarantee still applies.
+    """
+
+    mount_path: str = Field(default="/workspace/cache", min_length=1, max_length=1024)
+
+    @field_validator("mount_path")
+    @classmethod
+    def absolute_mount_path(cls, value: str) -> str:
+        """Require an unambiguous absolute mount path without traversal segments."""
+
+        return _absolute_worker_path(value)
 
 
 class SshConfig(FrozenModel):
@@ -196,6 +221,7 @@ class Settings(FrozenModel):
     runpod: RunPodConfig = RunPodConfig()
     storage: StorageConfig = StorageConfig()
     ssh: SshConfig = SshConfig()
+    volumes: VolumesConfig = VolumesConfig()
 
 
 ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
@@ -251,6 +277,7 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "WAVCSE_INFRA_JOBS_DEFAULT_TIMEOUT_SECONDS": ("jobs", "default_timeout_seconds"),
     "WAVCSE_INFRA_JOBS_LOG_TAIL_BYTES": ("jobs", "log_tail_bytes"),
     "WAVCSE_INFRA_WAVCSE_PATH": ("paths", "wavcse"),
+    "WAVCSE_INFRA_VOLUMES_MOUNT_PATH": ("volumes", "mount_path"),
 }
 
 

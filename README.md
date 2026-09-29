@@ -11,7 +11,7 @@ repository.
 
 ## Delivery status
 
-The repository currently implements Phases 0–6 of the v1 specification:
+The repository currently implements Phases 0–6.2 of the v1 specification:
 
 - a typed `infra` CLI and layered TOML/environment configuration;
 - Ruff, pytest, ShellCheck, and shfmt validation;
@@ -56,11 +56,18 @@ The repository currently implements Phases 0–6 of the v1 specification:
   before `SUCCEEDED` is recorded;
 - non-secret execution provenance handed to the research process as `INFRA_*` variables
   while MLflow run creation stays owned by wavCSE;
+- a RunPod network volume lifecycle (`infra volume list`, `show`, `datacenters`, `create`,
+  `destroy`) with data-center placement constraints and an ambiguous-create recovery
+  intent record;
+- a rebuildable content-addressed artifact cache on a mounted network volume, with
+  cache-aware job input materialization for digest-identified inputs;
 - initial architecture, security, operations, provider, and decision documentation.
 
-Phase 6 stops at single-job execution against an explicitly provided worker. Automatic
-provisioning, multi-worker scheduling, resume orchestration, and research dependency
-installation beyond an explicit declared argv remain unimplemented.
+Phase 6.2 adds persistent working storage for RunPod Secure Cloud: a network volume is a
+rebuildable content-addressed cache, never canonical, and execution still stops at
+single-job execution against an explicitly provided worker. Automatic provisioning,
+multi-worker scheduling, resume orchestration, research dependency installation beyond an
+explicit declared argv, and automatic cache eviction remain unimplemented.
 
 ## Architecture
 
@@ -200,6 +207,7 @@ infra worker list
 infra worker show <worker-id>
 infra worker gpu-types --cloud COMMUNITY --gpu-count 1 --require-direct-ssh
 infra worker create --gpu <exact-type-id> --cloud COMMUNITY --image <image> --start-ssh --require-direct-ssh --max-price <usd-hour>
+                    [--network-volume-id <volume-id>] [--volume-mount-path <path>]
 infra worker wait-ssh <exact-worker-id>
 infra worker ssh <exact-worker-id>
 infra worker exec <exact-worker-id> -- <command> [args...]
@@ -208,6 +216,13 @@ infra worker health <exact-worker-id>
 infra worker stop <exact-worker-id>
 infra worker start <exact-worker-id>
 infra worker destroy <exact-worker-id>
+infra volume list [--json]
+infra volume show <volume-id> [--json]
+infra volume datacenters [--json]
+infra volume create --data-center <exact-dc-id> --size <gb> [--tier standard|high_performance] [--name <prefix>] [--yes]
+infra volume destroy <volume-id> [--wait-timeout <seconds>] [--yes]
+infra volume forget <infra-identity> [--yes]
+infra volume cache stats --worker <worker-id> [--wait-timeout <s>] [--command-timeout <s>] [--json]
 infra storage list [--prefix <relative-key-prefix>] [--limit <n>] [--json]
 infra storage presign-download <artifact> [--expires-in <seconds>]
 infra storage presign-upload <artifact> [--expires-in <seconds>] [--overwrite]
@@ -252,6 +267,15 @@ Stopping retains the Pod. Compute cost stops according to the provider status, b
 persistent or network storage can continue to incur charges. Destroying terminates the
 Pod after showing the exact target and does not delete separately managed network
 volumes.
+
+A network volume exists in exactly one data center, so a Pod that mounts one is
+constrained to that data center before any paid request, and the provider's own placement
+answer is verified afterwards: a Pod reported elsewhere, or reported without the requested
+volume mount, raises a placement error naming the created billing Pod and how to remove
+it. A network volume also forces Secure Cloud; `--cloud community` with
+`--network-volume-id` is rejected before the billable create request (after the read-only
+lookups that resolve the volume and its data center). Destroying a volume never
+touches a Pod, and destroying a Pod never touches a volume.
 
 REST API v2 currently does not expose interruptible/spot Pod creation. The CLI rejects
 `--interruptible` instead of silently falling back to on-demand capacity. See
@@ -336,6 +360,58 @@ no-replacement header; `--overwrite` opts out. A single PUT is limited to 5 GB.
 `infra storage verify` proves existence, size, and manifest consistency — and states
 explicitly that it does not verify content, because the object body is never downloaded
 back to the controller.
+
+A RunPod network volume mounted on a Secure Cloud Pod is a rebuildable working cache, not
+canonical storage; S3 stays canonical, so losing the volume must never lose the only copy
+of a canonical artifact. The mount point is the cache root:
+
+```text
+<cache-root>/cache.json                                  rebuildable cache marker
+<cache-root>/artifacts/sha256/<first-two-hex>/<digest>/content
+                                                         verified artifact bytes
+<cache-root>/artifacts/sha256/<first-two-hex>/<digest>/metadata.json
+                                                         digest, size, artifact, cached_at
+<cache-root>/staging/                                    in-progress work and
+                                                         quarantine-*; safe to delete
+```
+
+Identity is the artifact's SHA-256, never its filename, so two artifacts with the same name
+and different content can never collide. A hit requires the requested identity, the
+recorded size, and the bytes on disk to all agree: the entry directory exists, its
+`metadata.json` parses under the supported schema and names the requested digest, and the
+content is a regular non-symlink file whose actual size and SHA-256 match. Anything else is
+a miss or an explicit integrity failure; corrupt bytes are never accepted because they came
+from the mount. An entry that contradicts its recorded identity is moved into
+`staging/quarantine-<digest>-<random>`, reported, and treated as a miss, so the next
+canonical download rebuilds it. Quarantine keeps the failing bytes for diagnosis instead of
+deleting them.
+
+Population copies the artifact into `staging/`, verifies it while copying, writes the
+metadata document, fsyncs, and then publishes the whole directory with a single `rename`,
+so a partially written artifact can never appear at an entry path. Two concurrent writers
+stage separately and one `rename` wins; the loser verifies the winner's entry and reports
+it rather than replacing anything. Materialization copies a verified entry into a partial
+staging file while hashing it, then places it through the same inode-anchored hard-link
+path a canonical download uses, so a hit carries exactly the integrity guarantee of a fresh
+download.
+
+Cache use is enabled only when the worker has a network-volume mount path recorded and the
+declared input has a SHA-256 (declared directly or recorded in its manifest). An input
+identified only by size is downloaded from canonical storage directly, because a
+content-addressed cache cannot answer a question about an unidentified artifact. On a
+miss, a quarantined entry, an unusable cache root, or an interrupted lookup, the canonical
+presigned download proceeds and the verified result is then offered to the cache. Every
+cache problem degrades to a warning: the cache can only make a job faster, never make it
+fail. The cache never receives a presigned URL; bytes only enter it from a file the
+canonical download already verified, and no URL, credential, or other bearer material is
+ever written to the mounted volume.
+
+No automatic eviction or LRU is implemented. `infra volume cache stats --worker <id>`
+reports the cache root, the number of entries, recorded cached bytes, staged bytes, entries
+with unusable metadata, and the marker's schema version. Sizes come from each entry's
+metadata document rather than from re-reading artifacts, so inspecting a full volume stays
+cheap. Cleanup is operator-managed through
+`infra worker exec <worker-id> -- rm -rf <path>`.
 
 Git stores code and small metadata, not generated tensors or archives. MLflow/DagsHub
 continues to own experiment metadata.

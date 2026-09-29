@@ -396,19 +396,67 @@ Never print the full presigned URL in ordinary logs.
 
 # 15. RunPod network volumes
 
-Network volumes are optional optimization.
+Network volumes are an optional persistent working cache.
 
-They may later cache:
+They cache verified immutable artifacts so a disposable worker does not have to download
+several GiB again for every experiment:
 
-- extracted embeddings
-- Python/package caches
+- required embedding archives
 - other expensive-to-transfer immutable artifacts
 
-They are NOT the canonical store.
+They are NOT the canonical store. S3 remains canonical, and a lost network volume must
+cost a re-download rather than a lost result. v1 must still function without a RunPod
+network volume, which keeps the system portable and avoids coupling worker availability
+to one RunPod data center.
 
-v1 must function without a RunPod network volume.
+## Lifecycle and placement
 
-This keeps the system portable and avoids coupling worker availability to a particular RunPod datacenter.
+A network volume is created, inspected, and destroyed explicitly:
+
+    infra volume list
+    infra volume show <id>
+    infra volume datacenters
+    infra volume create --data-center <dc> --size <gb> [--tier standard]
+    infra volume destroy <id>
+
+Creation is a billable persistent resource, so it prints the data center, size, tier, the
+provider's published list price when one applies, an estimated monthly cost, and the exact
+request body, and then requires confirmation unless `--yes`.
+
+A volume exists in exactly one data center and is attached at Pod creation only. A Pod
+that mounts one must therefore be created in that data center, and an explicit request
+that contradicts it is rejected instead of being silently overridden. If the requested GPU
+has no confirmed capacity there, the request fails before any paid call. After creation,
+the provider's own placement answer is verified.
+
+Volume and Pod lifecycles are independent: destroying a volume never stops or destroys a
+Pod and never deletes an S3 object, and destroying a Pod never destroys its volume.
+
+## Rebuildable artifact cache
+
+The mount point is the cache root. Entries are content-addressed by the artifact's
+SHA-256, never by filename, because two artifacts can share a name and cannot share a
+digest. A cache hit requires the requested identity, the recorded size, and the bytes on
+disk to agree; the artifact is hashed when an entry is selected and the copy is hashed as
+it is written, so a hit carries exactly the integrity guarantee of a fresh download and the
+digest requirements above are never weakened for cached content. Placement then links that
+verified file rather than moving a pathname, the same inode-anchored rule every transfer
+uses.
+
+Publication is atomic: a verified copy is staged, described, and then published with one
+directory rename, so a partially written artifact can never appear as a complete entry and
+two concurrent writers cannot produce a falsely complete one. An entry that contradicts
+its own recorded identity is quarantined and rebuilt rather than trusted; quarantined
+copies and an interrupted population accumulate under `staging/`, which is the documented
+place to reclaim their space.
+
+Cache use is enabled only when the worker has a mount and the artifact has a declared
+digest. Every cache problem - an absent entry, a quarantined entry, an unavailable mount,
+an interrupted lookup - falls back to the canonical download and is reported as a warning:
+the cache may only make a job faster, never fail it.
+
+No automatic eviction is implemented. Cache size is inspected with
+`infra volume cache stats`, and removal is an explicit operator action.
 
 # 16. Jobs
 
@@ -865,12 +913,22 @@ Deliver:
 
 At this point the first real wavCSE workload should run.
 
+## Phase 6.2 — persistent working storage
+
+Deliver:
+
+- network volume discovery, creation, inspection, and destruction
+- data-center placement enforcement for a Pod that mounts one
+- a rebuildable content-addressed artifact cache on the mounted volume
+- cache-aware materialization of declared job inputs
+- offline tests and a controlled live provisioning validation
+
 ## Phase 7 — hardening
 
 Only after real usage:
 
 - improved recovery
-- cache/network-volume support
+- automatic cache eviction
 - simple multi-worker dispatch
 - optional provider expansion
 

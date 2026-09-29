@@ -82,6 +82,15 @@ class AmbiguousCreateError(ProviderOperationAmbiguousError):
     """Raised when a paid create cannot be safely retried or reconciled."""
 
 
+class UnresolvedCreateError(InfraError):
+    """Raised when a new billable create is refused while an earlier one is unresolved.
+
+    The provider gives no idempotency key and no unique-name constraint, so issuing a second
+    create after a lost response is exactly how a duplicate paid resource appears. The
+    recovery is to reconcile the recorded intent against the provider, never to try again.
+    """
+
+
 class CostGuardError(InfraError):
     """Raised when provider pricing cannot satisfy an operator cost guard."""
 
@@ -96,6 +105,17 @@ class LifecycleError(InfraError):
 
 class LifecycleTimeoutError(LifecycleError):
     """Raised when a bounded lifecycle wait expires."""
+
+
+class WorkerPlacementError(LifecycleError):
+    """Raised when a created Pod is not placed where an attached resource requires.
+
+    A network volume exists in exactly one data center, so a Pod that mounts it must be
+    placed there. The provider accepted the create request and produced a Pod, which is why
+    this is a distinct, high-severity outcome: the Pod exists, costs money, and cannot use
+    the volume it was created for. It is never raised before the create request, because
+    placement is only knowable from the provider's answer.
+    """
 
 
 class SshError(InfraError):
@@ -211,6 +231,15 @@ class ArtifactSizeMismatchError(ArtifactTransferError):
 
 class ArtifactChecksumMismatchError(ArtifactTransferError):
     """Raised when an artifact does not match its expected SHA-256 digest."""
+
+
+class CacheError(StorageError):
+    """Raised when a worker's rebuildable artifact cache cannot be used as intended.
+
+    The cache is an optimization over canonical storage. Every caller must treat this class
+    as "the shortcut is unavailable", never as "the artifact failed": the canonical download
+    path remains correct and is the fallback.
+    """
 
 
 class JobError(InfraError):

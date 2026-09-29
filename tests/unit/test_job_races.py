@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ def _load_runner():
     return module
 
 
+LIFECYCLE_BUSY_MARKER = "is already in progress on this worker"
 runner = _load_runner()
 RUNNER_PATH = Path(__file__).resolve().parents[2] / "worker" / "job_runner.py"
 
@@ -268,12 +270,22 @@ def _race_subprocess(
     )
 
 
+@dataclass(frozen=True)
+class RaceOutcome:
+    """Everything one start-versus-cancel race produced, including how cancel answered."""
+
+    started: dict[str, str]
+    cancelled: dict[str, str]
+    cancel_returncode: int
+    cancel_stderr: str
+
+
 def _run_race(
     job_directory: Path,
     *,
     command: list[str],
     cancel_head_start: float = 0.0,
-) -> tuple[dict[str, str], dict[str, str]]:
+) -> RaceOutcome:
     descriptor = _descriptor(job_directory, command={"argv": command}, timeout_seconds=30)
     descriptor_path = job_directory / "race-descriptor.json"
     descriptor_path.write_text(json.dumps(descriptor), encoding="utf-8")
@@ -284,7 +296,12 @@ def _run_race(
     canceller_out, canceller_err = canceller.communicate(timeout=60)
     for process, err in ((starter, starter_err), (canceller, canceller_err)):
         assert process.returncode in {0, 1}, f"{process.args} failed: {err}"
-    return _rows(starter_out), _rows(canceller_out)
+    return RaceOutcome(
+        started=_rows(starter_out),
+        cancelled=_rows(canceller_out),
+        cancel_returncode=canceller.returncode or 0,
+        cancel_stderr=canceller_err,
+    )
 
 
 def _kill_recorded_processes(job_directory: Path) -> None:
@@ -317,13 +334,14 @@ def test_a_launch_and_a_cancellation_never_both_win(tmp_path: Path, worker_home:
     for iteration in range(6):
         job_directory = tmp_path / f"jobs-{iteration}" / JOB_ID
         runner.prepare(_descriptor(job_directory))
-        started, cancelled = _run_race(
+        outcome = _run_race(
             job_directory,
             command=command,
             # Bias half the iterations towards each side, so both decisions are exercised
             # by a genuine race rather than by one side happening to be scheduled first.
             cancel_head_start=0.08 if iteration % 2 else -0.08,
         )
+        started, cancelled = outcome.started, outcome.cancelled
         cancelled_state = job_directory / "state" / "cancelled.json"
         launched = (job_directory / "state" / "pid.json").exists()
 
@@ -339,14 +357,26 @@ def test_a_launch_and_a_cancellation_never_both_win(tmp_path: Path, worker_home:
                 outcomes.add("launch-terminated")
                 assert launched
                 assert cancelled.get("cancelled") == "true"
-        else:
+        elif cancelled.get("launch_in_progress") == "true":
             # The launch owns the job; the operator is told to retry against the process.
             outcomes.add("launch-in-progress")
-            assert cancelled.get("launch_in_progress") == "true"
             assert "pid" in started
+        else:
+            # The launch held the per-job lifecycle lock, so cancellation declined to decide
+            # and reported a refusal instead of guessing. That is a legitimate outcome of a
+            # single attempt: the controller treats it as uncertainty and retries. What must
+            # not happen is an unexplained answer, or a launch alongside a pre-start
+            # cancellation claim.
+            outcomes.add("cancel-deferred")
+            assert outcome.cancel_returncode == 1, "a refusal must be reported as a failure"
+            refusal = outcome.cancel_stderr
+            assert LIFECYCLE_BUSY_MARKER in refusal or "refusing to" in refusal, (
+                f"cancellation refused for an unexpected reason: {refusal.strip()[:300]}"
+            )
+            assert not cancelled_state.exists()
         _kill_recorded_processes(job_directory)
 
-    assert outcomes <= {"cancel-won", "launch-terminated", "launch-in-progress"}
+    assert outcomes <= {"cancel-won", "launch-terminated", "launch-in-progress", "cancel-deferred"}
     assert "cancel-won" in outcomes, "the race did not exercise the cancellation path"
     assert outcomes & {"launch-terminated", "launch-in-progress"}, (
         "the race did not exercise a winning launch"

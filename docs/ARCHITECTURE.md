@@ -3,9 +3,9 @@
 ## Boundaries
 
 `wavcse-infra` owns infrastructure bootstrap, provider communication, controller
-diagnostics, Pod lifecycle, SSH readiness, worker bootstrap, exact-commit job execution,
-and artifact transport. It does not own research code, experiment semantics, model
-dependencies, or MLflow instrumentation.
+diagnostics, Pod lifecycle, network-volume lifecycle, SSH readiness, worker bootstrap,
+exact-commit job execution, and artifact transport. It does not own research code,
+experiment semantics, model dependencies, or MLflow instrumentation.
 
 The components are:
 
@@ -14,6 +14,9 @@ The components are:
 - **wavCSE repository:** research code and experiment source of truth.
 - **wavcse-infra repository:** infrastructure CLI and machine bootstrap.
 - **RunPod Pods:** disposable GPU execution environments.
+- **RunPod network volumes:** provider-attached storage mounted by Secure Cloud Pods as a
+  rebuildable artifact cache. Private S3 stays canonical; a volume can be rebuilt and a
+  container disk is ephemeral scratch.
 - **GitHub:** immutable code distribution after changes are committed and pushed.
 - **Private S3:** canonical large-artifact and embedding storage.
 - **MLflow/DagsHub:** experiment tracking owned by wavCSE.
@@ -86,13 +89,29 @@ state and the worker's own files remain authoritative; a local record is never u
 - `cli.py` defines the stable `infra` interface and global configuration options.
 - `doctor.py` runs independent read-only controller and connectivity probes.
 - `models.py` defines provider-neutral worker requests/views, lifecycle states, cloud
-  types, and GPU offers used outside the provider client.
+  types, GPU offers, and the network-volume models (`NetworkVolume`, `DataCenterInfo`,
+  `NetworkVolumeBilling`) used outside the provider client.
 - `providers/runpod.py` owns RunPod REST v2 wire parsing, safe read retries, GPU catalog
-  discovery, exact-ID lifecycle requests, and ambiguous-create reconciliation.
+  discovery, exact-ID lifecycle requests, and ambiguous-create reconciliation. It also
+  owns all network-volume wire handling (`GET`/`POST` `/v2/network-volumes`,
+  `GET`/`DELETE` `/v2/network-volumes/{id}`, `GET` `/v2/catalog/datacenters`, and `GET`
+  `/v2/billing/network-volumes`), normalized into those provider-neutral models so no
+  RunPod response object leaks outside the provider module.
 - `state.py` stores only supplemental non-secret created-worker metadata with atomic
-  same-directory replacement beneath `~/.local/state/wavcse-infra/`.
+  same-directory replacement beneath `~/.local/state/wavcse-infra/`. Its
+  `VolumeStateStore` shares that atomic-write and advisory-lock machinery for
+  `volumes.json`, keyed by infra identity rather than provider ID because the identity is
+  known before the paid create and the ID only after a response.
+- `volumes/lifecycle.py` plans, creates, observes, and destroys network volumes and owns
+  the Pod placement constraint: a Pod that mounts a volume is constrained to the volume's
+  data center before any paid request, a contradicting explicit data center is rejected
+  rather than overridden, and an ambiguous create is reconciled by exact infra identity.
 - `workers/lifecycle.py` owns cost/availability guards, bounded polling, transitions,
-  and provider-authoritative reconciliation.
+  and provider-authoritative reconciliation. After a create completes it verifies that
+  the provider actually placed the Pod in the requested data center and actually attached
+  the requested volume; a create answer that omits placement or the mount is refreshed
+  once from `GET /pods/{id}` before any conclusion is drawn, and only an affirmative
+  contradiction raises.
 - `workers/ssh.py` invokes system OpenSSH with an explicit identity, isolated
   known-hosts file, bounded timeouts, captured streams, and provider-refreshed endpoint
   readiness polling. Interactive shells may use RunPod's PTY proxy, while automation
@@ -114,13 +133,24 @@ state and the worker's own files remain authoritative; a local record is never u
   reports a tab-separated result. Large objects with a known expected size download as
   bounded parallel HTTP byte ranges over a deterministic resumable partial file and
   range record; small or size-unknown objects keep the single-connection path. It is also
-  importable, so the same code is unit-tested on the controller.
+  importable, so the same code is unit-tested on the controller. The same program
+  implements the worker-side cache operations (`cache-materialize`, `cache-populate`,
+  `cache-stats`): they take no presigned URL, require a 64-hexadecimal digest and
+  symlink-free paths, use an entry only when identity, recorded size, and re-hashed bytes
+  agree, quarantine an entry that contradicts its recorded identity, and publish a
+  verified entry with a single directory `rename`. There is no second worker program and
+  no new install step.
 - `storage/transfer.py` presigns, streams that module over direct SSH stdin with the URL
   on the same stream, parses the worker result strictly, and verifies uploaded objects. It
   derives each attempt's command bound from the URL lifetime, and classifies a bounded
   timeout or a dropped connection as an unknown remote outcome rather than as a failed
   transfer; a transfer that another process already owns, and a destination that already
   exists, are reported as evidence for the caller to check.
+- `storage/cache.py` orchestrates cache-aware input materialization on the controller: it
+  decides whether to consult the worker cache at all (both a cache root and a declared
+  SHA-256 are required), offers a verified canonical download to the cache afterwards, and
+  turns every cache failure into a warning so the canonical path proceeds. Its
+  `WorkerArtifactCache` reports integrity problems through an injected warning sink.
 - `redaction.py` removes authorization values, known secret assignments, and URL
   query strings from user-facing external errors, and provides the shared
   `contains_bearer_material` check used by manifests and job specifications.
@@ -142,7 +172,11 @@ state and the worker's own files remain authoritative; a local record is never u
   the runner, verify the commit, materialize inputs, start the command). The same pass
   serves a first submission and a later reconciliation. A controller-side interruption
   records the preparation phase and `reconciliation_required` and leaves the job in
-  PREPARING; a definitive failure is what records FAILED.
+  PREPARING; a definitive failure is what records FAILED. Input materialization is
+  cache-aware: an input with both a cache root and a declared SHA-256 consults the worker
+  cache first, otherwise it uses the canonical presigned download exactly as before, and
+  a successful canonical download is then offered to the cache. Each input records a
+  `source` of `canonical` or `cache`.
 - `jobs/status.py` reconciles job state from worker evidence, persists declared outputs,
   captures a bounded local log copy, and implements idempotent cancellation. For a job
   that is still PREPARING it either advances the same preparation pass or reports the
@@ -211,6 +245,14 @@ config runpod.api_key_parameter
   -> SSM GetParameter(WithDecryption=True) via EC2 instance profile
   -> in-memory RunPod client credential
 ```
+
+`[volumes] mount_path` (environment `WAVCSE_INFRA_VOLUMES_MOUNT_PATH`, default
+`/workspace/cache`) is where a Pod mounts a RunPod network volume, and that mount is also
+the worker's rebuildable artifact-cache root; canonical artifacts stay in S3. The value
+must be an absolute path without traversal segments, and it is configuration rather than
+a secret. An explicit `--volume-mount-path` wins, and a Pod with no network volume keeps
+the historical `/workspace` default, so job scratch and the job workspace stay on
+ephemeral container disk.
 
 ## Artifact transfer flow
 
@@ -298,6 +340,86 @@ refreshed during polling because IP/port publication can lag provider `RUNNING`.
 Stopping or destroying a tracked Pod resets local readiness without redefining its
 provider state.
 
+## Network volume and cache flow
+
+```text
+infra volume create --data-center <dc> --size <gb> [--tier <tier>]
+  -> read the public catalog and billing views: data center, size, tier, price
+  -> write a durable PENDING_CREATE intent locally, before the paid request
+  -> print the target plan, the exact JSON request body, and an estimated monthly cost
+  -> operator confirmation unless --yes
+  -> one create POST, never retried
+  -> reconcile an ambiguous answer by exact infra identity
+  -> AVAILABLE
+
+infra worker create --network-volume-id <volume-id> ...
+  -> the volume exists in exactly one data center
+  -> constrain the requested Pod to that data center before any paid request
+       (an explicit --data-center that contradicts the volume is rejected)
+  -> one create POST
+  -> refresh GET /pods/{id} and verify the Pod is in that data center
+       and that the requested volume is actually attached
+  -> an answer that omits placement or the mount is refreshed once, and only an
+       affirmative contradiction raises, naming the created (billing) Pod
+```
+
+```text
+infra job submit ... (input materialization, per declared input)
+  -> cache root and declared SHA-256 both known?
+       no  -> canonical presigned GET (Phase 5), verify size and SHA-256
+       yes -> worker cache-materialize --root <root> --expected-sha256 <digest>
+                 -> hit: requested identity, recorded size, and re-hashed bytes agree
+                    -> copy into <destination>.wavcse-partial-<pid>-<random>
+                    -> place through the inode-anchored hard link
+                    -> source = cache
+                 -> miss, quarantine, unusable root, or interrupted lookup
+                    -> warning, then fall through to the canonical download
+  -> a successful canonical download is offered to the cache (cache-populate)
+  -> the job record stores the input's source: canonical or cache
+```
+
+The data-center invariant is a property of the provider, not a new trust boundary:
+RunPod attaches a network volume only to Secure Cloud Pods, a volume exists in exactly one
+data center, and a Pod that mounts it must be in that data center. The constraint is
+applied before any paid request — an explicit operator data center that contradicts the
+volume is rejected rather than silently overridden — and the provider's own placement
+answer is verified after creation. A Pod reported in the wrong data center, or reported
+without the requested mount, is surfaced as an error naming the created Pod.
+
+Creating a volume is a billable persistent resource, so the local store records a
+`PENDING_CREATE` intent with the exact requested placement before the create POST is
+issued. That POST is never retried; an ambiguous outcome is reconciled by matching the
+provider's own listing against the complete infra identity, which is why the volume
+document is keyed by identity rather than by provider ID.
+
+The cache layout beneath the mount point is:
+
+```text
+cache.json                                  marker: schema version and purpose
+artifacts/sha256/<first-two-hex>/<digest>/content
+artifacts/sha256/<first-two-hex>/<digest>/metadata.json
+staging/                                    in-progress work; safe to delete
+```
+
+The digest is the identity, so two artifacts that share a filename and differ in content
+occupy different directories. A staged copy is verified and then published by a single
+directory `rename`, so a partial artifact can never appear at an entry path and two
+concurrent writers cannot produce a falsely complete entry. Materialization copies a
+verified entry into the standard `<destination>.wavcse-partial-<pid>-<random>` staging
+file and places it through the same inode-anchored hard-link path a download uses.
+
+Every cache failure degrades: an absent entry, a quarantined entry, an unusable cache
+root, or an interrupted lookup can only make a job slower, never fail it, and the
+canonical download proceeds. Only a definitive protocol violation the worker reports
+raises. An entry that contradicts its recorded identity is quarantined into `staging/`
+and treated as a miss, so the next canonical download rebuilds it. A job record now
+carries a per-input `source` of `canonical` or `cache`, and `infra job status` prints it.
+
+No automatic eviction, LRU, or size cap exists. `infra volume cache stats --worker <id>`
+reports entries, cached bytes, staging bytes, unverified entries, and the marker schema
+version; cleanup is an explicit operator action that removes a digest directory or the
+`staging/` area.
+
 ## Reliability stance
 
 Read-only HTTP operations use explicit timeouts and bounded exponential backoff, with a
@@ -314,6 +436,9 @@ Missing optional provider fields remain `None`; the parser does not invent metad
 
 Research dependency installation beyond an explicit declared argv, multi-worker
 scheduling, resume/checkpoint orchestration, multipart artifact upload, and automatic
-worker provisioning remain deferred. S3 remains the artifact transport; direct SSH carries
-only small reviewed programs, their descriptors, and presigned URLs on stdin, never
-artifact bytes.
+worker provisioning remain deferred. Automatic cache eviction, a cache size cap or LRU
+policy, multi-worker cache concurrency beyond the single-writer-per-entry guarantee, and
+cross-data-center cache replication are also deferred: cache cleanup is an explicit
+operator action, and a cache is confined to the one data center that holds its volume.
+S3 remains the artifact transport; direct SSH carries only small reviewed programs, their
+descriptors, and presigned URLs on stdin, never artifact bytes.

@@ -21,6 +21,19 @@ mkdir -p ~/.config/wavcse-infra
 cp --no-clobber config/infra.example.toml ~/.config/wavcse-infra/config.toml
 ```
 
+The optional `[volumes]` section sets where a Pod mounts a RunPod network volume. That
+mount is also the worker's rebuildable artifact cache root; canonical artifacts stay in
+S3.
+
+```toml
+[volumes]
+mount_path = "/workspace/cache"
+```
+
+`mount_path` must be an absolute container path with no `.` or `..` segments. When a
+network volume is attached, `infra worker create --volume-mount-path` defaults to this
+value; without a volume the default remains `/workspace`.
+
 Supported environment variables:
 
 | Variable | Purpose |
@@ -40,6 +53,7 @@ Supported environment variables:
 | `WAVCSE_INFRA_S3_BUCKET` | Private canonical artifact bucket |
 | `WAVCSE_INFRA_S3_PREFIX` | Bucket prefix, default `wavcse` |
 | `WAVCSE_INFRA_S3_PRESIGN_EXPIRY_SECONDS` | Default presigned URL lifetime, 60–604800 |
+| `WAVCSE_INFRA_VOLUMES_MOUNT_PATH` | Where a Pod mounts a network volume; the rebuildable cache root |
 | `WAVCSE_INFRA_JOBS_WORKER_ROOT` | Worker-side isolated job workspace root |
 | `WAVCSE_INFRA_JOBS_RUNNER_PATH` | Absolute worker path of the reviewed job runner |
 | `WAVCSE_INFRA_JOBS_DEFAULT_TIMEOUT_SECONDS` | Default job timeout when a spec omits one |
@@ -405,6 +419,33 @@ Pods unclaimed. Missing tracked Pods are marked absent locally. Readiness timest
 bootstrap version, endpoint coordinates, disk availability, and GPU/driver facts are
 supplemental; stopping/destroying resets readiness and never changes provider truth.
 
+Created RunPod network volumes are tracked separately in:
+
+```text
+~/.local/state/wavcse-infra/volumes.json
+```
+
+That document is schema version 1, written atomically with a same-directory rename under a
+local advisory lock, mode 0700 for the directory and 0600 for the file, and contains no
+credentials. It is keyed by the generated infra volume identity rather than the provider
+ID, because the identity is known before the paid create while the provider ID is only
+known after a response. Each record holds the provider, the infra identity, the provider
+volume ID (nullable), the name, requested and observed size/data center/tier, creation and
+last-observed timestamps, a `lifecycle_state` in {`PENDING_CREATE`, `AVAILABLE`,
+`DESTROYED`}, and a `provider_absent` flag.
+
+`PENDING_CREATE` is written before the billable create request is issued. That is what
+makes an ambiguous create recoverable: if the response is lost and bounded exact-name
+reconciliation finds nothing, the intent survives so a later `infra volume list` can match
+the provider's own listing against it. `infra volume list` warns on stderr about any
+`PENDING_CREATE` intent with no matching provider volume: RunPod may have created it, so
+inspect the provider console before creating anything with that identity.
+
+Worker state gained one field, `network_volume_mount_path`: the provider-reported mount
+path of the Pod's network volume, `None` when the Pod has no volume. It is the cache root
+a worker uses. Each materialized job input also gained a `source` field, either
+`canonical` or `cache`; `infra job status` prints it as `from cache` / `from canonical`.
+
 If create loses its response, the CLI checks for the exact generated infra name. It
 adopts one exact match, reports multiple matches, or fails safely after bounded checks.
 It never retries the paid create POST. On the uncertain/no-match result, run:
@@ -414,6 +455,177 @@ infra worker list
 ```
 
 Inspect the generated identity shown in the error before issuing another create.
+
+## Network volume operations
+
+A RunPod network volume is a rebuildable working cache for a Secure Cloud Pod, never
+canonical storage: S3 stays canonical, so losing a network volume must never lose the only
+copy of a canonical artifact. A volume exists in exactly one data center, attaches only to
+Secure Cloud Pods, and must be attached at Pod creation; it cannot be attached or detached
+later, and RunPod replaces the Pod's default volume disk with the network volume. Tiers are
+`STANDARD` and `HIGH_PERFORMANCE`; the tier is immutable after creation, size can only be
+increased, and the provider minimum is 10 GB with a 4096 GB maximum.
+
+Lifecycle commands:
+
+```bash
+infra volume list [--json]
+infra volume show <volume-id> [--json]
+infra volume datacenters [--json]
+infra volume create --data-center <exact-dc-id> --size <gb> [--tier standard|high_performance] [--name <prefix>] [--yes]
+infra volume destroy <volume-id> [--wait-timeout <seconds>] [--yes]
+infra volume forget <infra-identity> [--yes]
+```
+
+`infra volume list` and `infra volume show` call only documented GET endpoints and do not
+change provider state. `infra volume datacenters` lists catalog data centers with their
+supported volume types; an empty `networkVolumeTypes` means the data center cannot host a
+network volume at all, which is what makes it a placement guard.
+
+`infra volume create` prints the infra identity, data center, size, storage tier (or "data
+center default"), the data center's supported tiers, RunPod's published list price when one
+applies, an estimated monthly cost, and the exact JSON create request body, then requires
+interactive confirmation unless `--yes` is supplied. The API exposes no network volume
+price field: the CLI labels any figure as a published list price, not a provider-reported
+charge. RunPod's published list price for STANDARD storage is $0.07/GB/month, quoted for
+volumes up to 1 TB, documented at https://docs.runpod.io/pods/pricing; the provider
+publishes a different rate for larger volumes of the same tier but does not state its
+banding unambiguously, so a request larger than 1 TB prints no estimate rather than one
+computed from a rate whose scope is unverified. HIGH_PERFORMANCE is documented
+only as a premium to standard storage whose exact per-GB rate varies by data center and
+appears only in RunPod's console, so this tool quotes no estimate for it. `infra volume
+show` reports the account's actual provider-billed storage instead, fetched from
+`/billing/network-volumes`.
+
+### Placement and the Pod ordering constraint
+
+A network volume must be created before the Pod that mounts it, and the Pod must be placed
+in the volume's data center. `infra worker create --network-volume-id <volume-id>`:
+
+- forces Secure Cloud; `--cloud community` with a network volume is rejected before the
+  billable create request (after the read-only lookups that resolve the volume);
+- constrains placement to the volume's data center; an explicit `--data-center` naming
+  anything else is rejected in the same place;
+- fails before the paid create when the requested GPU has no confirmed availability in the
+  volume's data center, naming the volume and its data center;
+- verifies the provider's own answer after creation: a Pod reported in another data center,
+  or reported without the requested network volume mount, raises a placement error naming
+  the created (billing) Pod and how to remove it.
+
+The printed creation plan shows the volume's data center, marked "placement constrained",
+and its size, and notes that storage charges are billed separately from GPU compute and
+continue while the volume and Pod exist. `--volume-mount-path` defaults to the configured
+`volumes.mount_path` when a network volume is attached and keeps `/workspace` otherwise.
+
+### Ambiguous create recovery
+
+Create and delete are never retried. A `PENDING_CREATE` intent is written before the
+billable create request is issued. If the response is lost, the client reconciles by
+listing volumes and matching the exact infra identity: one match is adopted, several are
+reported as ambiguous, and none fails safely and tells the operator to run
+`infra volume list`. On that result, run:
+
+```bash
+infra volume list
+```
+
+and inspect the provider's own listing against the pending identity before issuing another
+create.
+
+While any unresolved intent exists, `infra volume create` refuses to plan another volume
+and names the identities involved, because a retry after silence is the one way this
+command could create a duplicate billable resource. `infra volume list` clears the refusal
+by adopting the volume it finds. When the provider really has no such volume, clear it
+explicitly:
+
+```bash
+infra volume forget <infra-identity>
+```
+
+`forget` removes local bookkeeping only: no provider resource is changed or deleted, and a
+provider volume that does exist still appears in `infra volume list`, only without a local
+create record. A create the provider definitively refuses never leaves an intent behind,
+because a refusal is an answer: nothing was created.
+
+Destroying the volume also clears its record, including an intent that was never adopted,
+because the destroy path links the volume it is about to delete to the record that names
+it.
+
+### Destroying a volume
+
+`infra volume destroy` addresses a volume by exact provider ID only; passing a name yields
+"already absent" plus a note that this command never resolves names. It prints the id,
+name, data center, size, tier, tracked life cycle, any tracked Pods that mount it (stating
+they are not destroyed), and that the rebuildable cache is permanently lost while
+canonical S3 objects are untouched. It requires confirmation unless `--yes` is supplied.
+Destroying a volume never touches a Pod or an S3 object, and destroying a Pod never touches
+a volume. An ambiguous delete is reconciled by bounded polling of `GET
+/network-volumes/{id}` until the volume is absent.
+
+### Rebuildable artifact cache
+
+The mount point of the attached network volume is the cache root:
+
+```text
+<cache-root>/cache.json                                  rebuildable cache marker
+<cache-root>/artifacts/sha256/<first-two-hex>/<digest>/content
+                                                         verified artifact bytes
+<cache-root>/artifacts/sha256/<first-two-hex>/<digest>/metadata.json
+                                                         digest, size, artifact, cached_at
+<cache-root>/staging/                                    in-progress work and
+                                                         quarantine-*; safe to delete
+```
+
+Identity is the artifact's SHA-256, never its filename, so two artifacts with the same name
+and different content can never collide. A hit requires the requested identity, the
+recorded size, and the bytes on disk to all agree: the entry directory exists, its
+`metadata.json` parses under the supported schema and names the requested digest, and the
+content is a regular non-symlink file whose actual size and actual SHA-256 match. Anything
+else is a miss or an explicit integrity failure; corrupt bytes are never accepted because
+they came from the mount. An entry that contradicts its recorded identity is moved into
+`staging/quarantine-<digest>-<random>`, reported, and treated as a miss, so the next
+canonical download rebuilds it. Quarantine keeps the failing bytes available for diagnosis
+instead of deleting them, and `staging/` is documented as safe to delete.
+
+Population copies the artifact into `staging/`, verifies it while copying, writes the
+metadata document, fsyncs, and then publishes the whole directory with a single `rename`,
+so a partially written artifact can never appear at an entry path. Two concurrent writers
+stage separately and one `rename` wins; the loser verifies the winner's entry and reports
+it rather than replacing anything. Materialization copies a verified entry into a partial
+staging file while hashing it, then places it through the same inode-anchored hard-link
+path a canonical download uses, so a hit carries exactly the integrity guarantee of a fresh
+download. `--overwrite` is honored and no staging file is left behind.
+
+Cache use is enabled only when the worker has a network-volume mount path recorded and the
+declared input has a SHA-256 (declared directly or recorded in its manifest). An input
+identified only by size is downloaded from canonical storage directly, because a
+content-addressed cache cannot answer a question about an unidentified artifact. On a miss,
+a quarantined entry, an unusable cache root, or an interrupted lookup, the canonical
+presigned download proceeds and the verified result is then offered to the cache. Every
+cache problem degrades to a warning, so the cache can only make a job faster, never make it
+fail; a definitive protocol violation the worker reports still raises. The cache never
+receives a presigned URL: bytes only enter it from a file the canonical download already
+verified, and no URL, credential, or other bearer material is ever written to the mounted
+volume.
+
+Cache operations live in the same reviewed, stdlib-only `worker_transfer.py` program that
+is streamed to the worker over direct SSH stdin; there is no separate worker install,
+daemon, or package.
+
+### Cache inspection and cleanup
+
+```bash
+infra volume cache stats --worker <exact-worker-id> [--wait-timeout <s>] [--command-timeout <s>] [--json]
+```
+
+`infra volume cache stats` reports the cache root, the number of entries, recorded cached
+bytes, staged bytes, entries with unusable metadata, and the marker's schema version. Sizes
+come from each entry's metadata document rather than from re-reading artifacts, so
+inspecting a full volume stays cheap; every entry is hashed whenever it is actually used.
+
+No automatic eviction or LRU is implemented. Cleanup is operator-managed: remove a specific
+digest directory or everything under `staging/` through
+`infra worker exec <worker-id> -- rm -rf <path>`.
 
 ## Artifact storage operations
 

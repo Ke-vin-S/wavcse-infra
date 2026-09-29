@@ -6,6 +6,11 @@ The controller, GitHub source, private S3 bucket, and MLflow/DagsHub service are
 for their documented roles. A RunPod worker is a temporary execution environment and is
 not trusted with durable credentials or the only copy of important data.
 
+Private S3 remains the canonical store for every research artifact. A RunPod network
+volume is rebuildable working cache attached to a Secure Cloud Pod, and a container disk
+is ephemeral scratch. Neither may ever hold the only copy of a canonical research
+artifact, so losing a volume must never lose one.
+
 ## Credentials
 
 ### Configuration files
@@ -70,6 +75,41 @@ complete generated infra identity. Start, stop, and destroy accept exact provide
 destroy never resolves names or prefixes. `--yes` skips the human confirmation only and
 does not disable cost, capacity, identity, or request validation.
 
+`infra volume destroy` follows the same rule. It addresses one volume by exact provider
+ID and never resolves a name, prints the target's id, name, data center, size, and tier
+plus any tracked Pods that mount it (stating that they are not destroyed), states that
+the rebuildable cache is permanently lost, and requires interactive confirmation unless
+`--yes`. It never deletes an S3 object and never stops or destroys a Pod. Destroying a
+Pod never destroys its volume: volume and Pod lifecycles are independent by construction
+and covered by tests in both directions. Creating a network volume is a billable
+persistent resource, so a durable `PENDING_CREATE` intent is written locally before the
+create request is issued, the CLI prints the data center, size, tier, the published list
+price when one applies, an estimated monthly cost, and the exact JSON request body, and
+requires interactive confirmation unless `--yes`; the create POST is never retried, and
+an ambiguous outcome is reconciled by exact infra identity. A create the provider
+definitively refuses leaves no intent behind, and while any intent is unresolved a further
+volume create is refused rather than issued, because a retry after silence is the one way
+this command could create a duplicate billable resource.
+
+### Network volume cache
+
+The network volume is explicitly not a credential store and must never become one. Cache
+operations never receive a presigned URL at all: bytes enter the cache only from a file
+the canonical download already verified, so nothing about the cache can write an
+authorization header, API token, presigned URL, temporary AWS credential, or private key
+to the mounted volume. The only files the cache writes are artifact bytes, a metadata
+document holding the non-secret artifact key, digest, size, and timestamp, and a marker
+document holding the schema version, purpose, cache root, and creation time. An offline
+test asserts that no bearer-shaped material appears anywhere on the cache volume. This
+phase introduces no new credential, secret type, or long-lived token, and adds no static
+AWS key to the controller or the worker.
+
+Cache operations are performed by the same reviewed, stdlib-only worker program that
+already handles artifact transfers, streamed over direct SSH stdin. They add no worker
+installation, package, daemon, or listening service, and they run with the same worker
+account privileges as the existing transfer operations. They never travel over the RunPod
+proxy; the mapped public-IP direct SSH endpoint is still required.
+
 ### Local operational state
 
 Created-worker metadata lives in `~/.local/state/wavcse-infra/workers.json`. The
@@ -83,6 +123,14 @@ model/driver facts.
 It must never contain the RunPod key, authorization headers, SSM values, AWS
 credentials, private keys, or complete environment data. RunPod remains authoritative;
 the local file is not permission to delete a different or similarly named Pod.
+
+Network-volume bookkeeping lives beside it in
+`~/.local/state/wavcse-infra/volumes.json`, written atomically with a same-directory
+rename under a local advisory lock, stored in a `0700` directory as a `0600` file exactly
+like `workers.json`. It is non-secret operational state keyed by infra identity rather
+than provider ID, because the identity is known before the paid create and the ID only
+after a response, and it holds provider IDs, placement, size, and lifecycle bookkeeping
+only.
 
 ### Recorded jobs
 
@@ -158,7 +206,10 @@ normal GPU worker.
 Workers never receive AWS credentials, `~/.aws` state, a controller SSH private key, the
 RunPod token, or GitHub write credentials. Object access is granted one transfer at a
 time through a Signature Version 4 URL generated with the controller's instance-profile
-role.
+role. Presigned URLs remain the only artifact access path, and this phase changes nothing
+about their treatment: they are still time-limited, still object-and-action scoped, and
+still redacted unless a command was explicitly asked to produce one. A network volume is
+never an alternate route to canonical storage.
 
 Each URL is scoped to:
 
@@ -358,6 +409,37 @@ The trust model is therefore: a digest is only as trustworthy as the producer th
 recorded it. A worker-reported digest after upload is producer-claimed evidence, the
 stored size is provider-verified evidence, and a persisted job output additionally carries
 a controller-observed digest read back from canonical storage.
+
+### Cache integrity
+
+The cache is a shared, rebuildable store, so its threat model is poisoning and corruption
+rather than confidentiality of new material. An entry is used only when the requested
+identity, the recorded size, and the bytes on disk all agree, and the requested digest is
+the identity — a filename is never trusted. A file whose name matches but whose content
+differs cannot be returned, because identity is content-addressed and its bytes are
+re-hashed both when the entry is selected and again as the copy is written. Placement then
+links that verified file rather than moving a pathname, so a writer with the worker
+account's own write access to the destination directory is the only actor that could change
+the bytes afterwards - the same boundary every other placement in this tool has, and the
+same one the canonical download has. A hit therefore carries exactly the integrity guarantee
+of a fresh download:
+the Phase 5 size and SHA-256 requirements are unchanged and are never weakened for cached
+content, and corrupt bytes are never accepted because they came from provider-attached
+storage.
+
+An entry that contradicts its recorded identity is quarantined — moved into the cache's
+`staging/` area, which is documented as safe to delete — reported as a warning, and
+treated as a miss so the next canonical download rebuilds it. Every other cache failure
+degrades to a warning and the canonical download proceeds: an absent entry, a quarantined
+entry, an unusable cache root, or an interrupted lookup can only make a job slower, never
+fail it. A definitive protocol violation the worker reports still raises, and cache
+integrity problems are reported through a warning sink the CLI writes to stderr.
+
+Cache paths are validated before they are used. The digest must be 64 hexadecimal
+characters and a destination path must be absolute. No component between the cache root
+and an entry may be a symbolic link: a symlinked cache root, symlinked prefix directory,
+symlinked entry directory, or symlinked content file is refused rather than followed, and
+the resolved entry path is additionally checked to stay inside the resolved cache root.
 
 ## Job execution and source integrity
 

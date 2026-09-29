@@ -30,6 +30,11 @@ bucket = "CHANGE_ME"
 prefix = "wavcse"
 presign_expiry_seconds = 3600
 
+[volumes]
+# Where a Pod mounts a RunPod network volume. The mount is also the worker's rebuildable
+# artifact cache root; canonical artifacts stay in S3.
+mount_path = "/workspace/cache"
+
 [jobs]
 # Worker-side isolated job workspace; each job gets <worker_root>/<job-id>/.
 worker_root = "/workspace/wavcse-jobs"

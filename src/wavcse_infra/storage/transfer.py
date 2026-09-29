@@ -67,7 +67,15 @@ class ArtifactTransferResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    operation: Literal["download", "upload", "verify"]
+    # The cache operations report through the same five-field result, because they place the
+    # same kind of verified bytes; only the identity of the operation differs.
+    operation: Literal[
+        "download",
+        "upload",
+        "verify",
+        "cache-materialize",
+        "cache-populate",
+    ]
     path: str = Field(min_length=1)
     size_bytes: int = Field(ge=0)
     sha256: str
@@ -291,7 +299,7 @@ class WorkerArtifactTransfer:
         try:
             ready = self._waiter.wait(worker_id, timeout_seconds=wait_timeout_seconds)
         except SshError as exc:
-            raise _transfer_failure(worker_id, VERIFY_OPERATION, exc) from exc
+            raise remote_operation_failure(worker_id, VERIFY_OPERATION, exc) from exc
         timeout = (
             self._config.command_timeout_seconds
             if command_timeout_seconds is None
@@ -314,7 +322,7 @@ class WorkerArtifactTransfer:
             if _not_materialized(detail):
                 # Absent or partial: a caller may safely download it again.
                 return None
-            raise _transfer_failure(worker_id, VERIFY_OPERATION, exc) from exc
+            raise remote_operation_failure(worker_id, VERIFY_OPERATION, exc) from exc
         parsed = parse_transfer_output(result.stdout, expected_operation=VERIFY_OPERATION)
         if parsed.path != destination:
             raise ArtifactTransferError(
@@ -343,7 +351,7 @@ class WorkerArtifactTransfer:
         try:
             ready = self._waiter.wait(worker_id, timeout_seconds=wait_timeout_seconds)
         except SshError as exc:
-            raise _transfer_failure(worker_id, operation, exc) from exc
+            raise remote_operation_failure(worker_id, operation, exc) from exc
         presigned = presign()
         requested = (
             self._config.transfer_timeout_seconds
@@ -370,7 +378,7 @@ class WorkerArtifactTransfer:
                     f"{operation.capitalize()} did not start on worker {worker_id} because the "
                     f"destination already exists: {detail}"
                 ) from exc
-            raise _transfer_failure(worker_id, operation, exc) from exc
+            raise remote_operation_failure(worker_id, operation, exc) from exc
         try:
             parsed = parse_transfer_output(result.stdout, expected_operation=operation)
             if parsed.path != arguments[1]:
@@ -399,17 +407,19 @@ def _not_materialized(detail: str) -> bool:
     return DESTINATION_ABSENT_MARKER in detail or DESTINATION_INCOMPLETE_MARKER in detail
 
 
-def _transfer_failure(
+def remote_operation_failure(
     worker_id: str,
     operation: str,
     exc: SshError,
 ) -> InfraError:
-    """Classify one unsuccessful transfer command without inventing a remote outcome.
+    """Classify one unsuccessful remote artifact operation without inventing an outcome.
 
     Three outcomes never mean "this artifact failed": the controller lost contact with a
     process that may still run, the worker kept resumable state after a bounded attempt ran
     out of retries, or an unclassified SSH failure said nothing at all. An integrity,
-    authorization, or protocol failure the worker reports is definitive.
+    authorization, or protocol failure the worker reports is definitive. Both the transfer
+    and the cache paths share this policy so an identical failure is never classified two
+    different ways.
     """
 
     capitalized = operation.capitalize()

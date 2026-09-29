@@ -88,6 +88,13 @@ class Availability(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class VolumeType(StrEnum):
+    """RunPod network volume storage tiers, which are immutable after creation."""
+
+    STANDARD = "STANDARD"
+    HIGH_PERFORMANCE = "HIGH_PERFORMANCE"
+
+
 class WorkerConnectionInfo(BaseModel):
     """One provider-reported SSH endpoint; connectivity is not implied."""
 
@@ -152,6 +159,11 @@ class Worker(BaseModel):
     volume_gb: int | None = Field(default=None, ge=0)
     volume_mount_path: str | None = None
     network_volume_id: str | None = None
+    # `mounts` is a required field of the v2 Pod response, so the difference between "the
+    # provider reported no mount" and "the provider reported nothing at all" is real evidence.
+    # Without it, an absent mount and a sparse create answer would be indistinguishable, and
+    # a placement check could only guess.
+    mounts_reported: bool = False
     interruptible: bool | None = None
     created_at: datetime | None = None
     last_started_at: datetime | None = None
@@ -231,6 +243,137 @@ class WorkerCreationPlan(BaseModel):
     spec: WorkerSpec
     offer: GpuOffer
     max_hourly_price: Decimal | None = Field(default=None, ge=0)
+
+
+# RunPod requires a network volume to live inside one data center, and a Pod that mounts it
+# must be placed in that same data center. These bounds are the provider's own documented
+# contract for `POST /v2/network-volumes`, so an out-of-range size fails here rather than
+# after a paid call.
+MIN_NETWORK_VOLUME_SIZE_GB = 10
+MAX_NETWORK_VOLUME_SIZE_GB = 4096
+
+
+class NetworkVolume(BaseModel):
+    """Normalized provider-authoritative view of one network volume.
+
+    A network volume is persistent, provider-attached working storage. It is never
+    canonical: the provider reports capacity and placement only, never artifact contents,
+    and losing it is recoverable from canonical object storage.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: Literal["runpod"] = "runpod"
+    id: str = Field(min_length=1)
+    name: str | None = None
+    size_gb: int = Field(ge=0)
+    datacenter: str = Field(min_length=1)
+    volume_type: VolumeType | None = None
+
+
+class NetworkVolumeSpec(BaseModel):
+    """Explicit request used to create one network volume.
+
+    `name` is the infra identity: an operator-supplied prefix plus a generated
+    high-entropy suffix. The provider does not require volume names to be unique, so that
+    exact name is what reconciles an ambiguous create.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1, max_length=191)
+    size_gb: int = Field(ge=MIN_NETWORK_VOLUME_SIZE_GB, le=MAX_NETWORK_VOLUME_SIZE_GB)
+    datacenter: str = Field(min_length=1)
+    volume_type: VolumeType | None = None
+
+    @field_validator("datacenter")
+    @classmethod
+    def validate_datacenter(cls, value: str) -> str:
+        """Reject data-center text that could not be one exact provider identifier."""
+
+        normalized = value.strip()
+        if not normalized or any(character.isspace() for character in normalized):
+            raise ValueError("data center must be one exact provider identifier")
+        return normalized
+
+
+class DataCenterInfo(BaseModel):
+    """Normalized catalog view of one provider data center.
+
+    `network_volume_types` is empty when the data center cannot host a network volume at
+    all, which is what makes this usable as a placement guard rather than as decoration.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(min_length=1)
+    name: str | None = None
+    region: str | None = None
+    network_volume_types: tuple[VolumeType, ...] = ()
+    global_network: bool | None = None
+    gpu_availability: tuple[GpuDataCenterAvailability, ...] = ()
+
+    def supports_network_volume(self, volume_type: VolumeType | None = None) -> bool:
+        """Return whether this data center can host the requested storage tier."""
+
+        if not self.network_volume_types:
+            return False
+        return volume_type is None or volume_type in self.network_volume_types
+
+
+class NetworkVolumeBillingRecord(BaseModel):
+    """One provider-reported time bucket of network volume storage charges."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    volume_id: str = Field(min_length=1)
+    total_amount_usd: Decimal = Field(ge=0)
+    standard_amount_usd: Decimal = Field(default=Decimal(0), ge=0)
+    high_performance_amount_usd: Decimal = Field(default=Decimal(0), ge=0)
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+
+
+class NetworkVolumeBilling(BaseModel):
+    """Provider-reported storage charges, which is the only place a real price is exposed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    records: tuple[NetworkVolumeBillingRecord, ...] = ()
+    total_amount_usd: Decimal = Field(ge=0)
+    unique_volume_count: int = Field(default=0, ge=0)
+
+
+class NetworkVolumeCreationPlan(BaseModel):
+    """Validated volume request plus the catalog facts shown before confirmation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    spec: NetworkVolumeSpec
+    data_center: DataCenterInfo
+    # RunPod exposes no network volume price through its API, so this is the provider's
+    # published list price, labelled as such wherever it is displayed. `None` when no
+    # published rate applies to the requested tier.
+    published_list_price_usd_per_gb_month: Decimal | None = Field(default=None, ge=0)
+    # The largest volume the published rate above is quoted for. RunPod publishes a
+    # different rate for larger volumes of the same tier, so a request above this bound has
+    # no estimate rather than one computed with a rate that does not apply to it.
+    published_list_price_max_size_gb: int | None = Field(default=None, ge=1)
+
+    @property
+    def estimated_monthly_cost_usd(self) -> Decimal | None:
+        """Return the list-price monthly cost of the requested size, when known."""
+
+        if self.published_list_price_usd_per_gb_month is None:
+            return None
+        if (
+            self.published_list_price_max_size_gb is not None
+            and self.spec.size_gb > self.published_list_price_max_size_gb
+        ):
+            return None
+        return (self.published_list_price_usd_per_gb_month * Decimal(self.spec.size_gb)).quantize(
+            Decimal("0.01")
+        )
 
 
 class WorkerHealthCheck(BaseModel):
