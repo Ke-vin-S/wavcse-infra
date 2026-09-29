@@ -19,16 +19,16 @@ Boundaries: read-only, no-commit, no-paid-compute
    and MLflow connectivity; failed required checks exit non-zero. Record failures and
    name the failing check — repair is a separate, authorized task.
    `infra config validate` parses configuration without contacting any service.
-2. Provider-visible workers — `infra worker list [--json]`, then
-   `infra worker show <exact-worker-id> [--json]` for the IDs that matter. Report provider
+2. Provider-visible workers — `infra worker list --read-only [--json]`, then
+   `infra worker show <exact-worker-id> --read-only [--json]` for the IDs that matter. Report provider
    state, GPU, price/hour, and locally recorded readiness; provider `RUNNING` is not
    local `READY`.
-3. Provider-visible network volumes — `infra volume list [--json]`,
-   `infra volume show <volume-id> [--json]` (which includes provider-reported incurred
+3. Provider-visible network volumes — `infra volume list --read-only [--json]`,
+   `infra volume show <volume-id> --read-only [--json]` (which includes provider-reported incurred
    billing), and `infra volume datacenters [--json]`.
 4. Tracked local state — the records under `~/.local/state/wavcse-infra/` (`workers.json`,
-   `volumes.json`) are credential-free and supplemental. `worker list` and `volume list`
-   refresh them while leaving unrelated account resources unclaimed.
+   `volumes.json`) are credential-free and supplemental. The `--read-only` provider
+   views leave these records untouched.
 5. Canonical storage reachability — `infra storage list --prefix <relative-key-prefix>
    --limit <n> [--json]` proves the configured bucket and prefix are readable;
    `infra storage verify <artifact>` confirms one object's existence, size, metadata, and
@@ -40,8 +40,8 @@ Boundaries: read-only, no-commit, no-paid-compute
 
 ## Disagreements to look for
 
-- Local record with no provider counterpart: reported absent, or `worker show` returned
-  404 and marked the record destroyed. Absence of a local record never means absence of
+- Local record with no provider counterpart: reported absent, or `worker show --read-only`
+  returned 404. Absence of a local record never means absence of
   a provider resource, and a recorded timestamp is not current truth.
 - Provider resource with no local record: a Pod or volume not created by this tool.
 - Volume `lifecycle_state` of `PENDING_CREATE` with no matching provider volume — see

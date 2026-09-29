@@ -213,6 +213,17 @@ def test_volume_list_renders_the_provider_view(monkeypatch, tmp_path: Path) -> N
     assert f"{VOLUME_ID}\tEU-RO-1\t200 GB\tSTANDARD\t{VOLUME_NAME}" in result.stdout
 
 
+def test_volume_read_only_inspection_does_not_create_or_update_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _install(monkeypatch, tmp_path, FakeClient(volumes=[_volume()]))
+    state_path = tmp_path / "volumes.json"
+    listed = runner.invoke(app, ["volume", "list", "--read-only", "--json"], env=_env())
+    shown = runner.invoke(app, ["volume", "show", VOLUME_ID, "--read-only", "--json"], env=_env())
+    assert listed.exit_code == shown.exit_code == 0
+    assert not state_path.exists()
+
+
 def test_volume_list_reconciles_a_tracked_volume(monkeypatch, tmp_path: Path) -> None:
     store = _volume_state(tmp_path)
     intent = store.record_create_intent(

@@ -191,6 +191,23 @@ def test_worker_list_renders_normalized_workers(monkeypatch, tmp_path: Path) -> 
     ) in result.stdout
 
 
+def test_worker_read_only_inspection_does_not_create_or_update_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _install_fakes(monkeypatch, tmp_path, FakeClient())
+    state_path = tmp_path / "workers.json"
+    listed = runner.invoke(
+        app, ["worker", "list", "--read-only", "--json"], env={"RUNPOD_API_KEY": "fake-token"}
+    )
+    shown = runner.invoke(
+        app,
+        ["worker", "show", "pod-123", "--read-only", "--json"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+    assert listed.exit_code == shown.exit_code == 0
+    assert not state_path.exists()
+
+
 def test_worker_show_supports_normalized_json(monkeypatch, tmp_path: Path) -> None:
     _install_fakes(monkeypatch, tmp_path, FakeClient())
     result = runner.invoke(

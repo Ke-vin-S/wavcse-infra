@@ -203,6 +203,10 @@ def doctor_command(context: typer.Context) -> None:
 @worker_app.command("list")
 def list_workers(
     context: typer.Context,
+    read_only: Annotated[
+        bool,
+        typer.Option("--read-only", help="Inspect provider state without updating local records."),
+    ] = False,
     json_output: Annotated[
         bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
     ] = False,
@@ -213,7 +217,8 @@ def list_workers(
     try:
         with RunPodClient.from_settings(settings) as client:
             workers = client.list_workers()
-        _reconcile_state(workers)
+        if not read_only:
+            _reconcile_state(workers)
     except ConfigurationError as exc:
         _configuration_failure(exc)
     except ProviderError as exc:
@@ -246,6 +251,9 @@ def list_workers(
 def show_worker(
     context: typer.Context,
     worker_id: Annotated[str, typer.Argument(help="Exact RunPod worker ID.")],
+    read_only: Annotated[
+        bool, typer.Option("--read-only", help="Inspect without updating local records.")
+    ] = False,
     json_output: Annotated[
         bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
     ] = False,
@@ -256,11 +264,13 @@ def show_worker(
     try:
         with RunPodClient.from_settings(settings) as client:
             worker = client.get_worker(worker_id)
-        _observe_state(worker)
+        if not read_only:
+            _observe_state(worker)
     except ConfigurationError as exc:
         _configuration_failure(exc)
     except ProviderNotFoundError as exc:
-        _mark_state_destroyed(worker_id)
+        if not read_only:
+            _mark_state_destroyed(worker_id)
         _provider_failure(exc)
     except ProviderError as exc:
         _provider_failure(exc)
@@ -789,6 +799,10 @@ def destroy_worker(
 @volume_app.command("list")
 def list_volumes(
     context: typer.Context,
+    read_only: Annotated[
+        bool,
+        typer.Option("--read-only", help="Inspect provider state without updating local records."),
+    ] = False,
     json_output: Annotated[
         bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
     ] = False,
@@ -798,7 +812,11 @@ def list_volumes(
     settings = _load_cli_settings(_context(context))
     try:
         with RunPodClient.from_settings(settings) as client:
-            volumes = _volume_lifecycle(client, settings).refresh()
+            volumes = (
+                client.list_network_volumes()
+                if read_only
+                else _volume_lifecycle(client, settings).refresh()
+            )
     except ConfigurationError as exc:
         _configuration_failure(exc)
     except ProviderError as exc:
@@ -839,6 +857,9 @@ def list_volumes(
 def show_volume(
     context: typer.Context,
     volume_id: Annotated[str, typer.Argument(help="Exact RunPod network volume ID.")],
+    read_only: Annotated[
+        bool, typer.Option("--read-only", help="Inspect without updating local records.")
+    ] = False,
     json_output: Annotated[
         bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
     ] = False,
@@ -851,7 +872,9 @@ def show_volume(
     try:
         with RunPodClient.from_settings(settings) as client:
             lifecycle = _volume_lifecycle(client, settings)
-            volume = lifecycle.show(volume_id)
+            volume = (
+                client.get_network_volume(volume_id) if read_only else lifecycle.show(volume_id)
+            )
             try:
                 billing = lifecycle.billing(volume_id=volume_id, last_n=24)
                 billing_total = billing.total_amount_usd
@@ -860,7 +883,8 @@ def show_volume(
     except ConfigurationError as exc:
         _configuration_failure(exc)
     except ProviderNotFoundError as exc:
-        _mark_volume_destroyed_locally(volume_id)
+        if not read_only:
+            _mark_volume_destroyed_locally(volume_id)
         _provider_failure(exc)
     except ProviderError as exc:
         _provider_failure(exc)
