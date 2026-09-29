@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 from datetime import UTC, datetime
@@ -181,7 +182,15 @@ def test_storage_group_documents_every_command() -> None:
     result = runner.invoke(app, ["storage", "--help"])
 
     assert result.exit_code == 0
-    for command in ("list", "presign-download", "presign-upload", "verify", "download", "upload"):
+    for command in (
+        "list",
+        "presign-download",
+        "presign-upload",
+        "verify",
+        "read",
+        "download",
+        "upload",
+    ):
         assert command in result.stdout
 
 
@@ -446,6 +455,79 @@ def test_verify_supports_json_output(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = json.loads(result.stdout)
     assert payload["key"] == RESOLVED_KEY
     assert payload["content_checksum_verified"] is False
+
+
+def test_read_returns_the_bytes_and_the_digest_the_caller_computes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller inspecting evidence hashes the bytes itself, not a worker's report."""
+
+    body = b'{"study": "TR-0007", "schema_version": 1}\n'
+    digest = hashlib.sha256(body).hexdigest()
+    client = FakeClient(body=body)
+    _install_storage(monkeypatch, client)
+
+    result = runner.invoke(
+        app,
+        ["storage", "read", KEY, "--expected-sha256", digest, "--json"],
+        env=CONFIGURED_ENV,
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["artifact"] == RESOLVED_KEY
+    assert payload["sha256"] == digest
+    assert payload["size_bytes"] == len(body)
+    assert payload["text"] == body.decode()
+    # One bounded body read, and no presign/list call at all.
+    assert client.get_calls[0]["Key"] == RESOLVED_KEY
+    assert client.presign_calls == []
+    assert client.list_calls == []
+
+
+def test_read_refuses_bytes_that_do_not_match_the_expected_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_storage(monkeypatch, FakeClient(body=b"a different run"))
+
+    result = runner.invoke(
+        app, ["storage", "read", KEY, "--expected-sha256", "a" * 64], env=CONFIGURED_ENV
+    )
+
+    assert result.exit_code == 1
+    assert "does not contain the expected bytes" in result.stderr
+    assert "a different run" not in result.stdout
+
+
+def test_read_refuses_an_object_larger_than_the_requested_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_storage(monkeypatch, FakeClient(body=b"x" * 64))
+
+    result = runner.invoke(app, ["storage", "read", KEY, "--max-bytes", "16"], env=CONFIGURED_ENV)
+
+    assert result.exit_code == 1
+    assert "exceeds the 16 byte limit" in result.stderr
+
+
+def test_read_rejects_a_malformed_expected_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_storage(monkeypatch, FakeClient(body=b"{}"))
+
+    result = runner.invoke(
+        app, ["storage", "read", KEY, "--expected-sha256", "not-a-digest"], env=CONFIGURED_ENV
+    )
+
+    assert result.exit_code == 2
+    assert "64 lowercase hex" in result.stderr
+
+
+def test_read_requires_a_configured_bucket() -> None:
+    result = runner.invoke(app, ["storage", "read", KEY], env={})
+
+    assert result.exit_code == 2
+    assert "storage.bucket" in result.stderr
 
 
 def test_download_command_presigns_and_streams_the_worker_module(

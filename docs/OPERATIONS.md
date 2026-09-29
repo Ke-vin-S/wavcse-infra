@@ -641,6 +641,7 @@ infra storage presign-download embeddings/v1/voxceleb-minpooling.tar --expires-i
 infra storage presign-upload embeddings/v1/voxceleb-minpooling.tar
 infra storage verify embeddings/v1/voxceleb-minpooling.tar --expected-size 21474836480
 infra storage verify embeddings/v1/voxceleb-minpooling.tar --manifest embeddings/v1/voxceleb-minpooling.manifest.json
+infra storage read scratch/run-0001/job-ab12/MANIFEST.json --json
 infra storage download embeddings/v1/voxceleb-minpooling.tar /workspace/embeddings/voxceleb.tar \
   --worker <exact-worker-id> --expected-size 21474836480
 infra storage upload scratch/run-0001/outputs.tar /workspace/outputs.tar --worker <exact-worker-id>
@@ -688,6 +689,14 @@ does not download the object, so it cannot confirm content — the command says 
 explicitly. Use `download` with `--expected-sha256` when content must be proven on the
 machine that will consume it. Single presigned PUT uploads are limited to 5 GB by S3;
 larger outputs need a separate multipart transfer workflow.
+
+`infra storage read` is the read-only counterpart for small evidence documents: it
+returns one object's bytes (bounded by `--max-bytes`, 16 MiB ceiling) and, when
+`--expected-sha256` is given, only after the bytes it read match that digest. It exists so
+a caller can inspect the *content* of a stored result — a job manifest, a metrics text
+file — against a digest the caller already recorded, instead of trusting a worker's report
+about what it wrote. It makes no claim beyond the one bounded read: it is not a substitute
+for `verify`, and it never writes, presigns, or replaces anything.
 
 ### Large download transport
 
@@ -1428,8 +1437,23 @@ through the CLI alone. It may rely on exactly this much:
   its deterministic name and spec, never resubmitted.
 - **It is the reaper.** Nothing here expires, reaps or cleans up: the caller stops and
   destroys what it created, and a network volume is never a cleanup step for compute.
-  A caller that stops running leaves paid resources behind, so a periodic
-  `stop`/`sweep` on the controller is the operator's safeguard:
+  A caller that stops running leaves paid resources behind, so the caller installs its
+  own persistent enforcement rather than relying on a session. In wavCSE that is
+  `improvements.compute reap`, run by a controller-local systemd timer:
+
+  ```bash
+  # once per controller: render, install, then deliberately enable
+  uv run python -m improvements.compute reap-install            # prints the units
+  uv run python -m improvements.compute reap-install --install  # writes them, enables nothing
+  uv run python -m improvements.compute reap-install --install --enable
+
+  # what the timer runs, and what an operator can run by hand
+  uv run python -m improvements.compute reap            # dry run, every known scope
+  uv run python -m improvements.compute reap --execute  # stops what is past its deadline
+  ```
+
+  A bare cron entry still works for a single scope, and is the minimum an operator with no
+  systemd can do:
 
   ```bash
   # every 15 minutes: end compute whose deadline has passed, never destroy

@@ -275,6 +275,68 @@ def test_start_and_inspect_record_a_successful_detached_execution(
     assert json.loads(descriptor_text)["secret_names"] == ["MLFLOW_TRACKING_PASSWORD"]
 
 
+def test_the_declared_secret_reaches_the_job_process_and_nowhere_else(
+    tmp_path: Path, fake_git, worker_home
+) -> None:
+    """The whole delivery contract, on one real detached job.
+
+    Non-leakage alone is not delivery: a secret that never arrives would pass a test that
+    only asserts its absence from the log. This asserts both halves — the job process
+    really holds the value, and no persisted artifact holds it.
+    """
+
+    fake_git(_head_script())
+    job_directory = tmp_path / "jobs" / "job-0123456789abcdef"
+    evidence = job_directory / "outputs" / "seen.json"
+    runner.prepare(_descriptor(job_directory))
+
+    _capture_stdout(
+        runner.start,
+        _descriptor(
+            job_directory,
+            command={
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    "import json,os,pathlib,sys;"
+                    "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
+                    "'username': os.environ.get('MLFLOW_TRACKING_USERNAME'),"
+                    "'password': os.environ.get('MLFLOW_TRACKING_PASSWORD'),"
+                    "'tracking_uri': os.environ.get('MLFLOW_TRACKING_URI')"
+                    "}))",
+                    str(evidence),
+                ]
+            },
+            environment={"MLFLOW_TRACKING_URI": "https://dagshub.com/example/repo.mlflow"},
+            secrets={
+                "MLFLOW_TRACKING_USERNAME": "researcher",
+                "MLFLOW_TRACKING_PASSWORD": "super-secret-value",
+            },
+            timeout_seconds=60,
+            infra={"INFRA_JOB_ID": "job-0123456789abcdef"},
+        ),
+    )
+
+    rows = _await_terminal(job_directory, timeout=60)
+
+    assert rows["status"] == "finished"
+    assert rows["exit_code"] == "0"
+    seen = json.loads(evidence.read_text(encoding="utf-8"))
+    assert seen["username"] == "researcher"
+    assert seen["password"] == "super-secret-value"
+    # The non-secret tracking URI travels the ordinary declaration path.
+    assert seen["tracking_uri"] == "https://dagshub.com/example/repo.mlflow"
+
+    log = (job_directory / "logs" / "job.log").read_text(encoding="utf-8")
+    assert "super-secret-value" not in log
+    descriptor_text = (job_directory / "state" / "descriptor.json").read_text(encoding="utf-8")
+    assert "super-secret-value" not in descriptor_text
+    assert json.loads(descriptor_text)["secret_names"] == [
+        "MLFLOW_TRACKING_PASSWORD",
+        "MLFLOW_TRACKING_USERNAME",
+    ]
+
+
 def test_start_records_a_nonzero_exit_code(tmp_path: Path, fake_git, worker_home) -> None:
     fake_git(_head_script())
     job_directory = tmp_path / "jobs" / "job-0123456789abcdef"

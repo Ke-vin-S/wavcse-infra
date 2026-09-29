@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from wavcse_infra.errors import (
     StateError,
     StorageError,
     StorageObjectNotFoundError,
+    StorageVerificationError,
 )
 from wavcse_infra.jobs.collect import resolve_output_source
 from wavcse_infra.jobs.context import JobContext
@@ -68,7 +70,9 @@ from wavcse_infra.state import (
 from wavcse_infra.storage.cache import CacheStats, WorkerArtifactCache
 from wavcse_infra.storage.manifests import ArtifactManifest, load_manifest_json
 from wavcse_infra.storage.s3 import (
+    MAX_MANIFEST_BYTES,
     MAX_PRESIGN_EXPIRY_SECONDS,
+    MAX_READABLE_EVIDENCE_BYTES,
     MIN_PRESIGN_EXPIRY_SECONDS,
     S3Storage,
     StorageVerification,
@@ -1384,6 +1388,85 @@ def verify_artifact(
         _print_json(verification.model_dump(mode="json"))
         return
     _print_storage_verification(verification, bucket=storage.bucket)
+
+
+@storage_app.command("read")
+def read_artifact(
+    context: typer.Context,
+    artifact: Annotated[
+        str,
+        typer.Argument(help="Artifact key relative to the configured namespace prefix."),
+    ],
+    max_bytes: Annotated[
+        int,
+        typer.Option(
+            "--max-bytes",
+            min=1,
+            max=MAX_READABLE_EVIDENCE_BYTES,
+            help="Refuse to buffer an object larger than this many bytes.",
+        ),
+    ] = MAX_MANIFEST_BYTES,
+    expected_sha256: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-sha256",
+            help="Required SHA-256 of the stored bytes; the read fails on a mismatch.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Read one small stored object's bytes back for independent inspection.
+
+    Read-only, and deliberately bounded: it exists so a caller can validate a small
+    evidence document (a job manifest, a metrics text file) against bytes the caller hashes
+    itself, rather than trusting a worker's report about them. When `--expected-sha256` is
+    supplied the digest is checked before anything is printed, so a caller that already
+    recorded a digest can prove the content it inspects is the content that was verified.
+    """
+
+    settings = _load_cli_settings(_context(context))
+    expected = expected_sha256.lower() if expected_sha256 is not None else None
+    if expected is not None and not re.fullmatch(r"[0-9a-f]{64}", expected):
+        _configuration_failure(
+            ConfigurationError("--expected-sha256 must be 64 lowercase hex characters")
+        )
+    try:
+        storage = S3Storage.from_settings(settings)
+        payload = storage.read_object_bytes(artifact, max_bytes=max_bytes)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except StorageError as exc:
+        _storage_failure(exc)
+    digest = hashlib.sha256(payload).hexdigest()
+    if expected is not None and digest != expected:
+        _storage_failure(
+            StorageVerificationError(
+                f"s3://{storage.bucket}/{storage.object_key(artifact)} does not contain the "
+                f"expected bytes: its SHA-256 is {digest}, but {expected} was expected"
+            )
+        )
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        _storage_failure(
+            StorageVerificationError(
+                f"s3://{storage.bucket}/{storage.object_key(artifact)} is not valid UTF-8, "
+                "so it cannot be inspected as an evidence document"
+            )
+        )
+    if json_output:
+        _print_json(
+            {
+                "artifact": storage.object_key(artifact),
+                "size_bytes": len(payload),
+                "sha256": digest,
+                "text": text,
+            }
+        )
+        return
+    typer.echo(text, nl=False)
 
 
 @storage_app.command("download")

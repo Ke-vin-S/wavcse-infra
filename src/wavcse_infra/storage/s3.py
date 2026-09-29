@@ -61,6 +61,10 @@ PRESIGN_CREDENTIAL_MARGIN_SECONDS = 30
 DEFAULT_LIST_LIMIT = 100
 MAX_LIST_LIMIT = 1000
 MAX_MANIFEST_BYTES = 1024 * 1024
+# An evidence document (a job manifest, a metrics text file) is small by construction, so a
+# read-back is capped: a caller inspecting evidence must never be able to pull a training
+# artifact through this path by asking for a larger buffer.
+MAX_READABLE_EVIDENCE_BYTES = 16 * 1024 * 1024
 _LIST_PAGE_SIZE = 1000
 # Reading an object body to prove its bytes must not buffer it: a declared output can be
 # large, so the body is streamed through one hash in bounded chunks.
