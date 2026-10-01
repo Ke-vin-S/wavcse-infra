@@ -2,8 +2,8 @@
 
 `wavcse-infra` is the infrastructure control plane for reproducible wavCSE
 research workloads. It prepares a persistent AWS EC2 controller, operates
-RunPod GPU workers through SSH, inspects opt-in Colab sessions, and executes
-exact-commit jobs with durable S3 artifacts on supported worker transports.
+RunPod Pods over SSH and opt-in ephemeral Colab sessions through the pinned
+CLI, and executes exact-commit jobs with S3-canonical artifacts.
 
 It is not the wavCSE research repository. Model code, experiments, research
 configuration, tests, and MLflow integration remain in the separate `wavCSE`
@@ -11,7 +11,8 @@ repository.
 
 ## Delivery status
 
-The repository currently implements Phases 0–6.2 of the v1 specification:
+The repository implements the v1 RunPod flow and the opt-in Colab execution
+slice:
 
 - a typed `infra` CLI and layered TOML/environment configuration;
 - Ruff, pytest, ShellCheck, and shfmt validation;
@@ -43,17 +44,17 @@ The repository currently implements Phases 0–6.2 of the v1 specification:
   strings, traversal paths, reserved environment names, and bearer values;
 - an explicit job state machine (`PENDING`, `PREPARING`, `RUNNING`, `SUCCEEDED`, `FAILED`,
   `CANCELLED`) with frozen terminal states and durable non-secret records;
-- one reviewed, SHA-256-verified worker runner installed over SSH and driven one bounded
-  command per phase, with no worker daemon, tmux, or message queue;
+- one reviewed, SHA-256-verified worker runner driven over SSH (RunPod) or an
+  uploaded file envelope with fixed Colab launcher, without a worker daemon;
 - exact-commit source materialization with detached checkout, `HEAD` verification on both
   sides, a clean-tree requirement, and anonymous HTTPS-only access;
 - detached execution that survives SSH or controller interruption, with an enforced
   timeout and a combined stdout/stderr log;
 - `infra job submit`, `status`, `logs`, and `cancel`, where cancellation targets only the
   job's own verified process group and never the worker;
-- declared inputs materialized through Phase 5 presigned GET before the command starts,
-  and declared outputs persisted through presigned PUT plus controller size verification
-  before `SUCCEEDED` is recorded;
+- declared inputs materialized through presigned GET before execution, and
+  outputs persisted through presigned PUT plus independent controller read-back
+  and SHA-256 verification before `SUCCEEDED`;
 - non-secret execution provenance handed to the research process as `INFRA_*` variables
   while MLflow run creation stays owned by wavCSE;
 - a RunPod network volume lifecycle (`infra volume list`, `show`, `datacenters`, `create`,
@@ -63,22 +64,21 @@ The repository currently implements Phases 0–6.2 of the v1 specification:
   cache-aware job input materialization for digest-identified inputs;
 - initial architecture, security, operations, provider, and decision documentation.
 
-Phase 6.2 adds persistent working storage for RunPod Secure Cloud: a network volume is a
-rebuildable content-addressed cache, never canonical, and execution still stops at
-single-job execution against an explicitly provided worker. Automatic provisioning,
-multi-worker scheduling, resume orchestration, research dependency installation beyond an
-explicit declared argv, and automatic cache eviction remain unimplemented.
+Phase 6.2 adds persistent working storage for RunPod Secure Cloud: a network
+volume is a rebuildable content-addressed cache, never canonical. Dynamic
+RunPod provisioning from a job spec, multi-worker scheduling, research
+dependency installation beyond an explicit argv, and automatic cache
+eviction remain unimplemented.
 
-The Colab integration currently covers a pinned controller CLI, explicit ADC,
-read-only session inspection, provider/transport identity, scoped supplemental
-state, and ownership-guarded terminal release. **Colab allocation and recorded
-jobs remain blocked:** its CLI exposes no pre-allocation price for the required
-guard, and `colab exec` persists executed code and output in plaintext history,
-including any presigned URL or secret sent with it. `colab ssh --proxy-mode`
-automatically allocates a missing named session and is not a safe substitute.
-`infra worker create --provider colab` therefore reports account usage and
-refuses before allocation even with `--yes`. RunPod behavior is unchanged.
-See [Colab provider boundary](docs/COLAB.md).
+Colab is an opt-in dynamic execution provider with native compute-unit
+limits. One owned ephemeral session is allocated at a time, measured against
+account usage before and after allocation, and released if the observed
+incremental CU/hour breaches policy. This post-allocation check can consume a
+small amount of CU. The same exact-commit runner and durable S3 artifact
+verification are used through uploaded, short-lived envelopes; no presigned
+URL is embedded in normal `colab exec` source. Jobs without `--worker` select
+an existing READY Colab worker first, then RunPod; paid resources are never
+implicitly provisioned by job submission. See [Colab execution](docs/COLAB.md).
 
 ## Architecture
 
@@ -92,11 +92,11 @@ Disposable GPU workers execute immutable wavCSE commits. GitHub distributes code
 private S3 bucket is the canonical store for large artifacts, and wavCSE retains
 ownership of MLflow/DagsHub reporting.
 
-Colab is opt-in. `controller/bootstrap.sh` installs pinned
-`google-colab-cli==0.7.4` without authenticating; a human mints ADC once. All
-CLI calls pass `--auth=adc` explicitly because upstream defaults to interactive
-OAuth. Colab execution cannot yet satisfy the recorded-job secret and artifact
-contract; see [Colab provider boundary](docs/COLAB.md).
+Colab is opt-in. `controller/bootstrap.sh` installs
+`google-colab-cli==0.7.4` without authenticating; a human mints ADC once.
+Every invocation uses `--auth=adc`. The trusted controller accepts the CLI's
+plaintext execution history and restricts local permissions. Workers never
+receive ADC or long-lived cloud credentials. See [Colab](docs/COLAB.md).
 
 See [Architecture](docs/ARCHITECTURE.md), [Security](docs/SECURITY.md), and the
 [decision log](docs/DECISIONS.md) for boundaries and rationale.
@@ -225,20 +225,25 @@ the controller's EC2 instance profile; no permanent AWS access keys are installe
 temporary testing. Do not put the key in TOML or commit a populated `.env` file.
 [`.env.example`](.env.example) documents variables but is not automatically loaded.
 
-Colab is an optional, disabled-by-default section. It carries no credential: ADC comes from
-the ambient Google credential chain, so no Colab token is stored in TOML or in a
-`WAVCSE_INFRA_*` variable.
+Colab is optional and disabled until enabled in the operator's controller
+configuration. Google ADC comes from the ambient human-minted credential
+chain; no Colab credential belongs in TOML.
 
 ```toml
 [colab]
-enabled = false
-cli = "colab"
-command_timeout_seconds = 300.0
-lifecycle_timeout_seconds = 300.0
+enabled = true
+default_gpu = "T4"
+max_simultaneous_workers = 1
+minimum_balance_cu = 5
+max_incremental_rate_cu_per_hour = 3
+max_job_cu = 10
+
+[placement]
+preferred_providers = ["colab", "runpod"]
 ```
 
-Each field has a matching `WAVCSE_INFRA_COLAB_*` environment override; defaults are shown
-above. See [Colab provider notes](docs/COLAB.md) for the full table and lifecycle.
+CU limits are configurable; no Colab USD/hour approximation is used. Job
+selection considers existing READY leases, never silent provisioning.
 
 Validate without making network calls:
 

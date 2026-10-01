@@ -1412,7 +1412,7 @@ reason a mistake in one cannot destroy the other.
 
 ## ADR-029: Separate provider identity from transport, and gate unsafe Colab allocation
 
-- **Status:** Accepted for the provider foundation; recorded Colab execution deferred
+- **Status:** Superseded for Colab cost/history gates by ADR-030; provider foundation retained
 - **Date:** 2026-10-01
 
 ### Context
@@ -1464,3 +1464,61 @@ enforceable cost authorization and a verified secret-safe channel that
 cannot auto-provision on reconnect. Future static university SSH workers
 do not provision or destroy but can share the existing SSH transport and
 exact-commit job semantics.
+
+## ADR-030: Native CU guard and trusted-controller Colab execution
+
+- **Status:** Accepted
+- **Date:** 2026-10-01
+
+### Context
+
+Colab CLI 0.7.4 exposes account-level compute units, not an accelerator-specific
+pre-allocation USD/hour offer. Its `exec` writes source and outputs to controller
+plaintext history. The controller is a trusted single-user execution control
+plane; Colab sessions are ephemeral and must not be conflated with RunPod Pods.
+The Phase 7 foundation separated provider and execution-transport identities
+but intentionally blocked allocation and recorded jobs under the older guards.
+
+### Decision
+
+- Prefer Colab, then RunPod, for unspecified jobs on existing READY compatible
+  workers; an explicit worker/provider wins. Do not silently provision paid
+  RunPod capacity or rerun a failed experiment after a provider transition.
+- RunPod retains its observed USD/hour ceiling. Colab uses native CU balance,
+  observed incremental CU/hour and bounded maximum job CU, never a fabricated
+  USD conversion. Restrict to one active infra-owned Colab lease. Compare
+  account usage and assignment count before/after allocation and release
+  confirmed owned sessions that fail the post-allocation guard. A small amount
+  of CU can be consumed before rejection.
+- Accept the pinned CLI's plaintext execution history **only** on the trusted
+  controller. Restrict local directory/file permissions, use short-lived
+  object-scoped presigned URLs in private temporary uploaded envelopes, and
+  execute stable non-secret launcher code. CLI `upload` logs paths but not
+  contents; `exec` logs source and output. Never store long-lived credentials
+  on workers or in history, source, job state or configuration.
+- Colab bootstrap observes real GPU/CUDA, Python, Git, uv, disk and network.
+  Same reviewed job and artifact runners use a transport-specific upload/exec
+  channel; exact detached Git checkout, declared input digests, job semantics
+  and independent S3 read-back are shared. `/content` is scratch; terminal
+  release has no resumable stop. Research code owns periodic checkpoint policy.
+
+### Alternatives rejected
+
+- Invent an hourly Colab price or hardcode GPU costs: CU and USD/hour are
+  distinct native metrics.
+- Require a pre-allocation Colab price: the CLI does not provide it, so a
+  documented post-allocation rejection is the enforceable policy available.
+- Put presigned URLs or job secrets in `colab exec` source or `--env`: local
+  history would retain them. Use the validated upload path instead.
+- Treat Colab as a long-lived RunPod Pod, a network-volume cache, or a second
+  weaker research-job system: its lifecycle and durability differ.
+- Infer ownership from a session name or retry an ambiguous billable create:
+  only an exact locally recorded identity authorizes release or reconciliation.
+
+### Consequences
+
+Provider failure before an experiment begins may allow choosing another
+eligible existing worker; a nonzero experiment result never does. An orphaned
+unknown create remains blocked until reconciled. The operator owns ADC login,
+CU ceilings, history retention, and explicit release of a compatible batch.
+University static-provider integration remains separate.

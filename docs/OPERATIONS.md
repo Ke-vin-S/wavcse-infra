@@ -255,34 +255,50 @@ The installer downloads official installer scripts to a temporary file before
 execution; it does not use an opaque `curl | sudo bash` pipeline. It never runs login,
 writes provider credentials, or changes existing OMP/Codex authentication stores.
 
-## Google Colab controller checks (no allocation)
+## Google Colab ephemeral execution
 
-`controller/bootstrap.sh` installs `google-colab-cli==0.7.4` without
-authenticating. The operator runs the one-time ADC command on the controller:
+`controller/bootstrap.sh` installs pinned `google-colab-cli==0.7.4` without
+authenticating or allocating. A human performs one-time ADC login on controller:
 
 ```bash
 gcloud auth application-default login \
   --scopes=openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory
 ```
 
-Set `[colab] enabled = true` in the user TOML or use
-`WAVCSE_INFRA_COLAB_ENABLED=true`, then run `infra doctor` and
-`infra worker list --provider colab --read-only`. Both use only read-only
-CLI operations with `--auth=adc`; neither allocates a runtime. The other
-non-secret overrides are `WAVCSE_INFRA_COLAB_CLI`,
-`WAVCSE_INFRA_COLAB_COMMAND_TIMEOUT_SECONDS`,
-`WAVCSE_INFRA_COLAB_LIFECYCLE_TIMEOUT_SECONDS`.
+Set `[colab] enabled = true`, choose CU ceilings in the user-owned config,
+then inspect `infra doctor`, `infra provider list` and
+`infra worker list --provider colab`. No read-only check allocates compute.
+The CU limits also have environment overrides:
+`WAVCSE_INFRA_COLAB_MINIMUM_BALANCE_CU`,
+`WAVCSE_INFRA_COLAB_MAX_INCREMENTAL_RATE_CU_PER_HOUR`,
+`WAVCSE_INFRA_COLAB_MAX_JOB_CU` and existing CLI/timeout overrides. A missing
+or expired ADC requires the human login above; do not automate it.
 
-`infra worker create --provider colab --gpu T4` displays read-only
-account usage and refuses the paid request: Colab exposes no
-pre-allocation hourly price with which to enforce `--max-price`.
-`--yes` cannot bypass this. Recorded jobs, presigned worker transfers,
-and arbitrary exec reject Colab worker IDs rather than send bearer
-material through the upstream CLI's plaintext execution history.
-`infra worker stop` rejects Colab because stop is resumable; a
-provider-confirmed, tracked, infra-owned Colab session is released with
-`infra worker destroy <exact-session-name>` after confirmation.
-See [Colab provider boundary](COLAB.md) for the complete limitations.
+```bash
+infra worker create --provider colab --gpu T4
+infra worker show <exact-infra-owned-session>
+infra worker health <exact-infra-owned-session>
+infra job submit <job-spec.json> --worker <exact-infra-owned-session> --wait
+infra job status <job-id>
+infra worker destroy <exact-infra-owned-session>
+infra worker list --provider colab
+```
+
+Creation prints balance, aggregate CU rate and assignment count before
+confirmation; then claims a unique identity, allocates once, reads usage
+again, checks physical GPU/CUDA and the incremental CU/hour ceiling, bootstraps
+and marks READY. A rejected confirmed lease is released immediately. A small
+amount of CU may be charged before rejection; inspect usage after release.
+An ambiguous intent must be reconciled, never blindly retried. One active
+infra-owned lease at a time; release it after a bounded compatible job batch.
+`infra job submit <spec>` prefers an existing READY Colab worker over RunPod;
+`--provider runpod` restricts placement and `--worker` pins the exact worker.
+There is no implicit paid provisioning on submit or provider retry of a failed
+experiment. `infra storage upload` can publish a checkpoint from an existing
+Colab worker during a long job; coordinate the producer and checkpoint path in
+wavCSE. The worker's `/content` is never durable. Colab stop/start, SSH and
+network-volume operations remain unsupported. See [Colab](COLAB.md) for
+history permissions, capabilities, recovery and retention.
 
 ## RunPod worker operations
 

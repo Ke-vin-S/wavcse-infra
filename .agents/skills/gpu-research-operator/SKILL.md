@@ -34,12 +34,13 @@ time.
 
 ## Choosing capacity by total expected cost
 
-GPU discovery reports the exact GPU type id, VRAM, cloud tier, availability, the maximum GPUs of
-that type on one machine, and the provider list price both per GPU-hour and for the requested count;
-the discovery commands are in the `wavcse-infra-operator` skill. Compare candidates on total
-expected cost, which includes at least:
+RunPod GPU discovery reports exact type, VRAM, cloud tier, availability,
+maximum GPUs per machine and provider list price. Colab instead exposes
+account CU balance and aggregate CU/hour; use its one-owned-session
+before/after guard and never invent a USD/hour conversion. Compare candidates
+on provider-native cost, expected time and verified artifact outcome:
 
-- the discovered hourly price for the requested count;
+- RunPod's discovered hourly price, or Colab's observed incremental CU/hour;
 - expected wall clock for this workload, projected from a measurement (below), not from a
   specification sheet;
 - data-transfer and storage cost that continues after compute stops;
@@ -51,25 +52,24 @@ CPU-bound, or storage-bound pipeline cannot feed simply bills faster. Never assu
 with the price ratio or with advertised throughput numbers. A public-IP-compatible offer can be
 priced above the unfiltered catalog price, and the price guard compares the filtered value.
 
-## A price ceiling belongs to a human
+## A provider-native ceiling belongs to a human
 
-The create ceiling is the maximum accepted total GPU price in USD/hour for the whole request, not
-per GPU, and it is compared against the discovered total before the billable request is issued. If
-the provider did not report a reliable price, the guard cannot be proven and creation is refused
-whenever a ceiling was supplied.
+For RunPod, `--max-price` is the maximum accepted total GPU USD/hour for the
+whole request and is checked before billable creation. Always supply it for
+an autonomous RunPod create; never widen an authorized ceiling silently.
+For Colab, configure minimum balance, maximum incremental CU/hour and
+maximum job CU. The rate is observable only after a single owned allocation,
+so a rejected allocation may consume a small amount of CU before immediate
+release. Never substitute a guessed Colab USD/hour value.
 
-- Always supply a ceiling for an autonomous create.
-- Raising an authorized ceiling is a human decision. When the workload genuinely needs a more
-  expensive GPU, ask for explicit authorization. Never widen the flag, bypass the guard, or create
-  the resource by another route.
-- Billable-create and irreversible-destroy safety rules, including the reconciliation identity, are
-  in the `wavcse-infra-operator` skill.
+Raise authorized limits only with a human decision; never widen a ceiling,
+bypass the guard or create by another route. Billable create and irreversible
+destroy safeguards are in `wavcse-infra-operator` and `colab-operator`.
 
-Storage keeps costing money after compute stops: container disk is erased on stop and is not charged
-while stopped, but host-local volume disk and network volumes continue to accrue storage charges for
-as long as they exist. Destroying a Pod never destroys a volume, and a network volume lives in
-exactly one datacenter, so a Pod that mounts one is constrained to that datacenter. Volume and cache
-cleanup rules are the `wavcse-artifact-pipeline` skill.
+RunPod container scratch is erased on stop, while host-local and network-volume
+storage may keep billing. Destroying a Pod never destroys its volume. Colab
+scratch is ephemeral and no provider volume is assumed; release its lease after
+durable outputs are verified. Cache cleanup belongs to `wavcse-artifact-pipeline`.
 
 ## Measure before scaling
 

@@ -14,6 +14,8 @@ The components are:
 - **wavCSE repository:** research code and experiment source of truth.
 - **wavcse-infra repository:** infrastructure CLI and machine bootstrap.
 - **RunPod Pods:** disposable GPU execution environments.
+- **Google Colab sessions:** one infra-owned GPU lease at a time; ephemeral
+  `/content` scratch, no resumable stop or persistent provider disk.
 - **RunPod network volumes:** provider-attached storage mounted by Secure Cloud Pods as a
   rebuildable artifact cache. Private S3 stays canonical; a volume can be rebuilt and a
   container disk is ephemeral scratch.
@@ -21,19 +23,15 @@ The components are:
 - **Private S3:** canonical large-artifact and embedding storage.
 - **MLflow/DagsHub:** experiment tracking owned by wavCSE.
 
-Colab is an opt-in provider read path, not yet an execution target for recorded
-jobs. `ProviderKind` identifies the authoritative resource and
-`ExecutionTransport` identifies the worker channel independently. RunPod
-remains dynamically provisioned with SSH, resumable stop/start, and optional
-persistent provider storage. Colab sessions are dynamically allocated and
-ephemeral; upstream `colab stop` is terminal release, not resumable stop.
-`infra worker create --provider colab` refuses before allocation because the
-official CLI reports no per-accelerator pre-allocation hourly price. Its
-`colab exec` writes code and outputs to plaintext history, so it cannot carry
-job secrets or presigned URLs. Existing job semantics and S3 publication are
-not weakened to accommodate this transport; see [Colab](COLAB.md).
-Future university-managed static SSH workers need no dynamic provision or
-destroy, and can reuse SSH execution without changing the job specification.
+`ProviderKind` identifies the authoritative resource and `ExecutionTransport`
+identifies its command channel. RunPod provisions Pods with an observed USD/hour
+offer, SSH, resumable stop/start and optional cache volumes. Colab allocates
+named GPU sessions against native CU policy; `stop` is terminal release.
+Allocation measures aggregate CU/hour and assignment count before and after
+one owned create; a failed post-allocation guard releases the exact owned
+session. Colab bootstraps via the CLI kernel and observes physical CUDA hardware.
+Both transports feed the same reviewed job and artifact runners and independent
+S3 output verification. A static university SSH provider is not implemented.
 
 ## Control and data flow
 
@@ -42,7 +40,7 @@ OMP edits wavCSE on controller
   -> tests
   -> immutable Git commit
   -> GitHub
-  -> RunPod worker checks out exact commit
+  -> selected READY RunPod or Colab worker checks out exact commit
   -> wavCSE executes and reports to MLflow
 
 Controller IAM role
@@ -52,10 +50,10 @@ Controller IAM role
   -> controller verifies durable object
 ```
 
-Every storage key is resolved beneath the configured `storage.prefix`, so the
-controller can only address its own namespace. The presigned URL is transported on the
-direct SSH stdin stream rather than as a process argument, and worker-side code holds no
-AWS credential.
+Every key is resolved beneath `storage.prefix`. RunPod sends bearer URLs on
+direct SSH stdin. Colab uploads short-lived, 0600 local JSON envelopes through
+the CLI contents API, then runs a fixed non-secret `exec` launcher to consume
+and delete the remote envelope. Workers have no AWS credentials.
 
 Phase 5 adds canonical S3 access, version 1 artifact manifests, and worker artifact
 transfer. Phase 6 adds the versioned job specification, exact-commit materialization,
@@ -66,9 +64,9 @@ package manager.
 ## Recorded job flow
 
 ```text
-infra job submit jobs/dg-0004.json --worker <id>
-  -> validate the version 1 JSON specification
-  -> require provider RUNNING + locally READY worker (never create/bootstrap/destroy here)
+infra job submit jobs/dg-0004.json [--worker <id>] [--provider runpod]
+  -> validate version 1 JSON, choose an existing READY worker in placement order
+  -> never implicitly provision paid capacity
   -> install worker/job_runner.py at jobs.runner_path, verified by SHA-256
   -> create <jobs.worker_root>/<job-id>/{source,inputs,outputs,logs,state}
   -> clone/fetch/checkout spec.source.commit; verify HEAD == commit; require a clean tree
@@ -79,7 +77,7 @@ infra job submit jobs/dg-0004.json --worker <id>
        -> stdout/stderr -> logs/job.log, exit code -> state/finished.json
 
 infra job status <job-id>
-  -> read worker evidence (state files recording the commit verified at launch) over direct SSH
+  -> inspect worker evidence through the selected SSH or Colab upload/exec transport
   -> persist declared outputs through presigned PUT + controller content verification against
      the worker-reported size and digest, read back from canonical storage
   -> SUCCEEDED only when the command exited 0 and every required output is persisted
@@ -227,10 +225,10 @@ state and the worker's own files remain authoritative; a local record is never u
   releases for the controller user without performing authentication.
 - `controller/cloud-init.yaml` performs only initial public clone and bootstrap dispatch.
 
-No generic provider base class exists; the RunPod lifecycle and job transport
-remain operational. The Colab adapter provides a distinct session read path
-and ownership-guarded release. Recorded Colab execution requires a safe secret
-channel and an enforceable cost guard before it can join the common job flow.
+No broad generic provider framework exists. RunPod lifecycle remains Pod-specific,
+Colab lifecycle remains an ephemeral session with CU-based allocation and ownership-
+guarded release. The transport changes while exact-commit checkout, input digest
+checks, job result semantics and canonical output verification remain shared.
 
 Controller agent installation is not part of the worker lifecycle. Normal GPU workers
 remain minimal execution environments and do not receive OMP, Codex, AGF, or controller

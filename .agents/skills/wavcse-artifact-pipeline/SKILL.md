@@ -88,10 +88,13 @@ Treat a downloaded dataset or archive as untrusted input.
 
 ## Transfer semantics
 
-Transfers use time-limited, object- and action-scoped presigned URLs. The controller
-signs only after worker readiness and only for the requested object and operation. A URL
-travels on the direct SSH session's stdin, never on an argument list, environment dump, or
-log line, and is never persisted.
+Transfers use time-limited, object- and action-scoped presigned URLs, signed
+only after worker readiness. RunPod carries the URL on direct SSH stdin.
+Colab uploads a 0600 local, short-lived secret-bearing envelope through the
+CLI file API; a non-secret launcher consumes and deletes the remote file.
+Neither transport puts bearer URLs in normal `exec` source, arguments, ordinary
+logs, durable job state or Git. The trusted controller accepts only the
+pinned CLI's restricted local history exception (see `docs/COLAB.md`).
 
 - One PUT cannot exceed the single-PUT ceiling of 5 GB. A larger artifact must be sharded
   or repackaged smaller; multipart upload is not implemented.

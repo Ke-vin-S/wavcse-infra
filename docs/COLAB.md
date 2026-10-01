@@ -1,88 +1,117 @@
-# Google Colab provider boundary
+# Google Colab execution
 
-Colab CLI 0.7.4 is the validated controller-side command. `controller/bootstrap.sh`
-installs it without performing OAuth or allocating a runtime. Colab is disabled by
-default (`[colab] enabled = false`). When enabled, `infra doctor` checks the
-pinned CLI version and read-only session access; `infra worker list --provider colab`
-reads and normalizes session state. `infra worker show <tracked-session-name>`
-requires an exact locally tracked identity. A Colab session is ephemeral; RunPod
-retains its existing SSH, stop/start, persistent-volume, and price semantics.
+`google-colab-cli==0.7.4` is pinned on the trusted controller. Colab is a
+first-class **ephemeral** execution provider: allocate, observe actual account
+CU usage and physical GPU, enforce cost policy, bootstrap to READY, run one or
+more compatible exact-commit jobs, persist outputs, release. There is no
+resumable stop, network-volume cache, public-IP or SSH requirement.
 
-## One-time authentication
+## Authentication and configuration
 
-An operator, not an automated job, runs on the controller:
+A human authenticates once on the controller (never in automated bootstrap):
 
 ```bash
 gcloud auth application-default login \
   --scopes=openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory
 ```
 
-`gcloud` is an operator-installed prerequisite, not bundled with
-`google-colab-cli`. If `gcloud --version` is unavailable, install the
-[official Google Cloud CLI](https://cloud.google.com/sdk/docs/install)
-on the controller before minting ADC. Bootstrap never starts this login.
+The CLI uses `--auth=adc` explicitly. `infra doctor` checks CLI version, session
+access, account balance and rate without allocating. No ADC file, CLI session
+token, Google Drive, static AWS key or Git write credential is copied to a worker.
 
-The validated CLI defaults to **oauth2**, so every invocation from this project
-passes `--auth=adc` explicitly. To inspect authentication without allocating
-compute, run `colab --auth=adc sessions`. The CLI's own local session metadata
-includes runtime proxy tokens; never copy it to a worker or commit it. `colab
-auth` injects Google credentials into the runtime and is not used. Google Drive
-is not canonical storage: S3 remains the authority for artifact bytes.
+```toml
+[colab]
+enabled = true
+default_gpu = "T4"
+max_simultaneous_workers = 1
+minimum_balance_cu = 5
+max_incremental_rate_cu_per_hour = 3
+max_job_cu = 10
 
-Non-secret configuration fields in `config/infra.example.toml` are `enabled`,
-`cli`, `command_timeout_seconds`, and `lifecycle_timeout_seconds`; the
-matching `WAVCSE_INFRA_COLAB_*` environment settings follow CLI >
-environment > user TOML > defaults. No Google access or refresh credential
-belongs in TOML, environment overrides, job records, or worker state.
+[placement]
+preferred_providers = ["colab", "runpod"]
+```
 
-## Current safety gates
+Values are operator-owned non-secret limits, **not** provider prices. Defaults
+in the example are illustrative and should be set to the operator's CU budget.
+Only one infra-owned allocation is permitted. CLI 0.7.4 `usage` prints account
+balance, aggregate rate (two decimal places) and active-assignment count; the
+controller parses all three. On creation it records a unique `wavcse-` identity
+before calling `new`, then compares `usage_after - usage_before`, requiring the
+assignment count to increase by exactly one and the incremental CU/hour to be
+positive and within policy. If a confirmed owned session fails cost or bootstrap
+checks, it is released and marked absent only after provider confirmation.
+Ambiguous creation is reconciled by exact identity and never blindly repeated.
+Account observations are rounded; a changing unrelated session makes attribution
+unsafe and causes rejection. **The post-allocation guard may consume a small
+amount of CU before release.** No invented USD/hour conversion is made.
+RunPod retains its USD/hour ceiling, SSH, storage and lifecycle semantics.
 
-Colab **allocation and recorded execution are not enabled** in this change.
-The CLI's `usage` command provides account-level compute units but no
-provider-observed price for a selected accelerator *before* allocation. The
-existing cost invariant refuses an absent price: `infra worker create --provider
-colab --gpu T4` reports usage, then rejects without calling `colab new`, even
-with `--max-price` and `--yes`. No price is guessed and no paid session is
-silently created.
+## Worker and recorded job
 
-Colab CLI 0.7.4's `exec` implementation writes the complete executed source
-**and outputs** into `$HOME/.config/colab-cli/history/<session>.jsonl`; its
-`--env` option is written to that history too. Neither a presigned S3 URL nor a
-job secret may pass through this path. Its `ssh --proxy-mode -s NAME` command
-automatically creates a missing named runtime, including during a disappearance
-race; it cannot safely replace the secret-carrying direct SSH transport.
-Consequently `infra job submit`, `infra storage download/upload`, and arbitrary
-`infra worker exec` reject tracked Colab identities instead of recording a
-weaker experiment or leaking a bearer URL. A Colab worker is **not READY** for
-recorded jobs. No Colab input/output may be called durable until the controller
-independently reads the canonical S3 object back and hashes it.
+```bash
+infra provider list
+infra doctor
+infra worker create --provider colab --gpu T4
+infra worker show <exact-owned-session-id>
+infra worker health <exact-owned-session-id>
+infra job submit <job-spec.json> --worker <exact-owned-session-id> --wait
+infra job status <job-id>
+infra worker destroy <exact-owned-session-id>
+infra worker list --provider colab
+```
 
-`infra worker stop` means resumable compute and rejects Colab; upstream `colab
-stop` is terminal release. `infra worker destroy` recognizes only a tracked,
-confirmed infra-owned exact Colab session identity, prints the target and
-requires confirmation unless `--yes`, invokes terminal release once, then
-marks it absent only after provider session listing confirms that outcome. It
-never releases a session merely because its name resembles `wavcse-*`. Colab
-network volumes, stop/resume, and direct SSH are not emulated.
+Creation is confirmed interactively unless `--yes` is deliberate. RUNNING is
+not READY: non-SSH bootstrap checks Python, Git, uv, physical NVIDIA GPU model,
+PyTorch CUDA, scratch disk and GitHub reachability. `infra worker stop/start`
+remain unsupported. Worker release requires locally tracked confirmed ownership,
+provider-confirmed exact identity, and confirmation (or `--yes`). Destroy never
+targets a prefix, an arbitrary user session, or a network volume.
 
-A future change needs **both** (1) an approved, enforceable compute-unit cost
-policy or provider-observed price and (2) a verified execution channel that
-does not persist presigned URLs or job secrets or auto-create sessions on
-reconnect. Only then can the existing exact-commit job runner and S3
-publication checks be reused; do not create a second, weaker job system. A
-university-managed static SSH worker does not need provisioning or destroy;
-provider identity and execution transport are separate so this boundary can
-be added without changing the job specification.
+`infra job submit <spec>` selects an existing compatible READY worker in
+configured provider order (Colab, then RunPod); `--provider runpod` restricts
+selection. `--worker` pins one exact worker. The CLI never silently provisions
+paid compute from a job spec: RunPod needs an explicit offer and human USD/hour
+ceiling; create workers first. An existing Colab lease may be reused by ID only
+while READY, idle, and within the configured balance/rate/job-timeout CU budget.
+`max_job_cu` bounds observed CU/hour multiplied by declared maximum job runtime;
+it is not a guarantee against external account usage changes. One Colab job at
+a time avoids conflicting work. A research failure, undesirable metric or
+uncertain outcome never triggers cross-provider rerun.
 
-## Provider failure versus experiment failure
+Both transports use the reviewed `worker/job_runner.py` and Phase 5 transfer
+module: detached checkout verifies the full commit and clean tree, required
+inputs are SHA-256 verified before launch, outputs go through presigned PUT and
+independent controller-side S3 read-back plus streaming digest before success.
+MLflow/DagsHub instrumentation stays in wavCSE. `/content` is ephemeral
+scratch. For long runs, an operator may call `infra storage upload` on an
+atomically published worker checkpoint while the detached job continues, or
+research code must opt into its own approved in-run publication path. Merely
+declaring a terminal job output cannot protect a checkpoint before the job
+finishes. Infra does not schedule research-specific checkpoints.
 
-CLI missing, ADC unavailable/expired, malformed session response, missing
-session, quota exhausted, accelerator unavailable, and ambiguous allocation
-are provider errors. A training command's nonzero exit is a job result, not
-provider capacity evidence and not a reason to select another provider. All
-ordinary tests mock subprocesses; they allocate no GPU or compute units.
+## Local-history risk acceptance
 
-Official source reviewed: [google-colab-cli v0.7.4](https://github.com/googlecolab/google-colab-cli/tree/v0.7.4),
-notably `src/colab_cli/commands/execution.py` (history),
-`src/colab_cli/commands/ssh.py` (auto-allocation), and
-`src/colab_cli/commands/session.py` (session output and allocation).
+The trusted, single-user controller deliberately accepts plaintext local CLI
+history. Upstream [0.7.4 `upload`](https://github.com/googlecolab/google-colab-cli/blob/v0.7.4/src/colab_cli/commands/files.py)
+uses Jupyter Contents PUT and records **paths** (`local`, `remote`), not bytes;
+[execution.py](https://github.com/googlecolab/google-colab-cli/blob/v0.7.4/src/colab_cli/commands/execution.py)
+records all `exec` source **and outputs**. Upstream `history.py` appends JSONL to
+`~/.config/colab-cli/history/<session>.jsonl`; `state.py` stores runtime proxy
+tokens in `~/.config/colab-cli/sessions.json`, and `common.py` writes
+`~/.config/colab-cli/colab.log`. The controller restricts owned CLI directories
+to 0700 and sessions/log/infra-history files to 0600. The remote envelope is an
+ephemeral upload with restrictive local 0600 mode, schema/session/job/expiry
+checks, one-time remote ingestion and deletion; the `exec` launcher contains no
+presigned URL or secret. File-operation paths remain in history. Keep a short
+operator-defined troubleshooting retention window; inspect and remove **only**
+identifiable old infra-owned history manually after its capabilities have
+expired. Do not broadly delete Google state. `ssh --proxy-mode` is not used:
+it can silently allocate a missing session. Never pass capabilities in `--env`,
+source code, normal logs, job records or Git.
+
+If ADC is unavailable or requires interactive login, stop before allocation.
+If a session disappears before/during execution, treat it as infrastructure
+loss, not evidence of a failed scientific command. Terminal outputs count as
+durable only after S3 read-back. Read [Security](SECURITY.md) and
+[ADR-030](DECISIONS.md) for the narrowly accepted controller-history exception.

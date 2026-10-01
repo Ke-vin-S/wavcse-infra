@@ -60,27 +60,38 @@ instance profile supplies and refreshes temporary AWS credentials.
 
 ### Google Colab
 
-The controller may hold one-time human-minted Google ADC. The CLI is always
-invoked with `--auth=adc` and never initiates an interactive login during
-automated work. ADC and the CLI's local session metadata stay on the
-controller, never on the runtime. `colab auth` and Google Drive mounting
-are not used. S3 remains canonical; Colab local storage is ephemeral.
+The trusted single-user controller holds human-minted ADC. Every pinned CLI
+0.7.4 call uses `--auth=adc`; automation never opens interactive auth. ADC,
+runtime proxy tokens in `~/.config/colab-cli/sessions.json`, and CLI history
+stay on the controller, never in source, config, job records or a worker.
+Colab `auth`, Google Drive, long-lived AWS keys and Git write credentials
+are forbidden on the runtime. S3 remains canonical; `/content` is scratch.
 
-The validated CLI 0.7.4 writes every `colab exec` code block **and output**
-to plaintext history in the controller user's home directory. Job secrets
-and presigned URLs therefore must not be sent through it, even through its
-`--env` flag. Its `ssh --proxy-mode -s` auto-allocates a missing session,
-so a read-then-connect race can provision paid compute; it is not a
-permitted secret transport here. Colab workers are not marked READY for
-recorded jobs, and no Colab job is considered durable without the same
-S3 read-back and SHA-256 check as a RunPod job.
+**Narrow accepted exception:** the pinned CLI logs all `colab exec` code
+and output in plaintext local JSONL history. The controller is already
+trusted with temporary job capabilities, so this local history risk is
+accepted for research execution; it is not permission to log tokens or
+presigned URLs in ordinary CLI output or job metadata. Pinned `colab upload`
+records its local/remote **paths** in history, not file contents. The CLI
+Jupyter Contents PUT carries the temporary envelope bytes; a fixed exec
+launcher validates schema, session, job and expiry, deletes the remote file
+after ingestion, and never embeds URL/secret values in exec source or `--env`.
+Local envelopes are 0600 and removed after upload. A kernel output that
+echoes a secret can still enter CLI history; research code must not print
+secrets. The adapter restricts owned CLI directories to 0700 and token/log/
+infra-owned history files to 0600. Keep a short manually reviewed retention
+window for identifiable infra-owned history; never broadly delete Google
+state or change unrelated users' files.
 
-Colab `usage` reports account compute units, not a per-accelerator
-pre-allocation USD/hour price. The CLI therefore refuses Colab creation
-under the existing price guard, even with `--yes`. Release requires both
-a tracked created identity and provider-confirmed exact session name,
-plus confirmation; no name-prefix cleanup is authorized.
-See [Colab provider boundary](COLAB.md).
+Colab `usage` is a native CU balance/rate report, not a USD/hour offer.
+Only one infra-owned allocation can be active, enabling before/after
+incremental CU attribution. A post-allocation rate rejection releases the
+confirmed exact owned session; a small amount of CU may already be charged.
+An ambiguous create blocks another allocation until reconciliation.
+Destroy checks local ownership and provider identity, and requires explicit
+confirmation. The CLI's SSH proxy is not used because it can auto-create
+missing sessions. RunPod's USD/hour, SSH and stop/start contract is unchanged.
+See [Colab](COLAB.md) and [ADR-030](DECISIONS.md).
 
 ### RunPod
 

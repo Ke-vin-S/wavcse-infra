@@ -520,12 +520,12 @@ The first version may require the caller to specify a worker explicitly.
 
 Automatic scheduling is not required for initial v1.
 
-Implementation note (Phase 6): `infra job submit <job-spec.json> --worker <id>` requires
-an existing, locally READY worker and refuses to create, bootstrap, or start one. A
-required input that fails size or checksum verification prevents the command from
-starting. Submission records FAILED with the failing phase and evidence instead of
-silently discarding the attempt, and `infra job status` reconciles against the worker's
-own recorded state before reporting anything.
+Implementation note: `infra job submit <job-spec.json> [--worker <id>]`
+chooses an existing locally READY worker under configured placement preference,
+or pins the explicit worker/provider. It never silently creates paid capacity.
+Required input digest failures prevent command launch. Submission records
+FAILED with evidence only on definitive failures; status reconciles worker
+evidence before reporting an outcome.
 
 Implementation note (Phase 6.1, remediation): the same distinction is applied to every
 observation the controller makes, not only to waits. A worker that is merely stopped or
@@ -727,13 +727,13 @@ Exit non-zero if required checks fail.
 
 # 25. Cost safety
 
-Worker creation must show the requested resource before or immediately after creation.
-
-Where RunPod returns pricing, record it.
-
-The configuration should support a maximum acceptable hourly price.
-
-If the provider cannot satisfy a requested constraint, fail rather than silently choosing an arbitrary more expensive worker.
+Worker creation must show the requested resource and enforce native provider cost.
+RunPod requires its observed USD/hour offer and the human price ceiling before
+creation. Colab uses account compute-unit balance and aggregate CU/hour,
+measures incremental rate across one owned allocation, and may spend a small
+amount before rejecting and releasing a lease above its configured ceiling.
+Neither model is converted into the other. A provider unable to prove a
+requested constraint must fail, not silently choose an expensive substitute.
 
 Destructive cleanup should be explicit.
 
@@ -933,15 +933,15 @@ Only after real usage:
 - optional provider expansion
 
 
-Phase 7 multi-provider evaluation introduces an opt-in Colab session adapter,
-provider/transport identity, and read-only diagnostics, without changing the
-recorded job contract. The official Colab CLI 0.7.4 has no pre-allocation
-per-accelerator hourly price and writes `exec` code and output to plaintext
-history. The existing price and secret rules therefore prevent Colab
-allocation and recorded Colab jobs until those constraints are resolved; see
-[Colab](COLAB.md) and ADR-029. A future static university SSH worker requires
-neither provisioning nor destroy, but can use the existing exact-commit job
-semantics once its transport and ownership are defined.
+Phase 7 provider/transport separation is followed by an opt-in Colab execution
+slice. The official CLI 0.7.4 has no pre-allocation per-accelerator USD/hour
+price and writes `exec` code/output into local plaintext controller history.
+ADR-030 accepts a trusted-controller history exception while preserving
+short-lived capabilities in uploaded ephemeral envelopes. Colab uses CU
+balance and post-allocation incremental CU/hour policy, one owned active
+session, real GPU/CUDA bootstrap and the shared exact-commit job/S3 contract.
+RunPod remains a separately priced, SSH-driven, resumable Pod provider.
+University static SSH is not implemented.
 
 # 31. v1 acceptance scenario
 

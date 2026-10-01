@@ -5,10 +5,10 @@ description: Operate the wavCSE control plane with the infra CLI: reconcile prov
 
 # wavCSE Infrastructure Operator
 
-`wavcse-infra` is the control plane for reproducible wavCSE runs: a persistent but stoppable EC2
-controller, disposable RunPod GPU workers, GitHub for code distribution, and S3 for canonical large
-artifacts. Research code, experiments, tests, and MLflow reporting stay in the separate `wavCSE`
-repository.
+`wavcse-infra` is the control plane for reproducible wavCSE runs: a persistent
+EC2 controller, disposable RunPod Pods and ephemeral Colab leases, GitHub for
+exact-commit code distribution and S3 for canonical artifacts. Research logic
+and MLflow reporting stay in the separate `wavCSE` repository.
 
 Act through the `infra` CLI. Every operation below already carries cost guards, identity safeguards,
 bounded retries, and provenance. Reimplementing it with raw `ssh`, `aws`, or provider HTTP calls
@@ -16,12 +16,10 @@ discards those properties and is a defect.
 
 ## Autonomous callers
 
-An automated caller driving this CLI from the wavCSE checkout relies on the contract in
-`docs/OPERATIONS.md` ("Autonomous callers"): it owns what it creates, supplies its own
-price ceiling, declares verified inputs and outputs, reconciles an ambiguous outcome
-before retrying, and is the reaper — nothing here expires or cleans up on its own. When
-a failure needs infrastructure judgement rather than a CLI call, expect to be asked
-about one scope at a time; the research side never changes directory to ask.
+An automated caller follows `docs/OPERATIONS.md` ("Autonomous callers"): it
+owns paid capacity it creates and releases, sets a RunPod USD/hour ceiling or
+Colab CU policy, declares verified inputs/outputs, and reconciles ambiguity
+before retrying. Job submission itself does not implicitly provision capacity.
 
 ## Controller and worker responsibility
 
@@ -58,8 +56,10 @@ It is read-only; required failures exit 1 and invalid TOML exits 2. Global `--co
 
 ## Worker lifecycle
 
-Creation is paid. Discover an exact offer with `infra worker gpu-types` first; GPU choice and price
-ceiling policy are the `gpu-research-operator` skill's subject.
+Use `compute-placement` and `colab-operator` for Colab's one-owned-session CU
+policy, ephemeral bootstrap, upload/exec and terminal release. The following
+GPU catalog, cloud tier, USD/hour ceiling, direct SSH and volume rules apply
+to **RunPod only**:
 
 ```
 infra worker create --gpu '<exact-gpu-type-id>' --cloud '<cloud-tier>' \
@@ -107,8 +107,8 @@ requires the mapped direct endpoint and disables PTY allocation.
 
 ## Exact-commit jobs
 
-One versioned job specification drives one attempt on one explicit `READY` worker. The worker must
-prove the requested source, commit, and inputs before the command starts.
+One versioned job specification drives one attempt on one existing `READY`
+worker. The worker proves source, commit and inputs before execution.
 
 Spec fields: `source.repository` (anonymous `https://` only) and `source.commit` (full 40- or
 64-character ID; branches, tags, short prefixes, and `HEAD` are rejected); `command.argv` (an
@@ -120,16 +120,17 @@ the verified checkout); optional `setup.argv`; `runtime.timeout_seconds`, non-se
 and bearer values are rejected before any worker is contacted.
 
 ```
-infra job submit <job-spec.json> --worker <exact-worker-id> [--wait --wait-timeout <s>]
+infra job submit <job-spec.json> [--worker <exact-worker-id>] [--provider runpod|colab] [--wait]
 infra job status <job-id> [--json]
 infra job logs <job-id> [--tail-bytes <n>] [--local]
 infra job cancel <job-id>
 ```
 
 Job states are `PENDING`, `PREPARING`, `RUNNING`, `SUCCEEDED`, `FAILED`, and `CANCELLED`.
-`SUCCEEDED` requires exit code 0 and every required declared output persisted and size-verified at
-the controller. A scientific failure stays `FAILED` with its exit code, stage, timeout flag, logs,
-and provenance; optional outputs are still persisted for debugging.
+`SUCCEEDED` requires exit code 0 and every required output independently
+read back and SHA-256 verified from canonical S3. A scientific failure remains
+`FAILED` with exit code, stage, timeout flag, logs and provenance; optional
+outputs are still persisted when possible for debugging.
 
 `PREPARING` is a real, resumable phase, not a waypoint. When the record carries
 `reconciliation_required`, its preparation phase is one of `installing_runner`, `preparing_source`,
@@ -137,8 +138,8 @@ and provenance; optional outputs are still persisted for debugging.
 download that finished after the controller stopped watching is verified and reused, a running one
 is reported and never duplicated, a dead one resumes from the ranges recorded on the worker, and a
 command that may already have been launched is never launched again. `FAILED` always means the
-system has evidence; uncertainty keeps the job reconcilable instead. A stopped or restarting worker
-is unreachable rather than failed: start it and run `infra job status` again.
+system has evidence; uncertainty keeps the job reconcilable instead. RunPod
+stop/start may retain a workspace; a lost Colab lease cannot be resumed.
 
 Terminal states are frozen and one job is one attempt. Never resubmit or rerun a failed job ID; a
 retry is a new job ID, because repeating a submission duplicates the transfer or the run.
@@ -200,9 +201,10 @@ Artifact identity, manifests, transfer, cache inspection and verification intern
   generated `wavcse-...` identity; after an ambiguous outcome run `infra worker list` or
   `infra volume list` and inspect the printed identity before creating anything again. While a
   volume create intent is unresolved, further volume creates are refused.
-- Make cost visible: state the provider-reported total hourly price and the storage configuration
-  before creating anything, keep the printed plan, and never silently fall back to a more expensive
-  resource or provider.
+- Make native provider cost visible: RunPod requires observed USD/hour and a
+  human ceiling; Colab reports CU balance and incremental CU/hour after one
+  allocation, with possible small CU consumed before rejection. Do not silently
+  fall back to an expensive resource or rerun an experiment after failure.
 - Never change the model, checkpoint, pooling, layer set, dataset membership, splits, preprocessing,
   label mapping, or precision to make a run faster or cheaper. If the cheaper resource cannot
   satisfy the requirement, report that instead.

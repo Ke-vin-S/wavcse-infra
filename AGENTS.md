@@ -3,12 +3,10 @@
 ## What this repository is
 
 `wavcse-infra` is the infrastructure control plane for reproducible wavCSE research
-workloads. It operates a persistent but stoppable AWS EC2 controller and disposable
-RunPod GPU workers, inspects opt-in Colab sessions, transfers artifacts, and executes
-RunPod jobs against an exact commit through the `infra` CLI. Colab allocation and
-recorded execution are guarded until the price and secret-transport invariants can be
-met; see `docs/COLAB.md`. Bootstrap, lifecycle, diagnostics, and orchestration are
-its responsibilities.
+workloads. Its EC2 controller operates disposable RunPod Pods and ephemeral Colab
+sessions through `infra`; both execute recorded exact-commit jobs with S3-canonical
+artifacts. Provider cost and lifecycle differ; see `docs/COLAB.md`. Bootstrap,
+diagnostics, and orchestration are its responsibilities.
 
 It is not the wavCSE research repository: research code, models, experiment definitions,
 tests, study documentation, and MLflow/DagsHub reporting stay in the separate `wavCSE`
@@ -56,19 +54,23 @@ Non-negotiable. A skill mentioning one of these does not relax it.
    credential chain, under least privilege scoped to the configured bucket and prefix, which
    stays private (public-read artifacts are out of scope); no static AWS keys on the
    controller.
-5. **Secrets are never logged or persisted.** Redact authorization headers, API tokens,
-   presigned URL query strings, AWS temporary credentials, and private keys; never print a
-   full environment dump. Secret values come from the environment or an external credential
-   store, never from committed configuration; `.env.example` carries names only.
+5. **Secrets never enter source, config, ordinary logs, or job state.** Redact
+   authorization headers, API tokens and presigned URL query strings. The trusted
+   single-user controller explicitly accepts pinned Colab CLI local history of `exec`
+   code/output and file-operation paths. Upload temporary bearer envelopes instead of
+   embedding capabilities in `exec`; keep CLI state/history private (0700/0600), use
+   short-lived URLs, and never copy ADC or long-lived credentials to workers.
 6. **Destructive operations require explicit intent and confirmation.** Worker, volume, and
    storage deletion targets an explicit identifier, prints the exact target, and requires
    confirmation unless `--yes` is given; `--yes` never bypasses validation or a price guard.
    Automated cleanup may destroy only resources this tool created and tracks, never by
    naming convention alone.
-7. **Cost is a first-class constraint.** Never silently provision GPU resources. Creation
-   exposes GPU type and count, cloud tier, maximum acceptable hourly price, storage, and
-   interruptibility policy, prints the selected resource and the provider-observed hourly
-   price, and refuses to guess an absent price. The price ceiling belongs to a human.
+7. **Cost is provider-native and explicit.** Never silently provision GPU resources.
+   RunPod requires a provider-observed USD/hour price and a human price ceiling,
+   cloud tier and storage plan. Colab uses account compute units: observe balance and
+   aggregate rate before and after a single owned allocation, enforce a configured
+   incremental CU/hour ceiling, and immediately release a rejected owned lease. The
+   post-allocation guard can consume a small amount of CU; never invent USD conversion.
 8. **Provider state is authoritative; local state is convenience.** Reconcile against the
    provider before acting, and never let a lost response become a duplicate paid resource:
    an ambiguous create is reconciled by exact generated identity and the paid request is
@@ -112,8 +114,10 @@ could create paid resources are opt-in, explicitly flagged, self-cleaning, and n
 - `.agents/skills/wavcse-artifact-pipeline/SKILL.md` — artifact identity, the S3 / network
   volume / scratch model, cache-hit criteria, transfer semantics, version 1 manifests,
   deterministic packaging, publication verification, cleanup.
-- `.agents/skills/colab-operator/SKILL.md` — Colab ADC, account inspection,
-  ownership-guarded release, and current cost/secret-transport restrictions.
+- `.agents/skills/colab-operator/SKILL.md` — ADC, CU usage, ephemeral allocation,
+  readiness, envelope upload/exec, terminal release, and local history.
+- `.agents/skills/compute-placement/SKILL.md` — provider preference, compatibility,
+  cost models, safe reuse and failure/fallback rules.
 - `.agents/commands/{infra-status,infra-gpu,infra-artifact}.md` — read-only reconciliation,
   GPU-economics, and artifact-flow entry points.
 
