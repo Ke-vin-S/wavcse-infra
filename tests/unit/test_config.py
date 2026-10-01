@@ -173,6 +173,8 @@ def test_colab_cu_policy_precedence_and_single_lease_limit(tmp_path: Path) -> No
     assert settings.colab.minimum_balance_cu == Decimal("9")
     assert settings.colab.max_incremental_rate_cu_per_hour == Decimal("2")
     assert settings.colab.max_job_cu == Decimal("6")
+    # Free-tier permission defaults on and is independent of the paid-CU floor.
+    assert settings.colab.allow_free_tier is True
     assert settings.placement.preferred_providers == (
         ProviderKind.RUNPOD,
         ProviderKind.COLAB,
@@ -183,6 +185,16 @@ def test_colab_cu_policy_precedence_and_single_lease_limit(tmp_path: Path) -> No
             environ={},
             cli_overrides={"colab.max_simultaneous_workers": 2},
         )
+
+
+def test_colab_allow_free_tier_is_configurable(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[colab]\nallow_free_tier = false\n")
+    settings = load_settings(
+        config_path=config_file,
+        environ={"WAVCSE_INFRA_COLAB_ALLOW_FREE_TIER": "true"},
+    )
+    assert settings.colab.allow_free_tier is True
 
 
 def test_runpod_key_is_only_loaded_from_environment() -> None:

@@ -31,6 +31,20 @@ class ExecutionTransport(StrEnum):
     COLAB_EXEC = "colab_exec"
 
 
+class ColabBillingMode(StrEnum):
+    """Colab execution mode, derived from the paid CU balance; never a provider identity.
+
+    The pinned CLI's `Current balance` is the account's `paidComputeUnitsBalance`.
+    A zero paid balance does not mean no compute entitlement: Colab can allocate and
+    run a free-tier accelerator with zero paid CU, so a zero balance only selects
+    best-effort free-tier execution, not rejection. A positive paid balance retains
+    the existing CU-budget policy.
+    """
+
+    FREE_TIER = "FREE_TIER"
+    PAID_CU = "PAID_CU"
+
+
 class WorkerState(StrEnum):
     """Normalized worker states exposed by the stable CLI."""
 

@@ -14,9 +14,20 @@ from unittest.mock import Mock
 import pytest
 
 from wavcse_infra.config import ColabConfig
-from wavcse_infra.errors import CostGuardError, ProviderResponseError, UnresolvedCreateError
+from wavcse_infra.errors import (
+    ColabQuotaError,
+    CostGuardError,
+    ProviderResponseError,
+    UnresolvedCreateError,
+)
 from wavcse_infra.jobs.colab_transport import ColabConnection, ColabExecutor, validate_envelope
-from wavcse_infra.models import ExecutionTransport, ProviderKind, Worker, WorkerState
+from wavcse_infra.models import (
+    ColabBillingMode,
+    ExecutionTransport,
+    ProviderKind,
+    Worker,
+    WorkerState,
+)
 from wavcse_infra.providers.colab import ColabUsage, parse_usage
 from wavcse_infra.state import WorkerStateStore
 from wavcse_infra.workers.colab import ColabLifecycle, normalize_gpu
@@ -201,6 +212,87 @@ def test_accepted_cu_rate_bootstraps_physical_gpu_and_marks_ready(
     assert record.observed_gpu_models == ("Tesla T4",)
     assert record.readiness_state.value == "READY"
     assert not client.destroy_worker.called
+
+
+def _allocate_ready_client(*usages: ColabUsage) -> Mock:
+    """Build a client that allocates once, then reports the given usage observations."""
+
+    client = Mock()
+    client.usage_snapshot.side_effect = list(usages)
+    client.list_workers.return_value = []
+    client.create_worker.return_value = WORKER
+    client.get_worker.return_value = WORKER
+    client.exec_code.side_effect = [
+        'wavcse_colab_health\t{"gpu": "Tesla T4", "disk": 2000000000}\n',
+        "wavcse_job_schema\t1\nwavcse_job_install\tinstalled\nwavcse_colab_exit\t0\n",
+    ]
+    return client
+
+
+def test_zero_paid_balance_free_tier_allocates_and_marks_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The empirically observed case: 0.00 paid CU, 1.07 CU/hour, one assignment."""
+
+    store = WorkerStateStore(tmp_path / "workers.json")
+    client = _allocate_ready_client(
+        ColabUsage(Decimal("0.00"), Decimal("0.00"), 0),
+        ColabUsage(Decimal("0.00"), Decimal("1.07"), 1),
+    )
+    monkeypatch.setattr(
+        "wavcse_infra.workers.colab.uuid4", lambda: type("U", (), {"hex": "123456789abc"})()
+    )
+    worker, before, _ = ColabLifecycle(client, store, ColabConfig()).create("T4")
+    record = store.get(SESSION)
+    assert worker.id == SESSION
+    assert before.billing_mode is ColabBillingMode.FREE_TIER
+    assert record.readiness_state.value == "READY"
+    assert record.billing_mode is ColabBillingMode.FREE_TIER
+    assert record.observed_rate_cu_per_hour == Decimal("1.07")
+    assert not client.destroy_worker.called
+
+
+def test_free_tier_rate_above_paid_ceiling_is_recorded_not_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A free-tier observed rate is metering evidence, not a paid-CU ceiling."""
+
+    store = WorkerStateStore(tmp_path / "workers.json")
+    client = _allocate_ready_client(
+        ColabUsage(Decimal("0.00"), Decimal("0.00"), 0),
+        ColabUsage(Decimal("0.00"), Decimal("9.99"), 1),
+    )
+    monkeypatch.setattr(
+        "wavcse_infra.workers.colab.uuid4", lambda: type("U", (), {"hex": "123456789abc"})()
+    )
+    lifecycle = ColabLifecycle(
+        client, store, ColabConfig(max_incremental_rate_cu_per_hour=Decimal("3"))
+    )
+    _, _, after = lifecycle.create("T4")
+    assert store.get(SESSION).observed_rate_cu_per_hour == Decimal("9.99")
+    assert after.billing_mode is ColabBillingMode.FREE_TIER
+    assert not client.destroy_worker.called
+
+
+def test_free_tier_disabled_rejects_zero_paid_balance_before_allocation(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json")
+    client = Mock()
+    client.usage_snapshot.return_value = ColabUsage(Decimal("0.00"), Decimal("0.00"), 0)
+    client.list_workers.return_value = []
+    with pytest.raises(ColabQuotaError, match="free-tier"):
+        ColabLifecycle(client, store, ColabConfig(allow_free_tier=False)).create("T4")
+    assert not client.create_worker.called
+    assert store.list_records() == []
+
+
+def test_paid_cu_below_minimum_balance_still_rejected_before_allocation(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json")
+    client = Mock()
+    client.usage_snapshot.return_value = ColabUsage(Decimal("3.00"), Decimal("0.00"), 0)
+    client.list_workers.return_value = []
+    with pytest.raises(ColabQuotaError, match="below"):
+        ColabLifecycle(client, store, ColabConfig()).create("T4")
+    assert not client.create_worker.called
 
 
 def test_failed_colab_recheck_clears_stale_ready_state(tmp_path: Path) -> None:

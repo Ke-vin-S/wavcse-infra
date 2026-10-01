@@ -27,7 +27,13 @@ from wavcse_infra.errors import (
     ProviderValidationError,
     UnsupportedProviderOperationError,
 )
-from wavcse_infra.models import ExecutionTransport, ProviderKind, Worker, WorkerState
+from wavcse_infra.models import (
+    ColabBillingMode,
+    ExecutionTransport,
+    ProviderKind,
+    Worker,
+    WorkerState,
+)
 from wavcse_infra.redaction import redact
 from wavcse_infra.state import WorkerRecord
 
@@ -53,9 +59,25 @@ _ASSIGNMENTS = re.compile(r"^Active assignments: ([0-9]+)$")
 
 @dataclass(frozen=True)
 class ColabUsage:
-    balance_cu: Decimal
+    """One account-wide CU observation from the pinned CLI.
+
+    `paid_balance_cu` is the CLI's `Current balance`, which is the account's
+    `paidComputeUnitsBalance`: it is the paid CU balance only, not total compute
+    entitlement. `rate_cu_per_hour` is the provider-reported aggregate usage rate and
+    is observation-only when the paid balance is zero.
+    """
+
+    paid_balance_cu: Decimal
     rate_cu_per_hour: Decimal
     assignments: int
+
+    @property
+    def billing_mode(self) -> ColabBillingMode:
+        """Select the execution mode from the paid CU balance, never from entitlement."""
+
+        if self.paid_balance_cu > 0:
+            return ColabBillingMode.PAID_CU
+        return ColabBillingMode.FREE_TIER
 
 
 def parse_usage(text: str) -> ColabUsage:

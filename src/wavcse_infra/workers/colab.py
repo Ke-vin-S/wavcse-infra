@@ -19,7 +19,7 @@ from wavcse_infra.errors import (
     ProviderResponseError,
     WorkerBootstrapError,
 )
-from wavcse_infra.models import Worker
+from wavcse_infra.models import ColabBillingMode, Worker
 from wavcse_infra.providers.colab import ColabClient, ColabUsage
 from wavcse_infra.state import WorkerStateStore
 
@@ -78,9 +78,20 @@ class ColabLifecycle:
                 f"Colab has an owned lease or pending allocation: {existing[0].infra_identity}"
             )
         before = self.client.usage_snapshot()
-        if before.balance_cu < self.config.minimum_balance_cu:
+        mode = before.billing_mode
+        # A zero paid CU balance is not zero entitlement: it selects best-effort free
+        # tier, which is permitted only when explicitly enabled. A paid balance still
+        # enforces the configured minimum.
+        if mode is ColabBillingMode.FREE_TIER and not self.config.allow_free_tier:
             raise ColabQuotaError(
-                f"Colab balance {before.balance_cu} CU is below "
+                f"Colab paid CU balance is {before.paid_balance_cu} CU and free-tier "
+                "execution is disabled by colab.allow_free_tier"
+            )
+        if mode is ColabBillingMode.PAID_CU and (
+            before.paid_balance_cu < self.config.minimum_balance_cu
+        ):
+            raise ColabQuotaError(
+                f"Colab paid CU balance {before.paid_balance_cu} CU is below "
                 f"minimum {self.config.minimum_balance_cu} CU"
             )
         self.client.list_workers()  # Reconcile provider before paid mutation.
@@ -121,17 +132,20 @@ class ColabLifecycle:
                     f"to {after.assignments}; incremental CU cannot be attributed safely"
                 )
             rate = after.rate_cu_per_hour - before.rate_cu_per_hour
-            if rate <= 0 or rate > self.config.max_incremental_rate_cu_per_hour:
-                raise CostGuardError(
-                    f"Colab {name}: observed incremental {rate} CU/hour outside (0, "
-                    f"{self.config.max_incremental_rate_cu_per_hour}] CU/hour; "
-                    "COST_POLICY_REJECTION"
-                )
-            if after.balance_cu < self.config.minimum_balance_cu:
-                raise CostGuardError(
-                    f"Colab {name}: balance below configured minimum after allocation"
-                )
-            self.bootstrap(name, rate=rate, baseline=before)
+            if mode is ColabBillingMode.PAID_CU:
+                if rate <= 0 or rate > self.config.max_incremental_rate_cu_per_hour:
+                    raise CostGuardError(
+                        f"Colab {name}: observed incremental {rate} CU/hour outside (0, "
+                        f"{self.config.max_incremental_rate_cu_per_hour}] CU/hour; "
+                        "COST_POLICY_REJECTION"
+                    )
+                if after.paid_balance_cu < self.config.minimum_balance_cu:
+                    raise CostGuardError(
+                        f"Colab {name}: balance below configured minimum after allocation"
+                    )
+            # Free tier bills no paid CU, so its reported rate is recorded as observed
+            # metering evidence, never as a paid-balance or rate-ceiling gate.
+            self.bootstrap(name, rate=max(rate, Decimal(0)), baseline=before, billing_mode=mode)
             return worker, before, after
         except Exception:
             # Cleanup only the confirmed exact identity; an ambiguous release
@@ -162,16 +176,26 @@ class ColabLifecycle:
         self.state.mark_destroyed(name)
 
     def bootstrap(
-        self, name: str, *, rate: Decimal | None = None, baseline: ColabUsage | None = None
+        self,
+        name: str,
+        *,
+        rate: Decimal | None = None,
+        baseline: ColabUsage | None = None,
+        billing_mode: ColabBillingMode | None = None,
     ) -> str:
         try:
-            return self._bootstrap(name, rate=rate, baseline=baseline)
+            return self._bootstrap(name, rate=rate, baseline=baseline, billing_mode=billing_mode)
         except Exception:
             self.state.mark_colab_failed(name)
             raise
 
     def _bootstrap(
-        self, name: str, *, rate: Decimal | None = None, baseline: ColabUsage | None = None
+        self,
+        name: str,
+        *,
+        rate: Decimal | None = None,
+        baseline: ColabUsage | None = None,
+        billing_mode: ColabBillingMode | None = None,
     ) -> str:
         worker = self.client.get_worker(name)
         record = self.state.get(name)
@@ -222,5 +246,6 @@ class ColabLifecycle:
             disk_bytes=disk,
             baseline_rate=baseline.rate_cu_per_hour if baseline else None,
             baseline_assignments=baseline.assignments if baseline else None,
+            billing_mode=billing_mode,
         )
         return model

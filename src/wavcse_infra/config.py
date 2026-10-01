@@ -121,6 +121,10 @@ class ColabConfig(FrozenModel):
     command_timeout_seconds: float = Field(default=300.0, gt=0, le=86400)
     lifecycle_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
     default_gpu: str = "T4"
+    # A zero paid CU balance selects Colab's best-effort free tier, not a failed account.
+    # Enabling this permits allocation and recorded jobs at zero paid balance; disable to
+    # require paid CU. It never represents free-tier availability or a paid-CU floor.
+    allow_free_tier: bool = True
     minimum_balance_cu: Decimal = Field(default=Decimal("5"), ge=0)
     max_incremental_rate_cu_per_hour: Decimal = Field(default=Decimal("3"), gt=0)
     max_job_cu: Decimal = Field(default=Decimal("10"), gt=0)
@@ -281,6 +285,7 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     ),
     "WAVCSE_INFRA_COLAB_MAX_JOB_CU": ("colab", "max_job_cu"),
     "WAVCSE_INFRA_COLAB_DEFAULT_GPU": ("colab", "default_gpu"),
+    "WAVCSE_INFRA_COLAB_ALLOW_FREE_TIER": ("colab", "allow_free_tier"),
     "WAVCSE_INFRA_EXPECT_OMP": ("controller", "expect_omp"),
     "WAVCSE_INFRA_MLFLOW_URL": ("controller", "mlflow_url"),
     "WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER": ("runpod", "api_key_parameter"),

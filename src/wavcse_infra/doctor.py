@@ -23,6 +23,7 @@ from wavcse_infra.credentials import (
     resolve_runpod_api_key,
 )
 from wavcse_infra.errors import ColabAuthenticationRequiredError, CredentialError, ProviderError
+from wavcse_infra.models import ColabBillingMode
 from wavcse_infra.providers.colab import ColabClient
 from wavcse_infra.redaction import redact
 
@@ -204,18 +205,50 @@ def _colab_checks(settings: Settings) -> list[DoctorCheck]:
     )
     try:
         usage = client.usage_snapshot()
-        checks.append(
-            DoctorCheck(
-                "Colab compute units",
-                CheckStatus.PASS
-                if usage.balance_cu >= settings.colab.minimum_balance_cu
-                else CheckStatus.FAIL,
-                f"balance {usage.balance_cu} CU, aggregate rate {usage.rate_cu_per_hour} CU/hour, "
-                f"assignments {usage.assignments}",
+        if usage.billing_mode is ColabBillingMode.PAID_CU:
+            checks.append(
+                DoctorCheck(
+                    "Colab execution policy",
+                    CheckStatus.PASS
+                    if usage.paid_balance_cu >= settings.colab.minimum_balance_cu
+                    else CheckStatus.FAIL,
+                    f"paid CU mode; paid CU balance {usage.paid_balance_cu} CU, "
+                    f"aggregate rate {usage.rate_cu_per_hour} CU/hour, "
+                    f"assignments {usage.assignments}",
+                )
             )
-        )
+        elif settings.colab.allow_free_tier:
+            # A zero paid balance is not an unhealthy account; it selects best-effort
+            # free tier. Only its unsatisfied paid-CU requirement would be a failure.
+            checks.append(
+                DoctorCheck(
+                    "Colab execution policy",
+                    CheckStatus.PASS,
+                    f"free tier enabled; paid CU balance {usage.paid_balance_cu} CU, "
+                    f"observed usage rate {usage.rate_cu_per_hour} CU/hour, "
+                    f"assignments {usage.assignments}",
+                )
+            )
+            checks.append(
+                DoctorCheck(
+                    "Colab free tier",
+                    CheckStatus.WARN,
+                    "best-effort: capacity, accelerator, runtime and usage limits are "
+                    "not guaranteed and a session may terminate unexpectedly",
+                )
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    "Colab execution policy",
+                    CheckStatus.FAIL,
+                    f"paid CU balance {usage.paid_balance_cu} CU is below the required "
+                    f"minimum {settings.colab.minimum_balance_cu} CU and free-tier "
+                    "execution is disabled by colab.allow_free_tier",
+                )
+            )
     except ProviderError as exc:
-        checks.append(DoctorCheck("Colab compute units", CheckStatus.FAIL, redact(exc)))
+        checks.append(DoctorCheck("Colab execution policy", CheckStatus.FAIL, redact(exc)))
     return checks
 
 

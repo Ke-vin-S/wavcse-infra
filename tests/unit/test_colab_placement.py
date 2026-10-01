@@ -16,9 +16,9 @@ from typer.testing import CliRunner
 
 from wavcse_infra import cli
 from wavcse_infra.config import Settings
-from wavcse_infra.errors import JobExecutionError, ProviderUnavailableError
+from wavcse_infra.errors import CostGuardError, JobExecutionError, ProviderUnavailableError
 from wavcse_infra.jobs.models import load_job_spec
-from wavcse_infra.models import ProviderKind
+from wavcse_infra.models import ColabBillingMode, ProviderKind
 from wavcse_infra.providers.colab import ColabUsage
 from wavcse_infra.state import WorkerStateStore
 
@@ -147,3 +147,133 @@ def test_job_execution_failure_never_submits_again_to_fallback_provider(
     result = CliRunner().invoke(cli.app, ["job", "submit", str(spec_path)], env={})
     assert result.exit_code == 1
     assert selected == [SESSION]
+
+
+def _budget_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    usage: ColabUsage,
+    colab: dict[str, object] | None = None,
+):
+    from test_colab_execution import WORKER
+
+    session_worker = WORKER.model_copy(update={"id": SESSION, "name": SESSION})
+    store = WorkerStateStore(tmp_path / "workers.json")
+    store.record_colab_intent(SESSION, "T4")
+    store.record_colab_created(session_worker)
+    store.record_colab_ready(
+        SESSION,
+        gpu_model="Tesla T4",
+        rate=Decimal("0"),
+        disk_bytes=10**9,
+        baseline_rate=Decimal("0"),
+        baseline_assignments=0,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_colab_client",
+        lambda settings: SimpleNamespace(usage_snapshot=lambda: usage),
+    )
+    settings = Settings(colab=colab if colab is not None else {"enabled": True})
+    return settings, store.get(SESSION)
+
+
+def _spec(timeout_seconds: int):
+    return load_job_spec(
+        json.dumps(job_spec_document(runtime={"timeout_seconds": timeout_seconds}))
+    )
+
+
+def test_free_tier_job_allowed_with_zero_paid_balance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings, record = _budget_fixture(
+        monkeypatch, tmp_path, usage=ColabUsage(Decimal("0.00"), Decimal("1.07"), 1)
+    )
+    # Must not raise despite balance < projected: free tier has no paid-CU coverage gate.
+    cli._require_colab_job_budget(settings, _spec(600), record)
+
+
+def test_free_tier_disabled_rejects_zero_paid_balance_job(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings, record = _budget_fixture(
+        monkeypatch,
+        tmp_path,
+        usage=ColabUsage(Decimal("0.00"), Decimal("1.07"), 1),
+        colab={"enabled": True, "allow_free_tier": False},
+    )
+    with pytest.raises(CostGuardError, match="free-tier"):
+        cli._require_colab_job_budget(settings, _spec(600), record)
+
+
+def test_paid_cu_requires_balance_to_cover_projected_job(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings, record = _budget_fixture(
+        monkeypatch,
+        tmp_path,
+        usage=ColabUsage(Decimal("1.00"), Decimal("1.80"), 1),
+        colab={"enabled": True, "minimum_balance_cu": 0},
+    )
+    # projected = 1.80 * 7200 / 3600 = 3.60, larger than the 1.00 paid balance.
+    with pytest.raises(CostGuardError):
+        cli._require_colab_job_budget(settings, _spec(7200), record)
+
+
+def test_paid_cu_max_job_cu_exceeded_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings, record = _budget_fixture(
+        monkeypatch,
+        tmp_path,
+        usage=ColabUsage(Decimal("100.00"), Decimal("1.80"), 1),
+        colab={"enabled": True, "max_job_cu": 1},
+    )
+    with pytest.raises(CostGuardError):
+        cli._require_colab_job_budget(settings, _spec(7200), record)
+
+
+def test_paid_cu_sufficient_balance_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings, record = _budget_fixture(
+        monkeypatch, tmp_path, usage=ColabUsage(Decimal("100.00"), Decimal("1.80"), 1)
+    )
+    cli._require_colab_job_budget(settings, _spec(600), record)
+
+
+def test_paid_cu_max_incremental_rate_exceeded_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings, record = _budget_fixture(
+        monkeypatch, tmp_path, usage=ColabUsage(Decimal("100.00"), Decimal("4.20"), 1)
+    )
+    with pytest.raises(CostGuardError):
+        cli._require_colab_job_budget(settings, _spec(600), record)
+
+
+def test_colab_record_persists_and_displays_billing_mode(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_colab_execution import WORKER
+
+    session_worker = WORKER.model_copy(update={"id": SESSION, "name": SESSION})
+    store = WorkerStateStore(tmp_path / "workers.json")
+    store.record_colab_intent(SESSION, "T4")
+    store.record_colab_created(session_worker)
+    store.record_colab_ready(
+        SESSION,
+        gpu_model="Tesla T4",
+        rate=Decimal("1.07"),
+        disk_bytes=10**9,
+        baseline_rate=Decimal("0"),
+        baseline_assignments=0,
+        billing_mode=ColabBillingMode.FREE_TIER,
+    )
+    record = store.get(SESSION)
+    assert record.billing_mode is ColabBillingMode.FREE_TIER
+    cli._print_colab_billing(record)
+    out = capsys.readouterr().out
+    assert "Billing mode: FREE_TIER" in out
+    assert "Observed CU rate (CU/hour): 1.07" in out
+    assert "cost" not in out.lower()

@@ -231,8 +231,84 @@ def test_authenticated_colab_doctor_does_not_require_runpod_fallback_key(
     checks = {check.name: check for check in report.checks}
     assert checks["RunPod credential"].status is CheckStatus.WARN
     assert checks["Colab authentication"].status is CheckStatus.PASS
-    assert checks["Colab compute units"].status is CheckStatus.PASS
+    assert checks["Colab execution policy"].status is CheckStatus.PASS
     assert report.successful
+
+
+def test_colab_zero_paid_balance_with_free_tier_is_healthy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from decimal import Decimal
+
+    from wavcse_infra import doctor
+    from wavcse_infra.config import ColabConfig
+    from wavcse_infra.providers.colab import ColabUsage
+
+    class FakeColab:
+        def __init__(self, config) -> None:
+            assert config.enabled
+
+        def version(self) -> str:
+            return "0.7.4"
+
+        def list_workers(self) -> list:
+            return []
+
+        def usage_snapshot(self) -> ColabUsage:
+            return ColabUsage(Decimal("0.00"), Decimal("1.07"), 1)
+
+    monkeypatch.setattr(doctor, "ColabClient", FakeColab)
+    settings = _configured_settings(tmp_path).model_copy(
+        update={"colab": ColabConfig(enabled=True, allow_free_tier=True)}
+    )
+    config_path = _config_file(tmp_path)
+    report = run_doctor(
+        settings,
+        HealthyProbes({settings.paths.wavcse, settings.ssh.private_key, config_path}),
+        config_path=config_path,
+    )
+    checks = {check.name: check for check in report.checks}
+    assert checks["Colab execution policy"].status is CheckStatus.PASS
+    assert "free tier enabled" in checks["Colab execution policy"].detail
+    assert checks["Colab free tier"].status is CheckStatus.WARN
+    assert report.successful
+
+
+def test_colab_zero_paid_balance_without_free_tier_fails_doctor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from decimal import Decimal
+
+    from wavcse_infra import doctor
+    from wavcse_infra.config import ColabConfig
+    from wavcse_infra.providers.colab import ColabUsage
+
+    class FakeColab:
+        def __init__(self, config) -> None:
+            assert config.enabled
+
+        def version(self) -> str:
+            return "0.7.4"
+
+        def list_workers(self) -> list:
+            return []
+
+        def usage_snapshot(self) -> ColabUsage:
+            return ColabUsage(Decimal("0.00"), Decimal("0.00"), 0)
+
+    monkeypatch.setattr(doctor, "ColabClient", FakeColab)
+    settings = _configured_settings(tmp_path).model_copy(
+        update={"colab": ColabConfig(enabled=True, allow_free_tier=False)}
+    )
+    config_path = _config_file(tmp_path)
+    report = run_doctor(
+        settings,
+        HealthyProbes({settings.paths.wavcse, settings.ssh.private_key, config_path}),
+        config_path=config_path,
+    )
+    checks = {check.name: check for check in report.checks}
+    assert checks["Colab execution policy"].status is CheckStatus.FAIL
+    assert not report.successful
 
 
 def test_doctor_reports_ssm_credential_source(tmp_path: Path) -> None:

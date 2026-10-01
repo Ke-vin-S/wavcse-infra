@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from wavcse_infra.errors import StateError, UnresolvedCreateError
 from wavcse_infra.models import (
     CloudType,
+    ColabBillingMode,
     ExecutionTransport,
     NetworkVolume,
     NetworkVolumeSpec,
@@ -123,6 +124,9 @@ class WorkerRecord(BaseModel):
     observed_rate_cu_per_hour: Decimal | None = Field(default=None, ge=0)
     baseline_rate_cu_per_hour: Decimal | None = Field(default=None, ge=0)
     baseline_assignments_count: int | None = Field(default=None, ge=0)
+    # Colab execution mode observed at allocation; the paid CU balance selected it.
+    # Absent for RunPod records and for Colab records written before this field existed.
+    billing_mode: ColabBillingMode | None = None
     image: str | None = None
     template_id: str | None = None
     container_disk_gb: int | None = Field(default=None, ge=1)
@@ -326,6 +330,7 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
         disk_bytes: int,
         baseline_rate: Decimal | None = None,
         baseline_assignments: int | None = None,
+        billing_mode: ColabBillingMode | None = None,
     ) -> WorkerRecord:
         document = self._load()
         existing = document.workers.get(worker_id)
@@ -356,6 +361,9 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
                     baseline_assignments
                     if baseline_assignments is not None
                     else existing.baseline_assignments_count
+                ),
+                "billing_mode": (
+                    billing_mode if billing_mode is not None else existing.billing_mode
                 ),
             }
         )

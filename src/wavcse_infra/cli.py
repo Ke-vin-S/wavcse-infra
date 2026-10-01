@@ -52,6 +52,7 @@ from wavcse_infra.jobs.status import JobCoordinator
 from wavcse_infra.jobs.submit import JobSubmitter
 from wavcse_infra.models import (
     CloudType,
+    ColabBillingMode,
     CostUnit,
     NetworkVolume,
     NetworkVolumeCreationPlan,
@@ -347,6 +348,7 @@ def show_worker(
         _print_json(worker.model_dump(mode="json"))
     else:
         _print_worker(worker)
+        _print_colab_billing(record)
 
 
 @worker_app.command("gpu-types")
@@ -537,25 +539,37 @@ def create_worker(
                     "Colab creates unique infra-owned session identities; --name is unsupported"
                 )
             before = client.usage_snapshot()
+            mode = before.billing_mode
             typer.echo(
-                f"Colab balance: {before.balance_cu} CU; aggregate rate: "
+                f"Colab billing mode: {mode.value}; paid CU balance: "
+                f"{before.paid_balance_cu} CU; observed usage rate: "
                 f"{before.rate_cu_per_hour} CU/hour; active assignments: {before.assignments}"
             )
-            typer.echo(
-                f"Requested Colab GPU: {gpu}; maximum incremental rate: "
-                f"{settings.colab.max_incremental_rate_cu_per_hour} CU/hour. "
-                "A small amount of CU may be consumed before the post-allocation guard rejects."
-            )
-            if not yes and not typer.confirm("Allocate one paid ephemeral Colab session?"):
+            if mode is ColabBillingMode.PAID_CU:
+                typer.echo(
+                    f"Requested Colab GPU: {gpu}; maximum incremental rate: "
+                    f"{settings.colab.max_incremental_rate_cu_per_hour} CU/hour; minimum "
+                    f"paid balance: {settings.colab.minimum_balance_cu} CU. A small amount "
+                    "of CU may be consumed before the post-allocation guard rejects."
+                )
+            else:
+                typer.echo(
+                    f"Requested Colab GPU: {gpu}; free-tier allocation is best-effort, "
+                    "interruptible, and capacity is not guaranteed. The reported usage "
+                    "rate is provider metering, not a paid CU cost."
+                )
+            if not yes and not typer.confirm("Allocate one ephemeral Colab session?"):
                 typer.echo("Allocation cancelled; no session was created.")
                 return
             worker, _, after = ColabLifecycle(client, _state_store(), settings.colab).create(gpu)
             typer.echo(
-                f"Colab session {worker.id} READY; observed incremental rate "
-                f"{after.rate_cu_per_hour - before.rate_cu_per_hour} CU/hour; "
-                f"remaining balance {after.balance_cu} CU."
+                f"Colab session {worker.id} READY; billing mode {mode.value}; observed "
+                f"usage rate {after.rate_cu_per_hour} CU/hour (incremental "
+                f"{after.rate_cu_per_hour - before.rate_cu_per_hour} CU/hour); paid CU "
+                f"balance {after.paid_balance_cu} CU."
             )
             _print_worker(worker)
+            _print_colab_billing(_state_store().get(worker.id))
             return
         except ConfigurationError as exc:
             _configuration_failure(exc)
@@ -2224,18 +2238,33 @@ def _require_colab_job_budget(settings: Settings, spec: JobSpec, record: WorkerR
     usage = _colab_client(settings).usage_snapshot()
     baseline = record.baseline_rate_cu_per_hour
     rate = usage.rate_cu_per_hour - baseline if baseline is not None else None
-    projected = rate * Decimal(timeout) / Decimal(3600) if rate is not None else None
     if (
         baseline is None
         or record.baseline_assignments_count is None
         or usage.assignments != record.baseline_assignments_count + 1
-        or rate is None
+    ):
+        raise CostGuardError(
+            f"Colab {record.provider_worker_id} session accounting is inconsistent; "
+            "exactly one owned active assignment is required"
+        )
+    if usage.billing_mode is ColabBillingMode.FREE_TIER:
+        # A zero paid balance selects best-effort free tier. Its reported usage rate is
+        # observed provider metering, never a paid-balance coverage requirement.
+        if not settings.colab.allow_free_tier:
+            raise CostGuardError(
+                "Colab paid CU balance is zero and free-tier execution is disabled "
+                "by colab.allow_free_tier"
+            )
+        return
+    projected = rate * Decimal(timeout) / Decimal(3600) if rate is not None else None
+    if (
+        rate is None
         or rate <= 0
         or rate > settings.colab.max_incremental_rate_cu_per_hour
         or projected is None
         or projected > settings.colab.max_job_cu
-        or usage.balance_cu < settings.colab.minimum_balance_cu
-        or usage.balance_cu < projected
+        or usage.paid_balance_cu < settings.colab.minimum_balance_cu
+        or usage.paid_balance_cu < projected
     ):
         raise CostGuardError(
             f"Colab {record.provider_worker_id} CU budget or job timeout "
@@ -2679,6 +2708,21 @@ def _print_worker(worker: Worker) -> None:
         ("Exposed ports", ", ".join(worker.exposed_ports) or None),
         ("Created", worker.created_at.isoformat() if worker.created_at else None),
         ("Last started", worker.last_started_at.isoformat() if worker.last_started_at else None),
+    )
+    for label, value in fields:
+        typer.echo(f"{label}: {value if value is not None else '-'}")
+
+
+def _print_colab_billing(record: WorkerRecord | None) -> None:
+    """Render the persisted Colab execution mode and observed metering, never as USD cost."""
+
+    if record is None or record.provider is not ProviderKind.COLAB:
+        return
+    fields = (
+        ("Billing mode", record.billing_mode.value if record.billing_mode else None),
+        ("Observed CU rate (CU/hour)", record.observed_rate_cu_per_hour),
+        ("Baseline CU rate (CU/hour)", record.baseline_rate_cu_per_hour),
+        ("Baseline assignments", record.baseline_assignments_count),
     )
     for label, value in fields:
         typer.echo(f"{label}: {value if value is not None else '-'}")
