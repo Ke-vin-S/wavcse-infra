@@ -210,6 +210,16 @@ class JobExecutor:
     def runner_path(self) -> str:
         return self._config.runner_path
 
+    def transport_environment(self) -> dict[str, str]:
+        """Provider-specific variables the reviewed runner needs before declared ones.
+
+        The job environment is otherwise a deterministic baseline; a transport whose
+        runtime puts GPU driver libraries outside the default loader path supplies the
+        minimum variables here. Declared `runtime.environment` values override them.
+        """
+
+        return {}
+
     def install_runner(self, worker_id: str) -> str:
         """Install the reviewed runner atomically; report `installed` or `unchanged`."""
 
@@ -286,6 +296,7 @@ class JobExecutor:
     ) -> StartResult:
         """Start the job detached in the worker's own session and return its PID."""
 
+        environment = {**self.transport_environment(), **environment}
         descriptor = {
             "job_id": job_id,
             "job_directory": job_directory,

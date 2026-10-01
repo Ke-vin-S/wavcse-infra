@@ -142,7 +142,12 @@ module: detached checkout verifies the full commit and clean tree, required
 inputs are SHA-256 verified before launch, outputs go through presigned PUT and
 independent controller-side S3 read-back plus streaming digest before success.
 MLflow/DagsHub instrumentation stays in wavCSE. `/content` is ephemeral
-scratch. For long runs, an operator may call `infra storage upload` on an
+scratch. The recorded job environment is a deterministic baseline plus declared
+variables; because Colab mounts the NVIDIA driver libraries outside the default
+loader path (`/usr/lib64-nvidia`), the Colab transport seeds `LD_LIBRARY_PATH`
+with that directory so `nvidia-smi` and `torch.cuda` see the allocated
+accelerator. A spec may override it. For long runs, an operator may call
+`infra storage upload` on an
 atomically published worker checkpoint while the detached job continues, or
 research code must opt into its own approved in-run publication path. Merely
 declaring a terminal job output cannot protect a checkpoint before the job

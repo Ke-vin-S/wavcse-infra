@@ -173,6 +173,39 @@ def test_start_keeps_secret_values_out_of_argv_and_parses_the_acknowledgement() 
     assert descriptor["infra"]["INFRA_GIT_COMMIT"] == COMMIT
 
 
+def test_start_merges_transport_environment_and_declared_values_win() -> None:
+    executor, remote, _ = _executor({"start": (0, start_output(pid=999, commit=COMMIT), "")})
+    executor.transport_environment = lambda: {  # type: ignore[method-assign]
+        "LD_LIBRARY_PATH": "/usr/lib64-nvidia",
+        "SHARED": "transport",
+    }
+
+    executor.start(
+        "pod-123",
+        job_id=JOB_ID,
+        job_directory=JOB_DIRECTORY,
+        repository="https://github.com/Synergy-io/wavcse.git",
+        commit=COMMIT,
+        argv=["python3", "-c", "import torch"],
+        setup_argv=None,
+        working_directory=None,
+        environment={"SHARED": "declared", "OTHER": "1"},
+        secrets={},
+        timeout_seconds=600,
+        infra_environment={},
+    )
+
+    descriptor = json.loads(str(remote.calls[0][1]))
+    assert descriptor["environment"]["LD_LIBRARY_PATH"] == "/usr/lib64-nvidia"
+    assert descriptor["environment"]["SHARED"] == "declared"
+    assert descriptor["environment"]["OTHER"] == "1"
+
+
+def test_default_transport_environment_is_empty() -> None:
+    executor, _, _ = _executor({})
+    assert executor.transport_environment() == {}
+
+
 def test_inspect_parses_worker_evidence_and_booleans() -> None:
     executor, _remote, _ = _executor(
         {

@@ -54,6 +54,10 @@ except Exception:
     except FileNotFoundError: pass
     print('wavcse_colab_transport_failed')
 """
+# Colab mounts the NVIDIA driver libraries (libnvidia-ml, libcuda) here instead of a
+# default loader directory. A recorded job's minimal environment must carry this path or
+# `nvidia-smi` and `torch.cuda` cannot see the allocated accelerator.
+_COLAB_GPU_LIBRARY_PATH = "/usr/lib64-nvidia"
 _JOB_ID = re.compile(r"^job-[0-9a-f]{16}$")
 
 
@@ -212,6 +216,11 @@ class ColabJobExecutor(JobExecutor):
         super().__init__(waiter, executor, ssh_config, jobs_config)
         self._colab_client = client
         self._colab_waiter = waiter
+
+    def transport_environment(self) -> dict[str, str]:
+        """Expose Colab's NVIDIA driver library directory to the recorded job."""
+
+        return {"LD_LIBRARY_PATH": _COLAB_GPU_LIBRARY_PATH}
 
     def logs(self, worker_id: str, *, job_id: str, job_directory: str, tail_bytes: int) -> str:
         if (

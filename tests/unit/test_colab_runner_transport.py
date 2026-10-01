@@ -60,6 +60,20 @@ class LocalColab:
         (self.root / Path(remote).name).unlink(missing_ok=True)
 
 
+def test_colab_job_environment_exposes_the_gpu_driver_library_path(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json")
+    client = LocalColab(tmp_path)
+    job_executor = ColabJobExecutor(
+        client,  # type: ignore[arg-type]
+        ColabWaiter(client, store),  # type: ignore[arg-type]
+        ColabExecutor(client),  # type: ignore[arg-type]
+        SshConfig(),
+        JobsConfig(runner_path=str(tmp_path / "runner"), worker_root=str(tmp_path / "jobs")),
+    )
+    # Colab mounts libnvidia-ml outside the loader default; recorded jobs need the path.
+    assert job_executor.transport_environment() == {"LD_LIBRARY_PATH": "/usr/lib64-nvidia"}
+
+
 def test_same_sha_verified_runner_installs_and_inspects_over_colab_upload(tmp_path: Path) -> None:
     store = WorkerStateStore(tmp_path / "workers.json")
     store.record_colab_intent(SESSION, "T4")
