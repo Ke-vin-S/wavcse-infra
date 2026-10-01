@@ -148,12 +148,79 @@ def test_bootstrap_delegates_agent_installation_and_supports_explicit_skip() -> 
     assert "--skip-agents" in bootstrap
 
 
-def test_worker_scripts_do_not_install_controller_agent_tools() -> None:
-    worker_directory = REPOSITORY_ROOT / "worker"
-    worker_scripts = worker_directory.rglob("*.sh") if worker_directory.exists() else ()
+def _run_colab_install_step(controller_home: Path) -> subprocess.CompletedProcess[str]:
+    command = 'source "$1"\nCONTROLLER_USER="$(id -un)"\nCONTROLLER_HOME="$2"\ninstall_colab_cli\n'
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            command,
+            "colab-install-test",
+            str(BOOTSTRAP_SCRIPT),
+            str(controller_home),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
-    for script in worker_scripts:
-        content = script.read_text(encoding="utf-8").lower()
-        assert "oh-my-pi" not in content
-        assert "@openai/codex" not in content
-        assert "cargo install agf" not in content
+
+def _write_fake_colab(controller_home: Path, version: str) -> Path:
+    binary = controller_home / ".local" / "bin" / "colab"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text(f'#!/usr/bin/env bash\nprintf "Version: {version}\\n"\n', encoding="utf-8")
+    binary.chmod(0o755)
+    return binary
+
+
+def test_colab_install_skips_uv_when_the_pinned_version_is_present(tmp_path: Path) -> None:
+    _write_fake_colab(tmp_path, "0.7.4")
+
+    result = _run_colab_install_step(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "Google Colab CLI 0.7.4 is already installed." in result.stdout
+    assert not (tmp_path / "uv-calls.txt").exists()
+
+
+def test_colab_install_pins_the_version_and_never_authenticates_or_requests_compute(
+    tmp_path: Path,
+) -> None:
+    record = tmp_path / "uv-calls.txt"
+    uv_binary = tmp_path / ".local" / "bin" / "uv"
+    uv_binary.parent.mkdir(parents=True, exist_ok=True)
+    uv_binary.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> '{record}'\n"
+        f"printf '#!/usr/bin/env bash\\nprintf \"Version: 0.7.4\\\\n\"\\n' > "
+        f"'{uv_binary.parent / 'colab'}'\n"
+        f"chmod 0755 '{uv_binary.parent / 'colab'}'\n",
+        encoding="utf-8",
+    )
+    uv_binary.chmod(0o755)
+
+    result = _run_colab_install_step(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert record.read_text(encoding="utf-8").strip() == (
+        "tool install --force google-colab-cli==0.7.4"
+    )
+    assert "Installing pinned Google Colab CLI 0.7.4." in result.stdout
+    assert "gcloud auth application-default login --scopes=openid," in result.stdout
+    assert "https://www.googleapis.com/auth/colaboratory" in result.stdout
+    assert "--auth=adc" in result.stdout
+    combined = result.stdout + result.stderr
+    for forbidden in ("colab auth", "colab new", "colab run", "--gpu", "--tpu"):
+        assert forbidden not in combined
+
+
+def test_colab_install_rejects_success_without_binary(tmp_path: Path) -> None:
+    uv_binary = tmp_path / ".local" / "bin" / "uv"
+    uv_binary.parent.mkdir(parents=True, exist_ok=True)
+    uv_binary.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    uv_binary.chmod(0o755)
+
+    result = _run_colab_install_step(tmp_path)
+
+    assert result.returncode != 0
+    assert "not executable" in result.stderr

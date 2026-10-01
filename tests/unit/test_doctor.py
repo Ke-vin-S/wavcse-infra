@@ -110,6 +110,81 @@ def test_doctor_passes_with_expected_controller_dependencies(tmp_path: Path) -> 
     )
 
 
+def test_enabled_colab_doctor_is_read_only_and_requires_adc(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from wavcse_infra import doctor
+    from wavcse_infra.errors import ColabAuthenticationRequiredError
+
+    calls: list[str] = []
+
+    class FakeColab:
+        def __init__(self, config) -> None:
+            assert config.enabled
+
+        def version(self) -> str:
+            calls.append("version")
+            return "0.7.4"
+
+        def list_workers(self):
+            calls.append("sessions")
+            raise ColabAuthenticationRequiredError(
+                "ADC required; run gcloud auth application-default login "
+                "--scopes=openid,https://www.googleapis.com/auth/cloud-platform,"
+                "https://www.googleapis.com/auth/userinfo.email,"
+                "https://www.googleapis.com/auth/colaboratory"
+            )
+
+    monkeypatch.setattr(doctor, "ColabClient", FakeColab)
+    configured = _configured_settings(tmp_path)
+    settings = configured.model_copy(
+        update={"colab": configured.colab.model_copy(update={"enabled": True})}
+    )
+    report = run_doctor(
+        settings,
+        HealthyProbes({settings.paths.wavcse, settings.ssh.private_key, _config_file(tmp_path)}),
+        config_path=tmp_path / "config.toml",
+    )
+    assert calls == ["version", "sessions"]
+    checks = {check.name: check for check in report.checks}
+    assert checks["Colab CLI"] == DoctorCheck("Colab CLI", CheckStatus.PASS, "0.7.4")
+    assert checks["Colab authentication"].status is CheckStatus.FAIL
+    assert "gcloud auth application-default login" in checks["Colab authentication"].detail
+
+
+def test_authenticated_colab_doctor_reports_cli_and_session_access(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from wavcse_infra import doctor
+
+    class FakeColab:
+        def __init__(self, config) -> None:
+            assert config.enabled
+
+        def version(self) -> str:
+            return "0.7.4"
+
+        def list_workers(self) -> list:
+            return []
+
+    monkeypatch.setattr(doctor, "ColabClient", FakeColab)
+    configured = _configured_settings(tmp_path)
+    settings = configured.model_copy(
+        update={"colab": configured.colab.model_copy(update={"enabled": True})}
+    )
+    report = run_doctor(
+        settings,
+        HealthyProbes({settings.paths.wavcse, settings.ssh.private_key, _config_file(tmp_path)}),
+        config_path=tmp_path / "config.toml",
+    )
+    checks = {check.name: check for check in report.checks}
+    assert checks["Colab CLI"].status is CheckStatus.PASS
+    assert checks["Colab authentication"] == DoctorCheck(
+        "Colab authentication", CheckStatus.PASS, "ADC"
+    )
+    assert checks["Colab API/session access"].status is CheckStatus.PASS
+
+
 def test_doctor_reports_ssm_credential_source(tmp_path: Path) -> None:
     configured = _configured_settings(tmp_path)
     settings = configured.model_copy(

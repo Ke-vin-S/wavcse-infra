@@ -111,6 +111,24 @@ class RunPodConfig(FrozenModel):
         return value
 
 
+class ColabConfig(FrozenModel):
+    """Non-secret, opt-in settings for the pinned Google Colab CLI."""
+
+    enabled: bool = False
+    cli: str = Field(default="colab", min_length=1)
+    command_timeout_seconds: float = Field(default=300.0, gt=0, le=86400)
+    lifecycle_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+
+    @field_validator("cli")
+    @classmethod
+    def cli_is_an_executable_name_or_absolute_path(cls, value: str) -> str:
+        if value.startswith("-") or any(character.isspace() for character in value):
+            raise ValueError("Colab CLI path must not contain whitespace or begin with '-'")
+        if "/" in value and not Path(value).is_absolute():
+            raise ValueError("Colab CLI path must be absolute or an executable name on PATH")
+        return value
+
+
 class StorageConfig(FrozenModel):
     """Canonical artifact storage location and bounded presign settings."""
 
@@ -215,6 +233,7 @@ class Settings(FrozenModel):
     """Complete non-secret and runtime-secret application configuration."""
 
     aws: AwsConfig = AwsConfig()
+    colab: ColabConfig = ColabConfig()
     controller: ControllerConfig = ControllerConfig()
     jobs: JobsConfig = JobsConfig()
     paths: PathsConfig = PathsConfig()
@@ -227,6 +246,10 @@ class Settings(FrozenModel):
 ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "RUNPOD_API_KEY": ("runpod", "api_key"),
     "WAVCSE_INFRA_AWS_REGION": ("aws", "region"),
+    "WAVCSE_INFRA_COLAB_ENABLED": ("colab", "enabled"),
+    "WAVCSE_INFRA_COLAB_CLI": ("colab", "cli"),
+    "WAVCSE_INFRA_COLAB_COMMAND_TIMEOUT_SECONDS": ("colab", "command_timeout_seconds"),
+    "WAVCSE_INFRA_COLAB_LIFECYCLE_TIMEOUT_SECONDS": ("colab", "lifecycle_timeout_seconds"),
     "WAVCSE_INFRA_EXPECT_OMP": ("controller", "expect_omp"),
     "WAVCSE_INFRA_MLFLOW_URL": ("controller", "mlflow_url"),
     "WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER": ("runpod", "api_key_parameter"),

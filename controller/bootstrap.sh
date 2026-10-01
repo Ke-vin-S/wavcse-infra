@@ -2,6 +2,11 @@
 set -Eeuo pipefail
 
 readonly UV_VERSION="${WAVCSE_INFRA_UV_VERSION:-0.12.19}"
+# Pinned Google Colab CLI. Bootstrap installs the tool only; it never authenticates
+# and never requests compute. The pinned CLI defaults to the interactive oauth2
+# provider, so every invocation must pass this project's explicit `--auth=adc`.
+readonly COLAB_CLI_VERSION='0.7.4'
+readonly COLAB_ADC_SCOPES='openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory'
 REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPOSITORY_ROOT
 readonly INSTALL_AGENTS_SCRIPT="${REPOSITORY_ROOT}/controller/install-agents.sh"
@@ -26,7 +31,9 @@ usage() {
   cat <<'EOF'
 Usage: ./controller/bootstrap.sh [--skip-agents]
 
-Bootstrap the controller and install controller-only agent tools by default.
+Bootstrap the controller, install controller-only agent tools by default, and
+install the pinned Google Colab CLI. No authentication or paid resource request
+is performed.
 EOF
 }
 
@@ -129,6 +136,36 @@ sync_project() {
     "${CONTROLLER_HOME}/.local/bin/infra"
 }
 
+install_colab_cli() {
+  local uv_bin="${CONTROLLER_HOME}/.local/bin/uv"
+  local colab_bin="${CONTROLLER_HOME}/.local/bin/colab"
+  local installed_version=''
+  if [[ -x "${colab_bin}" ]]; then
+    installed_version="$("${colab_bin}" version 2>/dev/null | awk '{print $2}')" ||
+      installed_version=''
+  fi
+
+  if [[ "${installed_version}" == "${COLAB_CLI_VERSION}" ]]; then
+    printf 'Google Colab CLI %s is already installed.\n' "${COLAB_CLI_VERSION}"
+  else
+    printf 'Installing pinned Google Colab CLI %s.\n' "${COLAB_CLI_VERSION}"
+    run_as_controller "${uv_bin}" tool install --force \
+      "google-colab-cli==${COLAB_CLI_VERSION}"
+  fi
+  [[ -x "${colab_bin}" ]] ||
+    fail "uv tool install reported success but ${colab_bin} is not executable"
+  installed_version="$("${colab_bin}" version 2>/dev/null | awk '{print $2}')" ||
+    fail "could not query the installed Colab CLI version"
+  [[ "${installed_version}" == "${COLAB_CLI_VERSION}" ]] ||
+    fail "expected Colab CLI ${COLAB_CLI_VERSION}, observed ${installed_version:-unknown}"
+
+  printf 'Google Colab CLI is installed but not authenticated; bootstrap performs no login.\n'
+  printf 'For headless ADC, run this once as %s, then verify with: %s --auth=adc sessions\n' \
+    "${CONTROLLER_USER}" "${colab_bin}"
+  printf '  gcloud auth application-default login --scopes=%s\n' "${COLAB_ADC_SCOPES}"
+  printf 'Always pass --auth=adc: this CLI defaults to the interactive oauth2 provider.\n'
+}
+
 install_agent_tools() {
   if [[ "${SKIP_AGENTS}" == true ]]; then
     printf 'Skipping controller agent tools (--skip-agents).\n'
@@ -198,11 +235,14 @@ main() {
   install_os_packages
   install_uv
   sync_project
+  install_colab_cli
   install_agent_tools
   install_omp_overlay
 
   printf 'Controller bootstrap complete.\n'
   printf 'Next: configure the controller and authenticate agent providers, then run infra doctor.\n'
+  printf 'If you will use Colab workers, run the printed ADC login as %s first.\n' \
+    "${CONTROLLER_USER}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

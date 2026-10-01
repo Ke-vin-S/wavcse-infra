@@ -50,6 +50,26 @@ class ProviderAuthenticationError(ProviderError):
     """Raised when a provider rejects configured credentials."""
 
 
+class ColabCliMissingError(ProviderError):
+    """The pinned controller-side Colab CLI is not installed."""
+
+
+class ColabAuthenticationRequiredError(ProviderAuthenticationError):
+    """ADC is absent, expired, or missing the Colab scopes."""
+
+
+class ColabQuotaError(ProviderError):
+    """The account cannot currently allocate more Colab compute."""
+
+
+class ColabAcceleratorUnavailableError(ProviderError):
+    """The requested accelerator cannot be allocated on this account."""
+
+
+class UnsupportedProviderOperationError(ProviderError):
+    """An operation would misrepresent the provider's actual lifecycle."""
+
+
 class ProviderPermissionError(ProviderError):
     """Raised when valid provider credentials lack an operation permission."""
 

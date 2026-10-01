@@ -25,6 +25,13 @@ poll_interval_seconds = 2.0
 max_poll_interval_seconds = 10.0
 create_reconcile_attempts = 3
 
+[colab]
+# Opt-in: Colab sessions consume compute units until explicitly released.
+enabled = false
+cli = "colab"
+command_timeout_seconds = 300.0
+lifecycle_timeout_seconds = 300.0
+
 [storage]
 bucket = "CHANGE_ME"
 prefix = "wavcse"

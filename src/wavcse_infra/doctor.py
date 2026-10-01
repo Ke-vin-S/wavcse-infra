@@ -22,7 +22,8 @@ from wavcse_infra.credentials import (
     ResolvedRunPodCredential,
     resolve_runpod_api_key,
 )
-from wavcse_infra.errors import CredentialError
+from wavcse_infra.errors import ColabAuthenticationRequiredError, CredentialError, ProviderError
+from wavcse_infra.providers.colab import ColabClient
 from wavcse_infra.redaction import redact
 
 
@@ -165,7 +166,35 @@ def run_doctor(
         _s3_check(active_probes, settings, timeout),
         _mlflow_check(active_probes, settings, timeout),
     ]
+    if settings.colab.enabled:
+        checks.extend(_colab_checks(settings))
     return DoctorReport(checks=tuple(checks))
+
+
+def _colab_checks(settings: Settings) -> list[DoctorCheck]:
+    """Inspect the pinned CLI and account sessions; never allocate a runtime."""
+
+    client = ColabClient(settings.colab)
+    try:
+        version = client.version()
+    except ProviderError as exc:
+        return [DoctorCheck("Colab CLI", CheckStatus.FAIL, redact(exc))]
+    checks = [DoctorCheck("Colab CLI", CheckStatus.PASS, version)]
+    try:
+        client.list_workers()
+    except ColabAuthenticationRequiredError as exc:
+        checks.append(DoctorCheck("Colab authentication", CheckStatus.FAIL, redact(exc)))
+        return checks
+    except ProviderError as exc:
+        checks.append(DoctorCheck("Colab API/session access", CheckStatus.FAIL, redact(exc)))
+        return checks
+    checks.extend(
+        (
+            DoctorCheck("Colab authentication", CheckStatus.PASS, "ADC"),
+            DoctorCheck("Colab API/session access", CheckStatus.PASS, "sessions readable"),
+        )
+    )
+    return checks
 
 
 def _command_check(probes: SystemProbes, name: str, command: str) -> DoctorCheck:

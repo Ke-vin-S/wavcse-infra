@@ -133,6 +133,28 @@ prefix = "from-file"
     assert settings.storage.prefix == "from-environment"
 
 
+def test_colab_config_precedence_and_secret_fields_are_rejected(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[colab]\nenabled = true\ncli = "colab-from-file"\ncommand_timeout_seconds = 30\n',
+        encoding="utf-8",
+    )
+    settings = load_settings(
+        config_path=config_file,
+        environ={"WAVCSE_INFRA_COLAB_CLI": "colab-from-environment"},
+        cli_overrides={"colab.cli": "/opt/colab"},
+    )
+    assert settings.colab.enabled
+    assert settings.colab.cli == "/opt/colab"
+    assert settings.colab.command_timeout_seconds == 30
+    with pytest.raises(ConfigurationError):
+        load_settings(
+            config_path=config_file,
+            environ={},
+            cli_overrides={"colab.access_token": "must-not-be-configured"},
+        )
+
+
 def test_runpod_key_is_only_loaded_from_environment() -> None:
     settings = load_settings(environ={"RUNPOD_API_KEY": "not-a-real-key"})
 
