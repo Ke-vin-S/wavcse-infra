@@ -155,6 +155,36 @@ def test_colab_config_precedence_and_secret_fields_are_rejected(tmp_path: Path) 
         )
 
 
+def test_colab_cu_policy_precedence_and_single_lease_limit(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    from wavcse_infra.models import ProviderKind
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        "[colab]\nminimum_balance_cu = 8\nmax_incremental_rate_cu_per_hour = 2\n"
+        'max_job_cu = 4\n[placement]\npreferred_providers = ["runpod", "colab"]\n'
+    )
+    settings = load_settings(
+        config_path=config_file,
+        environ={"WAVCSE_INFRA_COLAB_MAX_JOB_CU": "6"},
+        cli_overrides={"colab.minimum_balance_cu": "9"},
+    )
+    assert settings.colab.minimum_balance_cu == Decimal("9")
+    assert settings.colab.max_incremental_rate_cu_per_hour == Decimal("2")
+    assert settings.colab.max_job_cu == Decimal("6")
+    assert settings.placement.preferred_providers == (
+        ProviderKind.RUNPOD,
+        ProviderKind.COLAB,
+    )
+    with pytest.raises(ConfigurationError):
+        load_settings(
+            config_path=config_file,
+            environ={},
+            cli_overrides={"colab.max_simultaneous_workers": 2},
+        )
+
+
 def test_runpod_key_is_only_loaded_from_environment() -> None:
     settings = load_settings(environ={"RUNPOD_API_KEY": "not-a-real-key"})
 

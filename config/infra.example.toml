@@ -26,11 +26,23 @@ max_poll_interval_seconds = 10.0
 create_reconcile_attempts = 3
 
 [colab]
-# Opt-in: Colab sessions consume compute units until explicitly released.
+# Opt-in: Colab is preferred when enabled; sessions consume compute units
+# until explicitly released. Only one infra-owned lease is permitted.
 enabled = false
 cli = "colab"
 command_timeout_seconds = 300.0
 lifecycle_timeout_seconds = 300.0
+default_gpu = "T4"
+max_simultaneous_workers = 1
+# Human CU policy; no USD/hour conversion. A rejected allocation may cost a
+# small amount of CU before the post-allocation guard releases it.
+minimum_balance_cu = 5
+max_incremental_rate_cu_per_hour = 3
+max_job_cu = 10
+
+[placement]
+# Only existing READY workers are selected by job submit. No paid auto-create.
+preferred_providers = ["colab", "runpod"]
 
 [storage]
 bucket = "CHANGE_ME"

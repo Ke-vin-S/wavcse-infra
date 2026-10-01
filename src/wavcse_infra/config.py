@@ -6,6 +6,7 @@ import os
 import tomllib
 from collections.abc import Mapping
 from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from pydantic import (
 )
 
 from wavcse_infra.errors import ConfigurationError, StorageKeyError
+from wavcse_infra.models import ProviderKind
 from wavcse_infra.storage.keys import normalize_prefix
 
 DEFAULT_CONFIG_PATH = Path("~/.config/wavcse-infra/config.toml")
@@ -118,6 +120,11 @@ class ColabConfig(FrozenModel):
     cli: str = Field(default="colab", min_length=1)
     command_timeout_seconds: float = Field(default=300.0, gt=0, le=86400)
     lifecycle_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    default_gpu: str = "T4"
+    minimum_balance_cu: Decimal = Field(default=Decimal("5"), ge=0)
+    max_incremental_rate_cu_per_hour: Decimal = Field(default=Decimal("3"), gt=0)
+    max_job_cu: Decimal = Field(default=Decimal("10"), gt=0)
+    max_simultaneous_workers: int = Field(default=1, ge=1, le=1)
 
     @field_validator("cli")
     @classmethod
@@ -229,6 +236,22 @@ class SshConfig(FrozenModel):
         return _placeholder_as_none(value)
 
 
+class PlacementConfig(FrozenModel):
+    """Explicit provider order for jobs on already READY workers."""
+
+    preferred_providers: tuple[ProviderKind, ...] = (
+        ProviderKind.COLAB,
+        ProviderKind.RUNPOD,
+    )
+
+    @field_validator("preferred_providers")
+    @classmethod
+    def unique_providers(cls, value: tuple[ProviderKind, ...]) -> tuple[ProviderKind, ...]:
+        if not value or len(set(value)) != len(value):
+            raise ValueError("placement providers must be non-empty and distinct")
+        return value
+
+
 class Settings(FrozenModel):
     """Complete non-secret and runtime-secret application configuration."""
 
@@ -237,6 +260,7 @@ class Settings(FrozenModel):
     controller: ControllerConfig = ControllerConfig()
     jobs: JobsConfig = JobsConfig()
     paths: PathsConfig = PathsConfig()
+    placement: PlacementConfig = PlacementConfig()
     runpod: RunPodConfig = RunPodConfig()
     storage: StorageConfig = StorageConfig()
     ssh: SshConfig = SshConfig()
@@ -250,6 +274,13 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "WAVCSE_INFRA_COLAB_CLI": ("colab", "cli"),
     "WAVCSE_INFRA_COLAB_COMMAND_TIMEOUT_SECONDS": ("colab", "command_timeout_seconds"),
     "WAVCSE_INFRA_COLAB_LIFECYCLE_TIMEOUT_SECONDS": ("colab", "lifecycle_timeout_seconds"),
+    "WAVCSE_INFRA_COLAB_MINIMUM_BALANCE_CU": ("colab", "minimum_balance_cu"),
+    "WAVCSE_INFRA_COLAB_MAX_INCREMENTAL_RATE_CU_PER_HOUR": (
+        "colab",
+        "max_incremental_rate_cu_per_hour",
+    ),
+    "WAVCSE_INFRA_COLAB_MAX_JOB_CU": ("colab", "max_job_cu"),
+    "WAVCSE_INFRA_COLAB_DEFAULT_GPU": ("colab", "default_gpu"),
     "WAVCSE_INFRA_EXPECT_OMP": ("controller", "expect_omp"),
     "WAVCSE_INFRA_MLFLOW_URL": ("controller", "mlflow_url"),
     "WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER": ("runpod", "api_key_parameter"),

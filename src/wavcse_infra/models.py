@@ -17,6 +17,13 @@ class ProviderKind(StrEnum):
     COLAB = "colab"
 
 
+class CostUnit(StrEnum):
+    """Native provider billing units; never convert Colab CU into invented USD."""
+
+    USD_PER_HOUR = "USD/hour"
+    COMPUTE_UNITS = "CU"
+
+
 class ExecutionTransport(StrEnum):
     """How the controller executes on a worker, independently of its provider."""
 
