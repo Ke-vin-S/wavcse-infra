@@ -1,9 +1,9 @@
 # wavcse-infra
 
 `wavcse-infra` is the infrastructure control plane for reproducible wavCSE
-research workloads. It prepares a persistent AWS EC2 controller, inspects disposable
-RunPod GPU workers, prepares them through SSH, and will later coordinate exact-commit
-execution and durable S3 artifact transfer.
+research workloads. It prepares a persistent AWS EC2 controller, operates
+RunPod GPU workers through SSH, inspects opt-in Colab sessions, and executes
+exact-commit jobs with durable S3 artifacts on supported worker transports.
 
 It is not the wavCSE research repository. Model code, experiments, research
 configuration, tests, and MLflow integration remain in the separate `wavCSE`
@@ -38,7 +38,7 @@ The repository currently implements Phases 0–6.2 of the v1 specification:
 - worker artifact download and upload through presigned URLs only, with temporary-file
   materialization, optional expected-checksum enforcement, and controller-side size
   verification of the stored object;
-- provider-neutral worker/request/offer models and bounded retries for safe reads;
+- provider-identified worker views, RunPod-specific create specs, and bounded safe-read retries;
 - a versioned JSON job specification that rejects branches, short prefixes, shell command
   strings, traversal paths, reserved environment names, and bearer values;
 - an explicit job state machine (`PENDING`, `PREPARING`, `RUNNING`, `SUCCEEDED`, `FAILED`,
@@ -69,6 +69,17 @@ single-job execution against an explicitly provided worker. Automatic provisioni
 multi-worker scheduling, resume orchestration, research dependency installation beyond an
 explicit declared argv, and automatic cache eviction remain unimplemented.
 
+The Colab integration currently covers a pinned controller CLI, explicit ADC,
+read-only session inspection, provider/transport identity, scoped supplemental
+state, and ownership-guarded terminal release. **Colab allocation and recorded
+jobs remain blocked:** its CLI exposes no pre-allocation price for the required
+guard, and `colab exec` persists executed code and output in plaintext history,
+including any presigned URL or secret sent with it. `colab ssh --proxy-mode`
+automatically allocates a missing named session and is not a safe substitute.
+`infra worker create --provider colab` therefore reports account usage and
+refuses before allocation even with `--yes`. RunPod behavior is unchanged.
+See [Colab provider boundary](docs/COLAB.md).
+
 ## Architecture
 
 The persistent/stoppable EC2 controller is the writable development environment. It
@@ -80,6 +91,12 @@ from an AWS Systems Manager Parameter Store `SecureString` resolved at runtime.
 Disposable GPU workers execute immutable wavCSE commits. GitHub distributes code, a
 private S3 bucket is the canonical store for large artifacts, and wavCSE retains
 ownership of MLflow/DagsHub reporting.
+
+Colab is opt-in. `controller/bootstrap.sh` installs pinned
+`google-colab-cli==0.7.4` without authenticating; a human mints ADC once. All
+CLI calls pass `--auth=adc` explicitly because upstream defaults to interactive
+OAuth. Colab execution cannot yet satisfy the recorded-job secret and artifact
+contract; see [Colab provider boundary](docs/COLAB.md).
 
 See [Architecture](docs/ARCHITECTURE.md), [Security](docs/SECURITY.md), and the
 [decision log](docs/DECISIONS.md) for boundaries and rationale.
@@ -149,6 +166,23 @@ OMP, Codex, and AGF are controller development tools. They are not installed on 
 GPU training workers. The selected upstream mechanisms and version policy are recorded
 in [ADR-011](docs/DECISIONS.md#adr-011-install-controller-agents-from-pinned-official-releases).
 
+## Google Colab CLI
+
+Bootstrap also installs the pinned `google-colab-cli==0.7.4` with `uv tool install`, into
+the same `~/.local/bin`. The step is idempotent and performs no authentication and no
+compute request. Authentication is a separate, one-time, human step: mint ADC with the four
+required scopes and then verify it.
+
+```bash
+gcloud auth application-default login --scopes=openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory
+colab --auth=adc sessions
+```
+
+Pass `--auth=adc` before the subcommand on every invocation, because the pinned CLI
+defaults to the interactive `oauth2` provider. Colab support is off until
+`colab.enabled = true`. See [Colab provider notes](docs/COLAB.md) for the lifecycle,
+limitations, and the plaintext `exec`-history warning.
+
 ## Configuration
 
 Configuration and credential storage have five distinct roles:
@@ -190,6 +224,21 @@ the controller's EC2 instance profile; no permanent AWS access keys are installe
 `RUNPOD_API_KEY`, when non-empty, takes precedence for local development, CI, and
 temporary testing. Do not put the key in TOML or commit a populated `.env` file.
 [`.env.example`](.env.example) documents variables but is not automatically loaded.
+
+Colab is an optional, disabled-by-default section. It carries no credential: ADC comes from
+the ambient Google credential chain, so no Colab token is stored in TOML or in a
+`WAVCSE_INFRA_*` variable.
+
+```toml
+[colab]
+enabled = false
+cli = "colab"
+command_timeout_seconds = 300.0
+lifecycle_timeout_seconds = 300.0
+```
+
+Each field has a matching `WAVCSE_INFRA_COLAB_*` environment override; defaults are shown
+above. See [Colab provider notes](docs/COLAB.md) for the full table and lifecycle.
 
 Validate without making network calls:
 

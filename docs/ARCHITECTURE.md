@@ -21,6 +21,20 @@ The components are:
 - **Private S3:** canonical large-artifact and embedding storage.
 - **MLflow/DagsHub:** experiment tracking owned by wavCSE.
 
+Colab is an opt-in provider read path, not yet an execution target for recorded
+jobs. `ProviderKind` identifies the authoritative resource and
+`ExecutionTransport` identifies the worker channel independently. RunPod
+remains dynamically provisioned with SSH, resumable stop/start, and optional
+persistent provider storage. Colab sessions are dynamically allocated and
+ephemeral; upstream `colab stop` is terminal release, not resumable stop.
+`infra worker create --provider colab` refuses before allocation because the
+official CLI reports no per-accelerator pre-allocation hourly price. Its
+`colab exec` writes code and outputs to plaintext history, so it cannot carry
+job secrets or presigned URLs. Existing job semantics and S3 publication are
+not weakened to accommodate this transport; see [Colab](COLAB.md).
+Future university-managed static SSH workers need no dynamic provision or
+destroy, and can reuse SSH execution without changing the job specification.
+
 ## Control and data flow
 
 ```text
@@ -88,15 +102,18 @@ state and the worker's own files remain authoritative; a local record is never u
   SSM `SecureString` through Boto3's normal AWS credential chain.
 - `cli.py` defines the stable `infra` interface and global configuration options.
 - `doctor.py` runs independent read-only controller and connectivity probes.
-- `models.py` defines provider-neutral worker requests/views, lifecycle states, cloud
-  types, GPU offers, and the network-volume models (`NetworkVolume`, `DataCenterInfo`,
-  `NetworkVolumeBilling`) used outside the provider client.
+- `models.py` separates provider identity, execution transport, and normalized worker
+  views. RunPod creation specs/cloud tiers and network-volume models
+  (`NetworkVolume`, `DataCenterInfo`, `NetworkVolumeBilling`) stay provider-specific.
 - `providers/runpod.py` owns RunPod REST v2 wire parsing, safe read retries, GPU catalog
   discovery, exact-ID lifecycle requests, and ambiguous-create reconciliation. It also
   owns all network-volume wire handling (`GET`/`POST` `/v2/network-volumes`,
   `GET`/`DELETE` `/v2/network-volumes/{id}`, `GET` `/v2/catalog/datacenters`, and `GET`
   `/v2/billing/network-volumes`), normalized into those provider-neutral models so no
   RunPod response object leaks outside the provider module.
+- `providers/colab.py` wraps pinned official CLI 0.7.4 with explicit ADC and
+  bounded argv subprocesses; it parses account sessions without claiming
+  unidentifiable assignments or forwarding provider credentials.
 - `state.py` stores only supplemental non-secret created-worker metadata with atomic
   same-directory replacement beneath `~/.local/state/wavcse-infra/`. Its
   `VolumeStateStore` shares that atomic-write and advisory-lock machinery for
@@ -210,7 +227,10 @@ state and the worker's own files remain authoritative; a local record is never u
   releases for the controller user without performing authentication.
 - `controller/cloud-init.yaml` performs only initial public clone and bootstrap dispatch.
 
-No generic provider base class exists; RunPod is the only implemented provider.
+No generic provider base class exists; the RunPod lifecycle and job transport
+remain operational. The Colab adapter provides a distinct session read path
+and ownership-guarded release. Recorded Colab execution requires a safe secret
+channel and an enforceable cost guard before it can join the common job flow.
 
 Controller agent installation is not part of the worker lifecycle. Normal GPU workers
 remain minimal execution environments and do not receive OMP, Codex, AGF, or controller

@@ -255,6 +255,35 @@ The installer downloads official installer scripts to a temporary file before
 execution; it does not use an opaque `curl | sudo bash` pipeline. It never runs login,
 writes provider credentials, or changes existing OMP/Codex authentication stores.
 
+## Google Colab controller checks (no allocation)
+
+`controller/bootstrap.sh` installs `google-colab-cli==0.7.4` without
+authenticating. The operator runs the one-time ADC command on the controller:
+
+```bash
+gcloud auth application-default login \
+  --scopes=openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory
+```
+
+Set `[colab] enabled = true` in the user TOML or use
+`WAVCSE_INFRA_COLAB_ENABLED=true`, then run `infra doctor` and
+`infra worker list --provider colab --read-only`. Both use only read-only
+CLI operations with `--auth=adc`; neither allocates a runtime. The other
+non-secret overrides are `WAVCSE_INFRA_COLAB_CLI`,
+`WAVCSE_INFRA_COLAB_COMMAND_TIMEOUT_SECONDS`,
+`WAVCSE_INFRA_COLAB_LIFECYCLE_TIMEOUT_SECONDS`.
+
+`infra worker create --provider colab --gpu T4` displays read-only
+account usage and refuses the paid request: Colab exposes no
+pre-allocation hourly price with which to enforce `--max-price`.
+`--yes` cannot bypass this. Recorded jobs, presigned worker transfers,
+and arbitrary exec reject Colab worker IDs rather than send bearer
+material through the upstream CLI's plaintext execution history.
+`infra worker stop` rejects Colab because stop is resumable; a
+provider-confirmed, tracked, infra-owned Colab session is released with
+`infra worker destroy <exact-session-name>` after confirmation.
+See [Colab provider boundary](COLAB.md) for the complete limitations.
+
 ## RunPod worker operations
 
 ```bash

@@ -1409,3 +1409,58 @@ the identity must exist before the provider answers. An operator can see an ambi
 create as an unresolved intent instead of as a silent absence. Cleaning up a volume and its
 Pod is deliberately two explicit steps rather than a cascade, which is more work and is the
 reason a mistake in one cannot destroy the other.
+
+## ADR-029: Separate provider identity from transport, and gate unsafe Colab allocation
+
+- **Status:** Accepted for the provider foundation; recorded Colab execution deferred
+- **Date:** 2026-10-01
+
+### Context
+
+RunPod uses dynamic Pod creation, resumable stop/start, direct SSH and
+optionally persistent storage. Colab uses named ephemeral sessions with
+terminal release and a CLI-driven Jupyter kernel. The version validated
+offline is `google-colab-cli==0.7.4`: it defaults to interactive oauth2
+unless explicitly given `--auth=adc`. Its `exec` writes source and output
+to plaintext local history; its SSH proxy auto-allocates a missing session;
+and its usage view provides account-level compute units but no
+pre-allocation USD/hour price for a selected accelerator.
+
+### Decision
+
+- Represent provider identity (`runpod`, `colab`) and transport identity
+  (`ssh`, `colab_exec`) separately. Leave RunPod-specific Pod requests and
+  placement checks in the RunPod lifecycle, not a generic cloud interface.
+- Keep version-1 RunPod worker records loadable while making provider-only
+  fields optional for Colab and scoping reconciliation to one provider.
+  Record an allocation intent before any Colab mutation is ever permitted.
+- Keep `stop` resumable and `destroy` terminal. A tracked Colab session may
+  only be released by exact identity after provider confirmation and explicit
+  operator intent.
+- Refuse Colab allocation when the provider cannot supply a price for the
+  existing `--max-price` guard. Never interpret `--yes` as a price waiver.
+- Do not send job secrets or presigned URLs through `colab exec` or the
+  auto-provisioning SSH proxy. Keep recorded Colab jobs and worker transfers
+  disabled rather than weakening exact-commit and canonical S3 guarantees.
+  Authentication is a human ADC bootstrap only.
+
+### Alternatives rejected
+
+- Pretend upstream `colab stop` is resumable: it releases the VM.
+- Invent an hourly USD price from account-level compute units: rates and
+  billing are not the same quantity.
+- Pass a presigned URL as `exec` Python source or `--env`: upstream records
+  both, including output, in plaintext history.
+- Use `ssh --proxy-mode -s` as a secret channel: it creates a new paid runtime
+  if the named session disappears between reconciliation and connection.
+- Treat Colab as a second weaker job system: the same job specification,
+  exact checkout and S3 read-back must apply before recording success.
+
+### Consequences
+
+`infra doctor` and worker list/show provide a read-only Colab visibility
+path without a live session. Full Colab recorded execution requires an
+enforceable cost authorization and a verified secret-safe channel that
+cannot auto-provision on reconnect. Future static university SSH workers
+do not provision or destroy but can share the existing SSH transport and
+exact-commit job semantics.

@@ -58,6 +58,30 @@ If the `SecureString` uses a customer-managed KMS key, the controller role also 
 access. The application relies on Boto3's normal credential chain; on EC2 the attached
 instance profile supplies and refreshes temporary AWS credentials.
 
+### Google Colab
+
+The controller may hold one-time human-minted Google ADC. The CLI is always
+invoked with `--auth=adc` and never initiates an interactive login during
+automated work. ADC and the CLI's local session metadata stay on the
+controller, never on the runtime. `colab auth` and Google Drive mounting
+are not used. S3 remains canonical; Colab local storage is ephemeral.
+
+The validated CLI 0.7.4 writes every `colab exec` code block **and output**
+to plaintext history in the controller user's home directory. Job secrets
+and presigned URLs therefore must not be sent through it, even through its
+`--env` flag. Its `ssh --proxy-mode -s` auto-allocates a missing session,
+so a read-then-connect race can provision paid compute; it is not a
+permitted secret transport here. Colab workers are not marked READY for
+recorded jobs, and no Colab job is considered durable without the same
+S3 read-back and SHA-256 check as a RunPod job.
+
+Colab `usage` reports account compute units, not a per-accelerator
+pre-allocation USD/hour price. The CLI therefore refuses Colab creation
+under the existing price guard, even with `--yes`. Release requires both
+a tracked created identity and provider-confirmed exact session name,
+plus confirmation; no name-prefix cleanup is authorized.
+See [Colab provider boundary](COLAB.md).
+
 ### RunPod
 
 Store the persistent controller key as an SSM Parameter Store `SecureString` and put

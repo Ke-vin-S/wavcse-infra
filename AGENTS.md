@@ -3,11 +3,12 @@
 ## What this repository is
 
 `wavcse-infra` is the infrastructure control plane for reproducible wavCSE research
-workloads. It prepares and operates a persistent but stoppable AWS EC2 controller, creates
-and inspects disposable RunPod GPU workers, transfers artifacts, and executes research jobs
-against an exact commit, all through the `infra` CLI. Machine bootstrap, worker and volume
-lifecycle, remote execution, storage transfer, environment diagnostics, and orchestration
-are its responsibilities.
+workloads. It operates a persistent but stoppable AWS EC2 controller and disposable
+RunPod GPU workers, inspects opt-in Colab sessions, transfers artifacts, and executes
+RunPod jobs against an exact commit through the `infra` CLI. Colab allocation and
+recorded execution are guarded until the price and secret-transport invariants can be
+met; see `docs/COLAB.md`. Bootstrap, lifecycle, diagnostics, and orchestration are
+its responsibilities.
 
 It is not the wavCSE research repository: research code, models, experiment definitions,
 tests, study documentation, and MLflow/DagsHub reporting stay in the separate `wavCSE`
@@ -18,7 +19,7 @@ checkout. Never move research logic into this repository.
 - Research logic, experiment definitions, and research state: the `wavCSE` repository.
 - Detailed behaviour, configuration, and recovery narrative: `README.md`, `docs/SPEC.md`,
   `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/OPERATIONS.md`, `docs/RUNPOD.md`,
-  `docs/DECISIONS.md`. Point at them; do not restate them here.
+  `docs/COLAB.md`, `docs/DECISIONS.md`. Point at them; do not restate them here.
 - Procedure a skill already covers: reference the skill (see below); do not duplicate it.
 - Large artifacts, checkpoints, and embeddings: S3, never Git.
 - Do not add without an explicit request: Kubernetes, Slurm, Ray, Celery, Airflow, Ansible,
@@ -35,8 +36,9 @@ Non-negotiable. A skill mentioning one of these does not relax it.
    Source changes are made, tested, committed, and pushed in the controller's `wavCSE`
    checkout, then fetched by a worker at an exact pushed commit. A worker MUST NOT be the
    only location holding a change, MUST NOT hold a push credential, and a normal worker
-   MUST NOT run OMP. An explicitly requested development/debug worker may carry extra
-   tooling, but recorded runs still execute committed code.
+   MUST NOT run OMP. A Google Colab session is likewise ephemeral scratch, never canonical
+   storage, and is subject to the same rule. An explicitly requested development/debug
+   worker may carry extra tooling, but recorded runs still execute committed code.
 2. **Every recorded experiment executes an explicit immutable commit SHA.** Never infer a
    commit from the checked-out branch or from an unspecified working tree. Prefer full SHAs
    over branch names. Detached checkout, `HEAD` verified equal to the requested object on
@@ -110,11 +112,14 @@ could create paid resources are opt-in, explicitly flagged, self-cleaning, and n
 - `.agents/skills/wavcse-artifact-pipeline/SKILL.md` — artifact identity, the S3 / network
   volume / scratch model, cache-hit criteria, transfer semantics, version 1 manifests,
   deterministic packaging, publication verification, cleanup.
+- `.agents/skills/colab-operator/SKILL.md` — Colab ADC, account inspection,
+  ownership-guarded release, and current cost/secret-transport restrictions.
 - `.agents/commands/{infra-status,infra-gpu,infra-artifact}.md` — read-only reconciliation,
   GPU-economics, and artifact-flow entry points.
 
 Load the operator skill before any CLI-driven change; add the GPU or artifact skill when the
-work touches capacity economics or artifact bytes.
+work touches capacity economics or artifact bytes, and the Colab skill when the work targets
+a Google Colab session.
 
 ## Current state — reconcile, never assume
 
@@ -129,11 +134,12 @@ infra volume list       # also warns about unresolved create intents
 infra job status <job-id>   # may drive an interrupted job forward from worker evidence
 ```
 
-Authority order: the provider API (RunPod), then AWS/S3, then the controller-local non-secret
-state records (`workers.json`, `volumes.json`, `jobs/`) written atomically by the CLI beneath
-the CLI state directory. Local state is supplemental, never the sole source of truth, and is
-not hand-edited. Before acting on a disagreement, read `README.md` and the "Local state and
-reconciliation" section of `docs/OPERATIONS.md`.
+Authority order: the selected provider API (RunPod, or the Colab CLI for a Colab session),
+then AWS/S3, then the controller-local non-secret state records (`workers.json`,
+`volumes.json`, `jobs/`) written atomically by the CLI beneath the CLI state directory.
+Local state is supplemental, never the sole source of truth, and is not hand-edited. Before
+acting on a disagreement, read `README.md` and the "Local state and reconciliation" section
+of `docs/OPERATIONS.md`.
 
 ## Agent-facing assets
 

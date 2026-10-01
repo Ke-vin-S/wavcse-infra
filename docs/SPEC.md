@@ -932,6 +932,17 @@ Only after real usage:
 - simple multi-worker dispatch
 - optional provider expansion
 
+
+Phase 7 multi-provider evaluation introduces an opt-in Colab session adapter,
+provider/transport identity, and read-only diagnostics, without changing the
+recorded job contract. The official Colab CLI 0.7.4 has no pre-allocation
+per-accelerator hourly price and writes `exec` code and output to plaintext
+history. The existing price and secret rules therefore prevent Colab
+allocation and recorded Colab jobs until those constraints are resolved; see
+[Colab](COLAB.md) and ADR-029. A future static university SSH worker requires
+neither provisioning nor destroy, but can use the existing exact-commit job
+semantics once its transport and ownership are defined.
+
 # 31. v1 acceptance scenario
 
 Given:

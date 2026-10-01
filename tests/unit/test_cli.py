@@ -167,6 +167,205 @@ def test_doctor_uses_nonzero_exit_for_failed_required_check(monkeypatch) -> None
     assert "FAIL AWS identity: instance profile missing" in result.stdout
 
 
+def test_colab_create_refuses_unpriced_allocation_even_with_yes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    class FakeColab:
+        def __init__(self, config) -> None:
+            assert config.enabled
+
+        def version(self) -> str:
+            return "0.7.4"
+
+        def usage(self) -> str:
+            return "Balance: 100 compute units"
+
+        def create_worker(self, *args, **kwargs) -> None:
+            raise AssertionError("unpriced paid allocation must never be issued")
+
+    monkeypatch.setattr(cli, "ColabClient", FakeColab)
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[colab]\nenabled = true\n", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_file),
+            "worker",
+            "create",
+            "--provider",
+            "colab",
+            "--gpu",
+            "T4",
+            "--max-price",
+            "1",
+            "--yes",
+        ],
+        env={},
+    )
+    assert result.exit_code == 1
+    assert "hourly price" in result.stderr
+    assert "Balance: 100" in result.stdout
+
+
+def test_colab_stop_rejects_without_calling_runpod(monkeypatch, tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json")
+    store.record_colab_intent("wavcse-123456789abc", "T4")
+    monkeypatch.setattr(cli, "_state_store", lambda: store)
+    monkeypatch.setattr(
+        cli.RunPodClient,
+        "from_settings",
+        lambda settings: (_ for _ in ()).throw(AssertionError("wrong provider")),
+    )
+    result = runner.invoke(app, ["worker", "stop", "wavcse-123456789abc"], env={})
+    assert result.exit_code == 2
+    assert "Colab worker" in result.stderr
+    assert "destroy is terminal" in result.stderr
+
+
+def test_colab_listing_routes_without_runpod_and_reconciles_only_colab(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from wavcse_infra.models import ExecutionTransport, ProviderKind
+
+    store = WorkerStateStore(tmp_path / "workers.json")
+    name = "wavcse-123456789abc"
+    store.record_colab_intent(name, "T4")
+    colab_worker = Worker(
+        provider=ProviderKind.COLAB,
+        execution_transport=ExecutionTransport.COLAB_EXEC,
+        id=name,
+        name=name,
+        state=WorkerState.RUNNING,
+        gpu_type="T4",
+        gpu_count=1,
+    )
+    store.record_colab_created(colab_worker)
+    monkeypatch.setattr(cli, "_state_store", lambda: store)
+
+    class FakeColab:
+        def __init__(self, config):
+            assert config.enabled
+
+        def list_workers(self):
+            return [colab_worker]
+
+    monkeypatch.setattr(cli, "ColabClient", FakeColab)
+    monkeypatch.setattr(
+        cli.RunPodClient,
+        "from_settings",
+        lambda settings: (_ for _ in ()).throw(
+            AssertionError("Colab read should not resolve RunPod credentials")
+        ),
+    )
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[colab]\nenabled = true\n", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["--config", str(config_file), "worker", "list", "--provider", "colab"],
+        env={},
+    )
+    assert result.exit_code == 0
+    assert f"colab\t{name}\tRUNNING\tT4" in result.stdout
+    assert store.get(name).provider_absent is False
+
+
+def test_colab_pending_identity_cannot_be_released(monkeypatch, tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json")
+    name = "wavcse-123456789abc"
+    store.record_colab_intent(name, "T4")
+    monkeypatch.setattr(cli, "_state_store", lambda: store)
+    monkeypatch.setattr(
+        cli,
+        "ColabClient",
+        lambda config: (_ for _ in ()).throw(
+            AssertionError("unconfirmed ownership must not reach provider")
+        ),
+    )
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[colab]\nenabled = true\n", encoding="utf-8")
+    result = runner.invoke(
+        app, ["--config", str(config_file), "worker", "destroy", name, "--yes"], env={}
+    )
+    assert result.exit_code == 2
+    assert "lacks confirmed ownership" in result.stderr
+    assert store.get(name).create_pending
+
+
+def test_confirmed_owned_colab_session_is_released_only_after_provider_absence(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from wavcse_infra.models import ExecutionTransport, ProviderKind
+
+    name = "wavcse-123456789abc"
+    state = WorkerStateStore(tmp_path / "workers.json")
+    state.record_colab_intent(name, "T4")
+    worker = Worker(
+        provider=ProviderKind.COLAB,
+        execution_transport=ExecutionTransport.COLAB_EXEC,
+        id=name,
+        name=name,
+        state=WorkerState.RUNNING,
+        gpu_type="T4",
+        gpu_count=1,
+    )
+    state.record_colab_created(worker)
+    monkeypatch.setattr(cli, "_state_store", lambda: state)
+    operations: list[str] = []
+
+    class FakeColab:
+        def __init__(self, config):
+            assert config.enabled
+
+        def get_worker(self, requested: str) -> Worker:
+            assert requested == name
+            return worker
+
+        def destroy_worker(self, record) -> None:
+            assert record.infra_identity == name and not record.create_pending
+            operations.append("release")
+
+        def list_workers(self) -> list[Worker]:
+            assert operations == ["release"]
+            return []
+
+    monkeypatch.setattr(cli, "ColabClient", FakeColab)
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[colab]\nenabled = true\n", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["--config", str(config_file), "worker", "destroy", name, "--yes"],
+        env={},
+    )
+    assert result.exit_code == 0
+    assert f"terminal release target: {name}" in result.stdout
+    assert state.get(name).provider_absent
+    assert operations == ["release"]
+
+
+def test_colab_job_submission_is_refused_before_job_state_or_provider_contact(
+    monkeypatch, tmp_path: Path
+) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json")
+    name = "wavcse-123456789abc"
+    store.record_colab_intent(name, "T4")
+    monkeypatch.setattr(cli, "_state_store", lambda: store)
+    monkeypatch.setattr(
+        cli.RunPodClient,
+        "from_settings",
+        lambda settings: (_ for _ in ()).throw(
+            AssertionError("a Colab job must not dispatch over RunPod SSH")
+        ),
+    )
+    spec = tmp_path / "job.json"
+    spec.write_text("{}", encoding="utf-8")
+    result = runner.invoke(app, ["job", "submit", str(spec), "--worker", name], env={})
+    assert result.exit_code == 2
+    assert "Colab worker" in result.stderr
+    assert "submit a recorded job over SSH" in result.stderr
+    assert not list(tmp_path.glob("job-*.json"))
+
+
 def test_worker_list_requires_resolvable_credential(monkeypatch) -> None:
     resolver = Mock(
         side_effect=CredentialError(

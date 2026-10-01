@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -20,11 +21,13 @@ from wavcse_infra.config import Settings, load_settings, resolved_config_path
 from wavcse_infra.doctor import CheckStatus, DoctorReport, run_doctor
 from wavcse_infra.errors import (
     ConfigurationError,
+    CostGuardError,
     InfraError,
     JobError,
     JobSpecError,
     ProviderError,
     ProviderNotFoundError,
+    ProviderOperationAmbiguousError,
     ResourceUnavailableError,
     SshEndpointUnavailableError,
     StateError,
@@ -50,6 +53,7 @@ from wavcse_infra.models import (
     NetworkVolume,
     NetworkVolumeCreationPlan,
     NetworkVolumeSpec,
+    ProviderKind,
     VolumeType,
     Worker,
     WorkerConnectionInfo,
@@ -58,6 +62,7 @@ from wavcse_infra.models import (
     WorkerSpec,
     WorkerState,
 )
+from wavcse_infra.providers.colab import ColabClient
 from wavcse_infra.providers.runpod import RunPodClient, network_volume_create_payload
 from wavcse_infra.redaction import redact
 from wavcse_infra.state import (
@@ -98,7 +103,7 @@ app = typer.Typer(
     pretty_exceptions_enable=False,
 )
 config_app = typer.Typer(help="Validate controller configuration.", no_args_is_help=True)
-worker_app = typer.Typer(help="Manage RunPod GPU workers.", no_args_is_help=True)
+worker_app = typer.Typer(help="Manage RunPod and Colab workers.", no_args_is_help=True)
 volume_app = typer.Typer(
     help="Manage persistent RunPod network volumes.",
     no_args_is_help=True,
@@ -207,6 +212,10 @@ def doctor_command(context: typer.Context) -> None:
 @worker_app.command("list")
 def list_workers(
     context: typer.Context,
+    provider: Annotated[
+        ProviderKind | None,
+        typer.Option("--provider", case_sensitive=False, help="Inspect only one provider."),
+    ] = None,
     read_only: Annotated[
         bool,
         typer.Option("--read-only", help="Inspect provider state without updating local records."),
@@ -215,46 +224,59 @@ def list_workers(
         bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
     ] = False,
 ) -> None:
-    """List RunPod workers and reconcile tracked local metadata."""
+    """Reconcile workers against the selected provider or all enabled providers."""
 
     settings = _load_cli_settings(_context(context))
+    workers: list[Worker] = []
+    active_provider = "Colab" if provider is ProviderKind.COLAB else "RunPod"
     try:
-        with RunPodClient.from_settings(settings) as client:
-            workers = client.list_workers()
-        if not read_only:
-            _reconcile_state(workers)
+        if provider is not ProviderKind.COLAB:
+            with RunPodClient.from_settings(settings) as client:
+                runpod_workers = client.list_workers()
+            workers.extend(runpod_workers)
+            if not read_only:
+                _reconcile_state(runpod_workers)
+        if provider is ProviderKind.COLAB or (provider is None and settings.colab.enabled):
+            active_provider = "Colab"
+            colab_client = _colab_client(settings)
+            colab_workers = colab_client.list_workers()
+            workers.extend(colab_workers)
+            if not read_only:
+                _reconcile_colab_state(colab_workers)
     except ConfigurationError as exc:
         _configuration_failure(exc)
     except ProviderError as exc:
-        _provider_failure(exc)
+        _provider_failure(exc, provider=active_provider)
     if json_output:
         _print_json([worker.model_dump(mode="json") for worker in workers])
         return
     if not workers:
-        typer.echo("No RunPod workers found.")
+        typer.echo("No workers found." if settings.colab.enabled else "No RunPod workers found.")
         return
 
-    typer.echo("ID\tSTATE\tGPU\tCOUNT\tCLOUD\tCOST/HR\tNAME")
+    if settings.colab.enabled:
+        typer.echo("PROVIDER\tID\tSTATE\tGPU\tCOUNT\tCLOUD\tCOST/HR\tNAME")
+    else:
+        typer.echo("ID\tSTATE\tGPU\tCOUNT\tCLOUD\tCOST/HR\tNAME")
     for worker in workers:
+        values = (
+            worker.id,
+            worker.state.value,
+            worker.gpu_type or "-",
+            str(worker.gpu_count) if worker.gpu_count is not None else "-",
+            worker.cloud_type.value if worker.cloud_type is not None else "-",
+            _money(worker.hourly_cost),
+            worker.name or "-",
+        )
         typer.echo(
-            "\t".join(
-                (
-                    worker.id,
-                    worker.state.value,
-                    worker.gpu_type or "-",
-                    str(worker.gpu_count) if worker.gpu_count is not None else "-",
-                    worker.cloud_type.value if worker.cloud_type is not None else "-",
-                    _money(worker.hourly_cost),
-                    worker.name or "-",
-                )
-            )
+            "\t".join((worker.provider.value, *values) if settings.colab.enabled else values)
         )
 
 
 @worker_app.command("show")
 def show_worker(
     context: typer.Context,
-    worker_id: Annotated[str, typer.Argument(help="Exact RunPod worker ID.")],
+    worker_id: Annotated[str, typer.Argument(help="Exact worker ID or Colab session name.")],
     read_only: Annotated[
         bool, typer.Option("--read-only", help="Inspect without updating local records.")
     ] = False,
@@ -262,12 +284,19 @@ def show_worker(
         bool, typer.Option("--json", help="Render normalized machine-readable JSON.")
     ] = False,
 ) -> None:
-    """Show one RunPod worker by exact provider ID."""
+    """Show one tracked worker from its authoritative provider."""
 
     settings = _load_cli_settings(_context(context))
+    record = _state_record(worker_id)
+    active_provider = (
+        "Colab" if record is not None and record.provider is ProviderKind.COLAB else "RunPod"
+    )
     try:
-        with RunPodClient.from_settings(settings) as client:
-            worker = client.get_worker(worker_id)
+        if record is not None and record.provider is ProviderKind.COLAB:
+            worker = _colab_client(settings).get_worker(worker_id)
+        else:
+            with RunPodClient.from_settings(settings) as client:
+                worker = client.get_worker(worker_id)
         if not read_only:
             _observe_state(worker)
     except ConfigurationError as exc:
@@ -275,9 +304,9 @@ def show_worker(
     except ProviderNotFoundError as exc:
         if not read_only:
             _mark_state_destroyed(worker_id)
-        _provider_failure(exc)
+        _provider_failure(exc, provider=active_provider)
     except ProviderError as exc:
-        _provider_failure(exc)
+        _provider_failure(exc, provider=active_provider)
     if json_output:
         _print_json(worker.model_dump(mode="json"))
     else:
@@ -356,11 +385,15 @@ def list_gpu_types(
 @worker_app.command("create")
 def create_worker(
     context: typer.Context,
-    gpu: Annotated[str, typer.Option("--gpu", help="Exact RunPod GPU type ID.")],
+    gpu: Annotated[str, typer.Option("--gpu", help="Exact provider accelerator ID.")],
     cloud: Annotated[
-        CloudType,
-        typer.Option("--cloud", case_sensitive=False, help="RunPod cloud tier."),
-    ],
+        CloudType | None,
+        typer.Option("--cloud", case_sensitive=False, help="Required RunPod cloud tier."),
+    ] = None,
+    provider: Annotated[
+        ProviderKind,
+        typer.Option("--provider", case_sensitive=False, help="Execution provider."),
+    ] = ProviderKind.RUNPOD,
     image: Annotated[
         str | None,
         typer.Option("--image", help="Container image; mutually exclusive with --template."),
@@ -431,15 +464,49 @@ def create_worker(
         bool, typer.Option("--yes", help="Bypass only the interactive creation confirmation.")
     ] = False,
 ) -> None:
-    """Plan, confirm, create, persist, and wait for one RunPod Pod.
-
-    A Pod that mounts a network volume is constrained to that volume's data center before any
-    paid request is issued, because RunPod can only place it there. If the requested GPU has
-    no confirmed capacity in that data center, the command fails while it is still free to do
-    so.
-    """
+    """Plan and confirm one provider resource without guessing its price."""
 
     settings = _load_cli_settings(_context(context))
+    if provider is ProviderKind.COLAB:
+        try:
+            client = _colab_client(settings)
+            if (
+                cloud is not None
+                or image is not None
+                or template is not None
+                or gpu_count != 1
+                or container_disk != 20
+                or volume_gb != 0
+                or volume_mount_path is not None
+                or network_volume_id is not None
+                or data_center
+                or interruptible
+                or start_ssh
+                or require_direct_ssh
+            ):
+                raise ConfigurationError(
+                    "Colab does not accept RunPod cloud, image, disk, volume, "
+                    "interruptibility, or SSH placement options"
+                )
+            # Colab CLI reports account-level compute units, but does not expose a
+            # provider-observed hourly USD price for this selected accelerator.
+            # --yes and a guessed price may never bypass the project cost guard.
+            client.version()
+            typer.echo(f"Colab account usage (read-only): {client.usage()}")
+            _parse_price(max_price)
+            raise CostGuardError(
+                f"Colab {gpu} allocation refused: CLI 0.7.4 does not report an "
+                "hourly price for this accelerator, so --max-price cannot be enforced. "
+                "No session was allocated; --yes does not override the cost guard"
+            )
+        except ConfigurationError as exc:
+            _configuration_failure(exc)
+        except ProviderError as exc:
+            _provider_failure(exc, provider="Colab")
+        except InfraError as exc:
+            _operation_failure(exc)
+    if cloud is None:
+        raise typer.BadParameter("RunPod --cloud is required")
     try:
         with RunPodClient.from_settings(settings) as client:
             volume = (
@@ -517,6 +584,7 @@ def wait_for_worker_ssh(
 
     settings = _load_cli_settings(_context(context))
     try:
+        _require_runpod_transport(worker_id, "wait for SSH")
         with RunPodClient.from_settings(settings) as client:
             _, waiter = _worker_access(client, settings)
             result = waiter.wait(worker_id, timeout_seconds=wait_timeout)
@@ -545,6 +613,7 @@ def ssh_worker(
 
     settings = _load_cli_settings(_context(context))
     try:
+        _require_runpod_transport(worker_id, "open an SSH session")
         with RunPodClient.from_settings(settings) as client:
             worker = client.get_worker(worker_id)
         _observe_state(worker)
@@ -592,6 +661,7 @@ def exec_worker(
         raise typer.BadParameter("a remote command is required after `--`")
     settings = _load_cli_settings(_context(context))
     try:
+        _require_runpod_transport(worker_id, "run an arbitrary SSH command")
         with RunPodClient.from_settings(settings) as client:
             executor, waiter = _ssh_access(client, settings)
             ready = waiter.wait(worker_id, timeout_seconds=wait_timeout)
@@ -634,6 +704,7 @@ def bootstrap_worker(
 
     settings = _load_cli_settings(_context(context))
     try:
+        _require_runpod_transport(worker_id, "run the RunPod bootstrap")
         with RunPodClient.from_settings(settings) as client:
             bootstrapper, _ = _worker_access(client, settings)
             report = bootstrapper.bootstrap(
@@ -677,6 +748,7 @@ def health_worker(
 
     settings = _load_cli_settings(_context(context))
     try:
+        _require_runpod_transport(worker_id, "run RunPod health checks")
         with RunPodClient.from_settings(settings) as client:
             bootstrapper, _ = _worker_access(client, settings)
             report = bootstrapper.health(
@@ -708,6 +780,7 @@ def start_worker(
 
     settings = _load_cli_settings(_context(context))
     try:
+        _require_runpod_transport(worker_id, "start a stopped Pod")
         with RunPodClient.from_settings(settings) as client:
             worker = _lifecycle(client, settings).start(
                 worker_id,
@@ -736,6 +809,7 @@ def stop_worker(
 
     settings = _load_cli_settings(_context(context))
     try:
+        _require_runpod_transport(worker_id, "stop resumable compute")
         with RunPodClient.from_settings(settings) as client:
             worker = _lifecycle(client, settings).stop(
                 worker_id,
@@ -759,7 +833,7 @@ def destroy_worker(
     context: typer.Context,
     worker_id: Annotated[
         str,
-        typer.Argument(help="Exact RunPod worker ID; names are not accepted."),
+        typer.Argument(help="Exact RunPod ID or tracked Colab session identity."),
     ],
     wait_timeout: Annotated[
         float | None,
@@ -769,9 +843,50 @@ def destroy_worker(
         bool, typer.Option("--yes", help="Bypass only the interactive destroy confirmation.")
     ] = False,
 ) -> None:
-    """Permanently terminate one exact-ID Pod after explicit confirmation."""
+    """Permanently terminate one exact, owned worker after confirmation."""
 
     settings = _load_cli_settings(_context(context))
+    record = _state_record(worker_id)
+    if record is not None and record.provider is ProviderKind.COLAB:
+        try:
+            if (
+                record.infra_identity != worker_id
+                or record.provider_worker_id != worker_id
+                or record.create_pending
+                or record.provider_absent
+            ):
+                raise ConfigurationError(
+                    f"Colab session {worker_id} lacks confirmed ownership; "
+                    "refusing terminal release"
+                )
+            client = _colab_client(settings)
+            try:
+                target = client.get_worker(worker_id)
+            except ProviderNotFoundError:
+                _mark_state_destroyed(worker_id)
+                typer.echo(f"Colab session {worker_id} is already absent.")
+                return
+            typer.echo(f"Colab terminal release target: {target.id} ({target.gpu_type or 'CPU'})")
+            if not yes and not typer.confirm(
+                f"Terminate exact infra-owned Colab session {worker_id}?"
+            ):
+                typer.echo("Release cancelled; session unchanged.")
+                return
+            # Do not repeat a mutation whose acknowledgement was lost.
+            with suppress(ProviderOperationAmbiguousError):
+                client.destroy_worker(record)
+            if any(worker.id == worker_id for worker in client.list_workers()):
+                raise ProviderOperationAmbiguousError(
+                    f"Colab stop of {worker_id} is not confirmed absent; inspect "
+                    "infra worker list --provider colab before taking further action"
+                )
+            _mark_state_destroyed(worker_id)
+            typer.echo(f"Colab session {worker_id} was terminated and is absent.")
+            return
+        except ConfigurationError as exc:
+            _configuration_failure(exc)
+        except ProviderError as exc:
+            _provider_failure(exc, provider="Colab")
     try:
         with RunPodClient.from_settings(settings) as client:
             lifecycle = _lifecycle(client, settings)
@@ -1532,6 +1647,7 @@ def download_artifact(
 
     settings = _load_cli_settings(_context(context))
     try:
+        _require_runpod_transport(worker, "transfer presigned artifacts over SSH")
         with RunPodClient.from_settings(settings) as client:
             result = _worker_transfer(client, settings).download(
                 worker,
@@ -1605,6 +1721,7 @@ def upload_artifact(
 
     settings = _load_cli_settings(_context(context))
     try:
+        _require_runpod_transport(worker, "transfer presigned artifacts over SSH")
         with RunPodClient.from_settings(settings) as client:
             outcome = _worker_transfer(client, settings).upload(
                 worker,
@@ -1670,6 +1787,7 @@ def submit_job(
 
     settings = _load_cli_settings(_context(context))
     try:
+        _require_runpod_transport(worker, "submit a recorded job over SSH")
         spec = _load_job_spec_file(job_spec)
         with RunPodClient.from_settings(settings) as client:
             job_context = _job_context(client, settings)
@@ -2230,6 +2348,30 @@ def _load_manifest_file(path: Path | None) -> ArtifactManifest | None:
     return load_manifest_json(text)
 
 
+def _require_runpod_transport(worker_id: str, operation: str) -> None:
+    record = _state_record(worker_id)
+    if record is not None and record.provider is ProviderKind.COLAB:
+        raise ConfigurationError(
+            f"Colab worker {worker_id} cannot {operation}: that operation requires "
+            "RunPod SSH or a resumable Pod. Colab destroy is terminal"
+        )
+
+
+def _colab_client(settings: Settings) -> ColabClient:
+    if not settings.colab.enabled:
+        raise ConfigurationError(
+            "Colab is disabled; set colab.enabled = true in the controller TOML"
+        )
+    return ColabClient(settings.colab)
+
+
+def _reconcile_colab_state(workers: list[Worker]) -> None:
+    try:
+        _state_store().reconcile(workers, provider=ProviderKind.COLAB)
+    except StateError as exc:
+        typer.echo(f"State warning: {redact(exc)}", err=True)
+
+
 def _reconcile_state(workers: list[Worker]) -> None:
     try:
         _state_store().reconcile(workers)
@@ -2591,8 +2733,8 @@ def _configuration_failure(exc: Exception) -> Never:
     raise typer.Exit(code=2) from exc
 
 
-def _provider_failure(exc: Exception) -> Never:
-    typer.echo(f"RunPod error: {redact(exc)}", err=True)
+def _provider_failure(exc: Exception, *, provider: str = "RunPod") -> Never:
+    typer.echo(f"{provider} error: {redact(exc)}", err=True)
     raise typer.Exit(code=1) from exc
 
 
