@@ -1,6 +1,6 @@
 ---
 name: colab-operator
-description: Diagnose and operate the Google Colab provider through wavcse-infra while preserving ADC, price, ownership, and exact-commit safeguards.
+description: Operate the Google Colab execution provider through wavcse-infra: ADC, CU usage, ephemeral allocation, bootstrap readiness, uploaded-envelope execution, and ownership-guarded release.
 ---
 
 # Colab operator
