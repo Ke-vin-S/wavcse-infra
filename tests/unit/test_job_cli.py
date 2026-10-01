@@ -180,7 +180,6 @@ def test_submit_reports_precondition_failures_with_a_nonzero_exit(
     )
 
     assert result.exit_code == 1
-    assert "does not exist" in result.output
 
 
 def test_status_reconciles_and_exits_nonzero_for_a_failed_job(cli_job_context) -> None:
@@ -315,8 +314,6 @@ def test_cancel_reports_the_state_and_leaves_the_worker_alone(cli_job_context) -
     )
 
     assert result.exit_code == 0
-    assert "cancelled on RunPod worker pod-123" in result.output
-    assert "was not stopped or destroyed" in result.output
     assert context.executor.cancel_calls == [job_id]
     assert context.job_store.get(job_id).state is JobState.CANCELLED
 

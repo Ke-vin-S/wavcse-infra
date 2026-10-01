@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 from wavcse_infra.config import ColabConfig
 from wavcse_infra.errors import (
@@ -15,6 +19,7 @@ from wavcse_infra.errors import (
     ColabAuthenticationRequiredError,
     ColabCliMissingError,
     ColabQuotaError,
+    ProviderError,
     ProviderNotFoundError,
     ProviderOperationAmbiguousError,
     ProviderResponseError,
@@ -41,6 +46,36 @@ _SESSION_LINE = re.compile(
     r"(?P<variant>[^|]+?)(?: \| Status: (?P<status>IDLE|BUSY(?: \([^|\n]*\))?))?$"
 )
 
+_BALANCE = re.compile(r"^Current balance: ([0-9]+(?:\.[0-9]+)?) compute units$")
+_RATE = re.compile(r"^Usage rate: ([0-9]+(?:\.[0-9]+)?)/hr$")
+_ASSIGNMENTS = re.compile(r"^Active assignments: ([0-9]+)$")
+
+
+@dataclass(frozen=True)
+class ColabUsage:
+    balance_cu: Decimal
+    rate_cu_per_hour: Decimal
+    assignments: int
+
+
+def parse_usage(text: str) -> ColabUsage:
+    """Parse the pinned CLI's rounded, account-wide CU observation; refuse missing fields."""
+
+    lines = text.strip().splitlines()
+    if len(lines) != 3:
+        raise ProviderResponseError("Colab usage returned an unrecognized CU report")
+    balance, rate, count = (
+        _BALANCE.fullmatch(lines[0]),
+        _RATE.fullmatch(lines[1]),
+        _ASSIGNMENTS.fullmatch(lines[2]),
+    )
+    if balance is None or rate is None or count is None:
+        raise ProviderResponseError("Colab usage returned an unrecognized CU report")
+    try:
+        return ColabUsage(Decimal(balance[1]), Decimal(rate[1]), int(count[1]))
+    except InvalidOperation as exc:
+        raise ProviderResponseError("Colab usage returned invalid CU values") from exc
+
 
 @dataclass(frozen=True)
 class ColabCommandResult:
@@ -62,6 +97,9 @@ class ColabClient:
     def __init__(self, config: ColabConfig, *, runner: Runner = subprocess.run) -> None:
         self.config = config
         self._runner = runner
+        # Upstream may write token-bearing state and execution history with the
+        # process umask; pre-create private directories before its first invocation.
+        self._secure_local_state()
 
     def _call(
         self,
@@ -69,7 +107,9 @@ class ColabClient:
         *args: str,
         session: str | None = None,
         timeout: float | None = None,
+        input_text: str | None = None,
     ) -> ColabCommandResult:
+        self._secure_local_state()
         if not shutil.which(self.config.cli):
             raise ColabCliMissingError(
                 f"Colab {operation} for {session or 'account'}: "
@@ -83,6 +123,7 @@ class ColabClient:
                 capture_output=True,
                 text=True,
                 timeout=timeout or self.config.command_timeout_seconds,
+                **({"input": input_text} if input_text is not None else {}),
                 check=False,
             )
         except FileNotFoundError as exc:
@@ -102,6 +143,10 @@ class ColabClient:
                 f"Colab {operation} for {session or 'account'} could not invoke CLI "
                 f"(OS error {exc.errno})"
             ) from exc
+        finally:
+            # Upstream appends history even on failed exec; restrict any file it
+            # created before returning a diagnostic to the caller.
+            self._secure_local_state()
         result = ColabCommandResult(
             operation, session, completed.returncode, completed.stdout, completed.stderr
         )
@@ -232,12 +277,78 @@ class ColabClient:
             raise ProviderResponseError("Colab usage returned an empty result")
         return redact(result.stdout.strip())
 
-    def create_worker(self, name: str, gpu: str) -> Worker:
+    def usage_snapshot(self) -> ColabUsage:
+        """Obtain numeric account observations without inferring a USD price."""
+
+        return parse_usage(self.usage())
+
+    def upload_file(self, name: str, local_path: Path, remote_path: str) -> None:
         self._validate_name(name)
+        self._call("upload", "-s", name, str(local_path), remote_path, session=name)
+
+    def download_file(self, name: str, remote_path: str, local_path: Path) -> None:
+        self._validate_name(name)
+        self._call("download", "-s", name, remote_path, str(local_path), session=name)
+
+    def remove_file(self, name: str, remote_path: str) -> None:
+        self._validate_name(name)
+        self._call("rm", "-s", name, remote_path, session=name)
+
+    def exec_code(self, name: str, code: str, *, timeout: float | None = None) -> str:
+        """Execute stable non-secret source via stdin; CLI history records code and outputs."""
+
+        self._validate_name(name)
+        result = self._call(
+            "exec",
+            "-s",
+            name,
+            "--timeout",
+            str(timeout or self.config.command_timeout_seconds),
+            session=name,
+            input_text=code,
+            timeout=(timeout or self.config.command_timeout_seconds) + 30,
+        )
+        return result.stdout
+
+    @staticmethod
+    def _secure_local_state() -> None:
+        """Restrict existing CLI token/history state without deleting other users' files."""
+
+        root = Path.home() / ".config" / "colab-cli"
+        try:
+            for directory in (root, root / "history"):
+                if directory.is_symlink():
+                    raise ProviderValidationError("Colab CLI state directory must not be a symlink")
+                directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if directory.stat().st_uid != os.getuid():
+                    raise ProviderValidationError("Colab CLI state directory has another owner")
+                directory.chmod(0o700)
+            for path in (
+                root / "sessions.json",
+                root / "colab.log",
+                *(root / "history").glob("wavcse-*.jsonl"),
+            ):
+                if path.is_symlink():
+                    raise ProviderValidationError("Colab CLI state contains an unsafe symlink")
+                if path.exists():
+                    if not path.is_file() or path.stat().st_uid != os.getuid():
+                        raise ProviderValidationError("Colab CLI state contains an unsafe file")
+                    path.chmod(0o600)
+        except OSError as exc:
+            raise ProviderValidationError(
+                f"Colab CLI local state permissions could not be restricted (OS error {exc.errno})"
+            ) from exc
+
+    @staticmethod
+    def validate_gpu(gpu: str) -> None:
         if gpu not in _GPU_TYPES:
             raise ProviderValidationError(
                 f"Colab accelerator {gpu!r} is unsupported; choose " + ", ".join(sorted(_GPU_TYPES))
             )
+
+    def create_worker(self, name: str, gpu: str) -> Worker:
+        self._validate_name(name)
+        self.validate_gpu(gpu)
         self.version()
         try:
             self._call(
@@ -249,15 +360,31 @@ class ColabClient:
                 session=name,
                 timeout=self.config.lifecycle_timeout_seconds,
             )
-        except ProviderOperationAmbiguousError as exc:
-            matches = [worker for worker in self.list_workers() if worker.id == name]
+        except (ProviderOperationAmbiguousError, ProviderUnavailableError) as exc:
+            # A paid create can succeed before the CLI loses its reply; never retry it.
+            try:
+                matches = [worker for worker in self.list_workers() if worker.id == name]
+            except ProviderError:
+                matches = []
             if len(matches) == 1:
                 return matches[0]
             raise AmbiguousCreateError(
                 f"Colab allocation {name} has an unknown outcome; run infra worker list "
                 "and inspect this exact identity before any new allocation"
             ) from exc
-        return self.get_worker(name)
+        deadline = time.monotonic() + self.config.lifecycle_timeout_seconds
+        while True:
+            try:
+                return self.get_worker(name)
+            except (ProviderNotFoundError, ProviderUnavailableError) as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AmbiguousCreateError(
+                        f"Colab allocation {name} was acknowledged but provider RUNNING "
+                        "state could not be verified; reconcile this exact intent "
+                        "before another allocation"
+                    ) from exc
+                time.sleep(min(2.0, remaining))
 
     def destroy_worker(self, record: WorkerRecord) -> None:
         """Release only a confirmed locally owned exact session."""

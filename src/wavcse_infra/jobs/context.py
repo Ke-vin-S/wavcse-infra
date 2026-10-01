@@ -74,22 +74,21 @@ def require_storage(context: JobContext) -> S3Storage:
 def require_ready_worker(context: JobContext, worker_id: str) -> tuple[Worker, WorkerRecord]:
     """Return a provider-running, locally READY worker or fail with an actionable reason.
 
-    Phase 6 never bootstraps, starts, or creates a worker implicitly. The recorded local
-    readiness is what `infra worker bootstrap`/`health` last proved; submission re-proves
-    SSH and the bootstrap marker when it installs the runner and prepares the source.
+    Readiness is local evidence, not the provider's RUNNING state alone. The
+    reviewed runner re-verifies source and bootstrap before starting a command.
     """
 
     try:
         worker = context.provider.get_worker(worker_id)
     except ProviderNotFoundError as exc:
         raise JobPreconditionError(
-            f"RunPod worker {worker_id} does not exist; create the worker explicitly and "
-            "run `infra worker bootstrap <worker-id>` before submitting a job"
+            f"Worker {worker_id} no longer exists at its provider; create or restore "
+            "the exact worker and bootstrap it before submitting a job"
         ) from exc
     if worker.state is not WorkerState.RUNNING:
         raise JobPreconditionError(
-            f"RunPod worker {worker_id} is {worker.state.value}; a recorded job requires a "
-            "RUNNING worker. Start it explicitly and re-check readiness"
+            f"Worker {worker_id} is {worker.state.value}; a recorded job requires a "
+            "RUNNING provider session"
         )
     record = context.worker_state.get(worker_id)
     if record is None:
@@ -97,6 +96,8 @@ def require_ready_worker(context: JobContext, worker_id: str) -> tuple[Worker, W
             f"Worker {worker_id} is not tracked locally, so its readiness is unknown; run "
             "`infra worker bootstrap <worker-id>` on this controller first"
         )
+    if record.provider is not worker.provider or record.provider_absent or record.create_pending:
+        raise JobPreconditionError(f"Worker {worker_id} has no confirmed matching owned lease")
     if record.readiness_state is not WorkerReadinessState.READY:
         raise JobPreconditionError(
             f"Worker {worker_id} local readiness is {record.readiness_state.value}, not READY; "

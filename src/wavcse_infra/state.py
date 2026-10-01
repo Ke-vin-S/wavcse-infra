@@ -120,6 +120,9 @@ class WorkerRecord(BaseModel):
     requested_cloud_type: CloudType | None = None
     actual_cloud_type: CloudType | None = None
     known_hourly_price: Decimal | None = Field(default=None, ge=0)
+    observed_rate_cu_per_hour: Decimal | None = Field(default=None, ge=0)
+    baseline_rate_cu_per_hour: Decimal | None = Field(default=None, ge=0)
+    baseline_assignments_count: int | None = Field(default=None, ge=0)
     image: str | None = None
     template_id: str | None = None
     container_disk_gb: int | None = Field(default=None, ge=1)
@@ -255,6 +258,14 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
         if re.fullmatch(r"wavcse-[0-9a-f]{12,32}", name) is None:
             raise StateError("Colab allocation requires a generated wavcse- identity")
         document = self._load()
+        if any(
+            record.provider is ProviderKind.COLAB and not record.provider_absent
+            for record in document.workers.values()
+        ):
+            raise UnresolvedCreateError(
+                "One infra-owned Colab lease or unresolved allocation intent already exists; "
+                "release it or reconcile its exact identity before allocating another"
+            )
         if name in document.workers:
             raise UnresolvedCreateError(
                 f"Colab session {name} already has a local allocation intent; "
@@ -302,6 +313,72 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
             }
         )
         document.workers[worker.id] = updated
+        self._write(document)
+        return updated
+
+    @_serialized
+    def record_colab_ready(
+        self,
+        worker_id: str,
+        *,
+        gpu_model: str,
+        rate: Decimal,
+        disk_bytes: int,
+        baseline_rate: Decimal | None = None,
+        baseline_assignments: int | None = None,
+    ) -> WorkerRecord:
+        document = self._load()
+        existing = document.workers.get(worker_id)
+        if (
+            existing is None
+            or existing.provider is not ProviderKind.COLAB
+            or existing.create_pending
+        ):
+            raise StateError(f"Colab session {worker_id} has no confirmed owned allocation")
+        now = self._now()
+        updated = existing.model_copy(
+            update={
+                "readiness_state": WorkerReadinessState.READY,
+                "health_status": "READY",
+                "bootstrap_version": "colab-1",
+                "last_bootstrap_at": now,
+                "last_health_check_at": now,
+                "observed_gpu_models": (gpu_model,),
+                "disk_path": "/content",
+                "disk_available_bytes": disk_bytes,
+                "observed_rate_cu_per_hour": rate,
+                "baseline_rate_cu_per_hour": (
+                    baseline_rate
+                    if baseline_rate is not None
+                    else existing.baseline_rate_cu_per_hour
+                ),
+                "baseline_assignments_count": (
+                    baseline_assignments
+                    if baseline_assignments is not None
+                    else existing.baseline_assignments_count
+                ),
+            }
+        )
+        document.workers[worker_id] = updated
+        self._write(document)
+        return updated
+
+    @_serialized
+    def mark_colab_failed(self, worker_id: str) -> WorkerRecord | None:
+        """A failed Colab recheck invalidates previous readiness on ephemeral scratch."""
+
+        document = self._load()
+        existing = document.workers.get(worker_id)
+        if existing is None or existing.provider is not ProviderKind.COLAB:
+            return None
+        updated = existing.model_copy(
+            update={
+                "readiness_state": WorkerReadinessState.FAILED,
+                "health_status": "FAILED",
+                "last_health_check_at": self._now(),
+            }
+        )
+        document.workers[worker_id] = updated
         self._write(document)
         return updated
 

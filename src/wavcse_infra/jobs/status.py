@@ -54,9 +54,8 @@ from wavcse_infra.models import Worker, WorkerState
 from wavcse_infra.workers.ssh import remote_outcome_is_unknown
 
 # A provider state says whether the worker can be reached, not whether the command failed.
-# The workspace survives a stop/start cycle, so every state a started worker can return from
-# keeps the job reconcilable; only states that mean the workspace is gone for good can make
-# the recorded outcome unreadable.
+# RunPod can retain a stopped volume; Colab has no resumable stop and any lost
+# session loses its scratch state. The provider-specific branch below enforces it.
 _UNRECOVERABLE_WORKER_STATES = frozenset(
     {
         WorkerState.TERMINATING,
@@ -131,9 +130,9 @@ class JobCoordinator:
             return RefreshResult(
                 self._mark_failed(
                     record,
-                    f"RunPod worker {record.worker_id} no longer exists, so the job outcome "
-                    "is unknown; the worker was destroyed or terminated before it reported "
-                    "completion",
+                    f"{record.provenance.provider} worker {record.worker_id} no longer "
+                    "exists, so the job outcome is unknown; the worker was destroyed "
+                    "or terminated before it reported completion",
                     worker_absent=True,
                     remote_status="worker_absent",
                 )
@@ -152,12 +151,22 @@ class JobCoordinator:
                 return RefreshResult(
                     self._mark_failed(
                         record,
-                        f"RunPod worker {record.worker_id} reached {worker.state.value}, so the "
-                        "workspace that held this job is gone and its outcome can no longer be "
-                        "read; the job cannot be verified as successful",
+                        f"{record.provenance.provider} worker {record.worker_id} reached "
+                        f"{worker.state.value}; the workspace that held this job is gone "
+                        "and its outcome can no longer be read or verified as successful",
                         worker_absent=worker.state
                         in {WorkerState.TERMINATING, WorkerState.DESTROYED},
                         remote_status=f"worker_{worker.state.value.lower()}",
+                    )
+                )
+            if worker.provider.value == "colab":
+                return RefreshResult(
+                    self._mark_failed(
+                        record,
+                        f"Colab session {record.worker_id} is {worker.state.value}; "
+                        "ephemeral scratch cannot be resumed or treated as durable",
+                        worker_absent=True,
+                        remote_status="session_lost",
                     )
                 )
             # A stopped or restarting worker is not evidence about the job: its disk, and
@@ -247,8 +256,8 @@ class JobCoordinator:
             )
         except ProviderNotFoundError as exc:
             raise JobExecutionError(
-                f"RunPod worker {record.worker_id} no longer exists, so the remote log for job "
-                f"{job_id} cannot be read: {exc}"
+                f"{record.provenance.provider} worker {record.worker_id} no longer "
+                f"exists, so the remote log for job {job_id} cannot be read: {exc}"
             ) from exc
 
     def cancel(self, job_id: str) -> JobRecord:
@@ -269,8 +278,8 @@ class JobCoordinator:
         except ProviderNotFoundError:
             return self._mark_failed(
                 record,
-                f"RunPod worker {record.worker_id} no longer exists; nothing was running to "
-                "cancel and the job outcome is unknown",
+                f"{record.provenance.provider} worker {record.worker_id} no longer exists; "
+                "nothing was running to cancel and the job outcome is unknown",
                 worker_absent=True,
                 remote_status="worker_absent",
             )

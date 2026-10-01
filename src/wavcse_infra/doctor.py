@@ -167,6 +167,14 @@ def run_doctor(
         _mlflow_check(active_probes, settings, timeout),
     ]
     if settings.colab.enabled:
+        # A usable Colab primary does not require a RunPod token. Report the
+        # fallback's absence without marking unrelated Colab readiness failed.
+        for index, check in enumerate(checks):
+            unavailable = check.name in {"RunPod credential", "RunPod connectivity"}
+            if unavailable and check.status is CheckStatus.FAIL:
+                checks[index] = DoctorCheck(
+                    check.name, CheckStatus.WARN, f"RunPod fallback unavailable: {check.detail}"
+                )
         checks.extend(_colab_checks(settings))
     return DoctorReport(checks=tuple(checks))
 
@@ -194,6 +202,20 @@ def _colab_checks(settings: Settings) -> list[DoctorCheck]:
             DoctorCheck("Colab API/session access", CheckStatus.PASS, "sessions readable"),
         )
     )
+    try:
+        usage = client.usage_snapshot()
+        checks.append(
+            DoctorCheck(
+                "Colab compute units",
+                CheckStatus.PASS
+                if usage.balance_cu >= settings.colab.minimum_balance_cu
+                else CheckStatus.FAIL,
+                f"balance {usage.balance_cu} CU, aggregate rate {usage.rate_cu_per_hour} CU/hour, "
+                f"assignments {usage.assignments}",
+            )
+        )
+    except ProviderError as exc:
+        checks.append(DoctorCheck("Colab compute units", CheckStatus.FAIL, redact(exc)))
     return checks
 
 
