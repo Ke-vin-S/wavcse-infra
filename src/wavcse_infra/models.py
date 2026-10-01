@@ -10,6 +10,20 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+class ProviderKind(StrEnum):
+    """Identity of a worker's authoritative provider."""
+
+    RUNPOD = "runpod"
+    COLAB = "colab"
+
+
+class ExecutionTransport(StrEnum):
+    """How the controller executes on a worker, independently of its provider."""
+
+    SSH = "ssh"
+    COLAB_EXEC = "colab_exec"
+
+
 class WorkerState(StrEnum):
     """Normalized worker states exposed by the stable CLI."""
 
@@ -138,7 +152,8 @@ class Worker(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    provider: Literal["runpod"] = "runpod"
+    provider: ProviderKind = ProviderKind.RUNPOD
+    execution_transport: ExecutionTransport = ExecutionTransport.SSH
     id: str = Field(min_length=1)
     name: str | None = None
     state: WorkerState
@@ -184,7 +199,7 @@ class GpuOffer(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    provider: Literal["runpod"] = "runpod"
+    provider: ProviderKind = ProviderKind.RUNPOD
     gpu_type_id: str = Field(min_length=1)
     display_name: str = Field(min_length=1)
     memory_gb: int | None = Field(default=None, ge=0)
@@ -199,7 +214,7 @@ class GpuOffer(BaseModel):
 
 
 class WorkerSpec(BaseModel):
-    """Explicit provider-neutral request used to create one GPU worker."""
+    """RunPod Pod creation request; other providers have distinct allocation contracts."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

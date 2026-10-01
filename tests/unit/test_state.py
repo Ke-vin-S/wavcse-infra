@@ -13,8 +13,10 @@ from wavcse_infra.errors import StateError
 from wavcse_infra.models import (
     Availability,
     CloudType,
+    ExecutionTransport,
     GpuOffer,
     HealthCheckStatus,
+    ProviderKind,
     Worker,
     WorkerConnectionInfo,
     WorkerCreationPlan,
@@ -205,6 +207,45 @@ def test_state_document_is_versioned_json(tmp_path: Path) -> None:
 
     assert payload["version"] == 1
     assert list(payload["workers"]) == ["pod-123"]
+
+
+def test_colab_intent_and_provider_scoped_reconciliation_preserve_runpod(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+    store.record_created(_plan(), _worker(state=WorkerState.RUNNING))
+    intent = store.record_colab_intent("wavcse-123456789abc", "T4")
+    assert intent.execution_transport is ExecutionTransport.COLAB_EXEC
+    assert intent.requested_cloud_type is None
+    assert intent.image is None
+    assert intent.create_pending
+    assert store.provider_for("wavcse-123456789abc") is ProviderKind.COLAB
+
+    # A RunPod-only listing cannot declare Colab absent; a missing Colab listing
+    # cannot clear an unresolved, potentially billable allocation intent.
+    store.reconcile([_worker(state=WorkerState.RUNNING)])
+    store.reconcile([], provider=ProviderKind.COLAB)
+    assert store.get("pod-123").last_observed_state is WorkerState.RUNNING
+    assert store.get("wavcse-123456789abc").create_pending
+
+    colab = Worker(
+        provider=ProviderKind.COLAB,
+        execution_transport=ExecutionTransport.COLAB_EXEC,
+        id="wavcse-123456789abc",
+        name="wavcse-123456789abc",
+        state=WorkerState.RUNNING,
+        gpu_type="T4",
+        gpu_count=1,
+    )
+    store.reconcile([colab], provider=ProviderKind.COLAB)
+    adopted = store.get("wavcse-123456789abc")
+    assert not adopted.create_pending
+    assert adopted.actual_gpu_type == "T4"
+    observed = store.record_colab_created(colab)
+    assert observed.actual_gpu_type == "T4"
+    assert not observed.create_pending
+    store.reconcile([colab], provider=ProviderKind.COLAB)
+    assert store.get("pod-123").last_observed_state is WorkerState.RUNNING
+    store.reconcile([], provider=ProviderKind.COLAB)
+    assert store.get("wavcse-123456789abc").provider_absent
 
 
 def test_readiness_transitions_persist_health_and_reset_when_stopped(tmp_path: Path) -> None:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import tempfile
 import threading
 from collections.abc import Callable, Iterable, Iterator
@@ -28,8 +29,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from wavcse_infra.errors import StateError, UnresolvedCreateError
 from wavcse_infra.models import (
     CloudType,
+    ExecutionTransport,
     NetworkVolume,
     NetworkVolumeSpec,
+    ProviderKind,
     VolumeType,
     Worker,
     WorkerConnectionInfo,
@@ -105,7 +108,8 @@ class WorkerRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    provider: str = "runpod"
+    provider: ProviderKind = ProviderKind.RUNPOD
+    execution_transport: ExecutionTransport = ExecutionTransport.SSH
     provider_worker_id: str = Field(min_length=1)
     infra_identity: str = Field(min_length=1)
     name: str | None = None
@@ -113,13 +117,13 @@ class WorkerRecord(BaseModel):
     actual_gpu_type: str | None = None
     requested_gpu_count: int = Field(ge=1)
     actual_gpu_count: int | None = Field(default=None, ge=0)
-    requested_cloud_type: CloudType
+    requested_cloud_type: CloudType | None = None
     actual_cloud_type: CloudType | None = None
     known_hourly_price: Decimal | None = Field(default=None, ge=0)
     image: str | None = None
     template_id: str | None = None
-    container_disk_gb: int = Field(ge=1)
-    volume_gb: int = Field(ge=0)
+    container_disk_gb: int | None = Field(default=None, ge=1)
+    volume_gb: int | None = Field(default=None, ge=0)
     network_volume_id: str | None = None
     # The mount path of the network volume, when the Pod has one. It is provider-reported at
     # creation and is the cache root the worker derives its rebuildable artifact cache from;
@@ -145,6 +149,8 @@ class WorkerRecord(BaseModel):
     disk_path: str | None = None
     disk_available_bytes: int | None = Field(default=None, ge=0)
     provider_absent: bool = False
+    # Written before Colab allocation, so a lost response cannot invite another allocation.
+    create_pending: bool = False
 
 
 class _StateDocument(BaseModel):
@@ -243,6 +249,63 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
         return self._load().workers.get(worker_id)
 
     @_serialized
+    def record_colab_intent(self, name: str, gpu: str) -> WorkerRecord:
+        """Durably claim an exact generated identity before a potentially billable allocation."""
+
+        if re.fullmatch(r"wavcse-[0-9a-f]{12,32}", name) is None:
+            raise StateError("Colab allocation requires a generated wavcse- identity")
+        document = self._load()
+        if name in document.workers:
+            raise UnresolvedCreateError(
+                f"Colab session {name} already has a local allocation intent; "
+                "reconcile it with infra worker list instead of allocating again"
+            )
+        now = self._now()
+        record = WorkerRecord(
+            provider=ProviderKind.COLAB,
+            execution_transport=ExecutionTransport.COLAB_EXEC,
+            provider_worker_id=name,
+            infra_identity=name,
+            name=name,
+            requested_gpu_type=gpu,
+            requested_gpu_count=1,
+            creation_timestamp=now,
+            last_observed_state=WorkerState.PROVISIONING,
+            last_observed_at=now,
+            create_pending=True,
+        )
+        document.workers[name] = record
+        self._write(document)
+        return record
+
+    @_serialized
+    def record_colab_created(self, worker: Worker) -> WorkerRecord:
+        """Resolve an allocation intent only from a matching provider observation."""
+
+        document = self._load()
+        existing = document.workers.get(worker.id)
+        if (
+            worker.provider is not ProviderKind.COLAB
+            or existing is None
+            or existing.provider is not ProviderKind.COLAB
+            or existing.infra_identity != worker.name
+        ):
+            raise StateError(f"Colab session {worker.id} has no matching allocation intent")
+        updated = existing.model_copy(
+            update={
+                "actual_gpu_type": worker.gpu_type,
+                "actual_gpu_count": worker.gpu_count,
+                "last_observed_state": worker.state,
+                "last_observed_at": self._now(),
+                "provider_absent": False,
+                "create_pending": False,
+            }
+        )
+        document.workers[worker.id] = updated
+        self._write(document)
+        return updated
+
+    @_serialized
     def record_created(self, plan: WorkerCreationPlan, worker: Worker) -> WorkerRecord:
         now = self._now()
         connection = worker.ssh_direct or worker.ssh_proxy
@@ -287,6 +350,8 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
         existing = document.workers.get(worker.id)
         if existing is None:
             return None
+        if existing.provider != worker.provider:
+            raise StateError(f"Provider mismatch for worker {worker.id}")
         connection = worker.ssh_direct or worker.ssh_proxy
         updated = existing.model_copy(
             update={
@@ -342,8 +407,10 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
         return updated
 
     @_serialized
-    def reconcile(self, workers: Iterable[Worker]) -> None:
-        """Update only tracked records; provider reads remain authoritative."""
+    def reconcile(
+        self, workers: Iterable[Worker], *, provider: ProviderKind = ProviderKind.RUNPOD
+    ) -> None:
+        """Update only this provider's tracked records; provider reads remain authoritative."""
 
         document = self._load()
         provider_workers = {worker.id: worker for worker in workers}
@@ -352,6 +419,21 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
         now = self._now()
         updated_records = dict(document.workers)
         for worker_id, existing in document.workers.items():
+            if existing.provider is not provider:
+                continue
+            if existing.create_pending and worker_id not in provider_workers:
+                # A missing read is not proof that a pending paid allocation never happened.
+                continue
+            if existing.create_pending:
+                candidate = provider_workers[worker_id]
+                if (
+                    candidate.provider is not existing.provider
+                    or candidate.name != existing.infra_identity
+                ):
+                    raise StateError(
+                        f"Provider observation for pending worker {worker_id} "
+                        "does not match the exact allocation identity"
+                    )
             worker = provider_workers.get(worker_id)
             if worker is None:
                 updated_records[worker_id] = existing.model_copy(
@@ -394,6 +476,7 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
                         else WorkerReadinessState.NOT_READY
                     ),
                     "provider_absent": False,
+                    "create_pending": False,
                 }
             )
         self._write(document.model_copy(update={"workers": updated_records}))
@@ -511,6 +594,16 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
         records = dict(document.workers)
         records[record.provider_worker_id] = record
         self._write(document.model_copy(update={"workers": records}))
+
+    def provider_for(self, worker_id: str) -> ProviderKind:
+        """Route a tracked exact ID without guessing from its spelling."""
+
+        record = self.get(worker_id)
+        if record is None:
+            raise StateError(
+                f"Worker {worker_id} is not tracked locally; cannot infer its provider"
+            )
+        return record.provider
 
     def _load(self) -> _StateDocument:
         if not self.path.exists():

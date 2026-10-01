@@ -1,4 +1,4 @@
-"""Provider-neutral worker lifecycle decisions and bounded polling."""
+"""RunPod Pod lifecycle, pricing, placement, and bounded polling."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from wavcse_infra.state import WorkerStateStore
 
 
 class WorkerProvider(Protocol):
-    """Narrow normalized provider surface used by lifecycle decisions."""
+    """RunPod's normalized Pod/offer operations; not a multi-provider interface."""
 
     def get_worker(self, worker_id: str) -> Worker: ...
 
@@ -66,7 +66,7 @@ class DestroyResult:
 
 
 class WorkerLifecycle:
-    """Plan mutations, enforce guards, persist state, and poll boundedly."""
+    """Plan RunPod mutations, enforce guards, persist state, and poll boundedly."""
 
     def __init__(
         self,
