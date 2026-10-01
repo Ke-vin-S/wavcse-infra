@@ -19,15 +19,19 @@ cannot be deduced from a job spec. Never substitute a different accelerator
 without checking VRAM and study requirements.
 
 Colab is inexpensive for many ephemeral workloads but bills in native compute
-units. Inspect balance, current account CU/hour, maximum incremental rate, and
-estimated maximum job CU from observed rate and declared timeout. One active
-infra-owned Colab lease at a time makes before/after attribution possible.
+units. Its reported balance is the paid `paidComputeUnitsBalance`: positive means
+`PAID_CU` (inspect balance, current account CU/hour, maximum incremental rate,
+and estimated maximum job CU from observed rate and declared timeout); zero means
+best-effort `FREE_TIER` when `colab.allow_free_tier` is set, where the observed
+CU/hour is recorded but not a paid-balance gate. One active infra-owned Colab
+lease at a time makes before/after attribution possible.
 A freshly allocated session is charged while bootstrapping and may be terminated
-after a small CU charge by the post-allocation rate guard. Reuse only an exact
-infra-owned READY session with compatible accelerator, healthy provider state,
-no active local job, and acceptable cost; the same ID may run a bounded batch,
-then must be released. `/content` is scratch, not storage. Periodic checkpoint
-publication for long jobs belongs to research code, not this scheduler.
+after a small CU charge by the post-allocation rate guard in paid mode. Reuse
+only an exact infra-owned READY session with compatible accelerator, healthy
+provider state, no active local job, and acceptable cost; the same ID may run a
+bounded batch, then must be released. `/content` is scratch, not storage.
+Periodic checkpoint publication for long jobs belongs to research code, not this
+scheduler.
 
 RunPod retains USD/hour offer and ceiling, explicit cloud tier and capacity,
 SSH transport, optional network-volume cache, and resumable Pod lifecycle.

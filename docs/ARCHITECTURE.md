@@ -27,6 +27,11 @@ The components are:
 identifies its command channel. RunPod provisions Pods with an observed USD/hour
 offer, SSH, resumable stop/start and optional cache volumes. Colab allocates
 named GPU sessions against native CU policy; `stop` is terminal release.
+Colab execution has two billing modes selected by the paid CU balance:
+`PAID_CU` enforces the configured CU-budget policy, while a zero paid balance
+selects best-effort `FREE_TIER` (permitted by `colab.allow_free_tier`) whose
+reported usage rate is observation-only. The CLI's `Current balance` is
+`paidComputeUnitsBalance`, so zero paid balance is not zero compute.
 Allocation measures aggregate CU/hour and assignment count before and after
 one owned create; a failed post-allocation guard releases the exact owned
 session. Colab bootstraps via the CLI kernel and observes physical CUDA hardware.

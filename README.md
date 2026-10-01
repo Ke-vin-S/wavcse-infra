@@ -234,6 +234,7 @@ chain; no Colab credential belongs in TOML.
 enabled = true
 default_gpu = "T4"
 max_simultaneous_workers = 1
+allow_free_tier = true
 minimum_balance_cu = 5
 max_incremental_rate_cu_per_hour = 3
 max_job_cu = 10
@@ -242,8 +243,11 @@ max_job_cu = 10
 preferred_providers = ["colab", "runpod"]
 ```
 
-CU limits are configurable; no Colab USD/hour approximation is used. Job
-selection considers existing READY leases, never silent provisioning.
+The CLI's `Current balance` is the account's `paidComputeUnitsBalance`, so a
+zero balance is not zero compute entitlement: it selects best-effort
+free-tier execution when `allow_free_tier = true`. Paid CU limits apply only
+while the paid balance is positive. No Colab USD/hour approximation is used.
+Job selection considers existing READY leases, never silent provisioning.
 
 Validate without making network calls:
 

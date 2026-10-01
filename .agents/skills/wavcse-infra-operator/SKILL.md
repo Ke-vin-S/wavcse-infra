@@ -202,8 +202,10 @@ Artifact identity, manifests, transfer, cache inspection and verification intern
   `infra volume list` and inspect the printed identity before creating anything again. While a
   volume create intent is unresolved, further volume creates are refused.
 - Make native provider cost visible: RunPod requires observed USD/hour and a
-  human ceiling; Colab reports CU balance and incremental CU/hour after one
-  allocation, with possible small CU consumed before rejection. Do not silently
+  human ceiling; Colab reports paid CU balance and, after one allocation,
+  incremental CU/hour, with possible small CU consumed before a paid-mode
+  rejection. A zero paid balance is best-effort free tier when
+  `colab.allow_free_tier` is set, not a failed account. Do not silently
   fall back to an expensive resource or rerun an experiment after failure.
 - Never change the model, checkpoint, pooling, layer set, dataset membership, splits, preprocessing,
   label mapping, or precision to make a run faster or cheaper. If the cheaper resource cannot

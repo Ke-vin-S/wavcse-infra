@@ -267,9 +267,11 @@ gcloud auth application-default login \
 
 Set `[colab] enabled = true`, choose CU ceilings in the user-owned config,
 then inspect `infra doctor`, `infra provider list` and
-`infra worker list --provider colab`. No read-only check allocates compute.
-The CU limits also have environment overrides:
-`WAVCSE_INFRA_COLAB_MINIMUM_BALANCE_CU`,
+`infra worker list --provider colab`. A zero paid CU balance is a healthy free
+tier when `allow_free_tier = true`, not a failed account; only
+`allow_free_tier = false` with an insufficient paid balance fails. No read-only
+check allocates compute. The CU limits also have environment overrides:
+`WAVCSE_INFRA_COLAB_ALLOW_FREE_TIER`, `WAVCSE_INFRA_COLAB_MINIMUM_BALANCE_CU`,
 `WAVCSE_INFRA_COLAB_MAX_INCREMENTAL_RATE_CU_PER_HOUR`,
 `WAVCSE_INFRA_COLAB_MAX_JOB_CU` and existing CLI/timeout overrides. A missing
 or expired ADC requires the human login above; do not automate it.
@@ -284,13 +286,17 @@ infra worker destroy <exact-infra-owned-session>
 infra worker list --provider colab
 ```
 
-Creation prints balance, aggregate CU rate and assignment count before
-confirmation; then claims a unique identity, allocates once, reads usage
-again, checks physical GPU/CUDA and the incremental CU/hour ceiling, bootstraps
-and marks READY. A rejected confirmed lease is released immediately. A small
-amount of CU may be charged before rejection; inspect usage after release.
-An ambiguous intent must be reconciled, never blindly retried. One active
-infra-owned lease at a time; release it after a bounded compatible job batch.
+Creation prints billing mode (paid CU or free tier), paid CU balance, observed
+usage rate and assignment count before confirmation; then claims a unique
+identity, allocates once, reads usage again, checks physical GPU/CUDA,
+bootstraps and marks READY. The post-allocation rate ceiling and minimum-balance
+checks apply only in `PAID_CU`; in `FREE_TIER` the observed rate is recorded as
+metering evidence and the job is still gated on ownership, readiness, exactly
+one owned active assignment and the accelerator. A rejected confirmed lease is
+released immediately. A small amount of CU may be charged before a paid-mode
+rejection; inspect usage after release. An ambiguous intent must be reconciled,
+never blindly retried. One active infra-owned lease at a time; release it after
+a bounded compatible job batch.
 `infra job submit <spec>` prefers an existing READY Colab worker over RunPod;
 `--provider runpod` restricts placement and `--worker` pins the exact worker.
 There is no implicit paid provisioning on submit or provider retry of a failed

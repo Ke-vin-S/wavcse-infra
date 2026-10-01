@@ -732,6 +732,10 @@ RunPod requires its observed USD/hour offer and the human price ceiling before
 creation. Colab uses account compute-unit balance and aggregate CU/hour,
 measures incremental rate across one owned allocation, and may spend a small
 amount before rejecting and releasing a lease above its configured ceiling.
+The reported balance is `paidComputeUnitsBalance`, so a zero paid balance selects
+best-effort free-tier execution (permitted by `colab.allow_free_tier`) rather
+than indicating no compute entitlement; free-tier CU/hour is observation-only
+and the paid-CU guard applies only while the balance is positive.
 Neither model is converted into the other. A provider unable to prove a
 requested constraint must fail, not silently choose an expensive substitute.
 
@@ -940,8 +944,10 @@ ADR-030 accepts a trusted-controller history exception while preserving
 short-lived capabilities in uploaded ephemeral envelopes. Colab uses CU
 balance and post-allocation incremental CU/hour policy, one owned active
 session, real GPU/CUDA bootstrap and the shared exact-commit job/S3 contract.
-RunPod remains a separately priced, SSH-driven, resumable Pod provider.
-University static SSH is not implemented.
+Its paid CU balance selects `PAID_CU` (budgeted) or, at zero, `FREE_TIER`
+(best-effort, `colab.allow_free_tier`); both remain the same Colab provider and
+transport. RunPod remains a separately priced, SSH-driven, resumable Pod
+provider. University static SSH is not implemented.
 
 # 31. v1 acceptance scenario
 

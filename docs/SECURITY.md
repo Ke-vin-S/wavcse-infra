@@ -83,11 +83,15 @@ infra-owned history files to 0600. Keep a short manually reviewed retention
 window for identifiable infra-owned history; never broadly delete Google
 state or change unrelated users' files.
 
-Colab `usage` is a native CU balance/rate report, not a USD/hour offer.
-Only one infra-owned allocation can be active, enabling before/after
-incremental CU attribution. A post-allocation rate rejection releases the
-confirmed exact owned session; a small amount of CU may already be charged.
-An ambiguous create blocks another allocation until reconciliation.
+Colab `usage` reports the account's `paidComputeUnitsBalance` and a native
+CU/hour rate, not a USD/hour offer. A zero paid balance is not zero compute
+entitlement: it selects best-effort free-tier execution when
+`colab.allow_free_tier` is set, and its reported CU/hour is observation-only,
+not a billable cost or a paid-balance requirement. Only one infra-owned
+allocation can be active, enabling before/after incremental CU attribution. The
+post-allocation rate/minimum-balance rejection applies only in paid-CU mode and
+releases the confirmed exact owned session; a small amount of CU may already be
+charged. An ambiguous create blocks another allocation until reconciliation.
 Destroy checks local ownership and provider identity, and requires explicit
 confirmation. The CLI's SSH proxy is not used because it can auto-create
 missing sessions. RunPod's USD/hour, SSH and stop/start contract is unchanged.

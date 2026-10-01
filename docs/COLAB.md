@@ -6,6 +6,33 @@ CU usage and physical GPU, enforce cost policy, bootstrap to READY, run one or
 more compatible exact-commit jobs, persist outputs, release. There is no
 resumable stop, network-volume cache, public-IP or SSH requirement.
 
+## Execution modes
+
+Colab has two billing/execution modes, both still `ProviderKind.COLAB` over
+`ExecutionTransport.COLAB_EXEC` — a mode, never a second provider:
+
+- `PAID_CU` — `paidComputeUnitsBalance > 0`; the existing CU-budget policy
+  applies (minimum paid balance, maximum incremental CU/hour, maximum job CU,
+  and paid balance covering the projected job CU).
+- `FREE_TIER` — `paidComputeUnitsBalance == 0`; best-effort, interruptible
+  execution whose capacity, accelerator, runtime and usage limits are not
+  guaranteed. A free-tier job is never rejected for having no paid balance.
+
+The CLI's `Current balance` is the account's `paidComputeUnitsBalance`. It is
+empirically established that Colab allocates and runs a free-tier T4 with a
+`0.00` paid balance and a nonzero provider-reported usage rate (observed
+`1.07/hr`). Therefore:
+
+```text
+balance == 0  ->  no paid CU balance  ->  eligible to attempt free tier
+              -/->  no Colab compute entitlement
+```
+
+In free tier the provider-reported CU/hour is recorded as **observed metering**,
+never treated as a paid cost or as evidence that the account must hold enough
+paid CU. No CU-to-USD conversion is invented. Actual provider allocation is the
+only authority on whether a free accelerator is granted.
+
 ## Authentication and configuration
 
 A human authenticates once on the controller (never in automated bootstrap):
@@ -24,6 +51,7 @@ token, Google Drive, static AWS key or Git write credential is copied to a worke
 enabled = true
 default_gpu = "T4"
 max_simultaneous_workers = 1
+allow_free_tier = true
 minimum_balance_cu = 5
 max_incremental_rate_cu_per_hour = 3
 max_job_cu = 10
@@ -32,20 +60,46 @@ max_job_cu = 10
 preferred_providers = ["colab", "runpod"]
 ```
 
-Values are operator-owned non-secret limits, **not** provider prices. Defaults
-in the example are illustrative and should be set to the operator's CU budget.
+`allow_free_tier` is the free-tier permission, independent of `minimum_balance_cu`
+(which is paid-CU policy only). With `allow_free_tier = false`, a zero paid
+balance is rejected before allocation. Values are operator-owned non-secret
+limits, **not** provider prices. Defaults in the example are illustrative and
+should be set to the operator's CU budget.
+
 Only one infra-owned allocation is permitted. CLI 0.7.4 `usage` prints account
 balance, aggregate rate (two decimal places) and active-assignment count; the
 controller parses all three. On creation it records a unique `wavcse-` identity
 before calling `new`, then compares `usage_after - usage_before`, requiring the
-assignment count to increase by exactly one and the incremental CU/hour to be
-positive and within policy. If a confirmed owned session fails cost or bootstrap
-checks, it is released and marked absent only after provider confirmation.
-Ambiguous creation is reconciled by exact identity and never blindly repeated.
-Account observations are rounded; a changing unrelated session makes attribution
-unsafe and causes rejection. **The post-allocation guard may consume a small
-amount of CU before release.** No invented USD/hour conversion is made.
-RunPod retains its USD/hour ceiling, SSH, storage and lifecycle semantics.
+assignment count to increase by exactly one. In `PAID_CU` it additionally
+requires a positive incremental CU/hour within policy and a post-allocation
+balance at or above the configured minimum; in `FREE_TIER` it records the
+observed rate without a rate or paid-balance gate. If a confirmed owned session
+fails cost or bootstrap checks, it is released and marked absent only after
+provider confirmation. Ambiguous creation is reconciled by exact identity and
+never blindly repeated. Account observations are rounded; a changing unrelated
+session makes attribution unsafe and causes rejection. **The post-allocation
+guard may consume a small amount of CU before release.** No invented USD/hour
+conversion is made. RunPod retains its USD/hour ceiling, SSH, storage and
+lifecycle semantics.
+
+## Free-tier limitations
+
+These are explicitly accepted, not reasons to block execution: free-tier GPU
+availability is not guaranteed; usage limits are dynamic and unpublished;
+sessions may terminate unexpectedly; free sessions may have shorter runtime or
+lower priority; accelerator availability may vary and a free T4 may not always
+be granted; long jobs may be interrupted; and local Colab storage is ephemeral.
+Classify the resulting failures rather than treating them as guard defects:
+
+```text
+T4/accelerator unavailable            -> provider capacity failure
+free-tier usage limit reached         -> provider/quota failure
+session terminated unexpectedly       -> infrastructure/session-loss failure
+experiment command exits non-zero     -> experiment failure
+```
+
+Durable S3/job semantics remain the mitigation for ephemeral compute. Free-tier
+execution is not claimed to be reliable.
 
 ## Worker and recorded job
 
@@ -73,11 +127,15 @@ configured provider order (Colab, then RunPod); `--provider runpod` restricts
 selection. `--worker` pins one exact worker. The CLI never silently provisions
 paid compute from a job spec: RunPod needs an explicit offer and human USD/hour
 ceiling; create workers first. An existing Colab lease may be reused by ID only
-while READY, idle, and within the configured balance/rate/job-timeout CU budget.
-`max_job_cu` bounds observed CU/hour multiplied by declared maximum job runtime;
-it is not a guarantee against external account usage changes. One Colab job at
+while READY, idle, and — in `PAID_CU` — within the configured balance/rate/
+job-timeout CU budget. `max_job_cu` bounds observed CU/hour multiplied by
+declared maximum job runtime; it is not a guarantee against external account
+usage changes. In `FREE_TIER` the projected paid-CU coverage is not applied: the
+job is still gated on ownership, readiness, exactly one owned active assignment,
+the requested/acceptable accelerator, and `allow_free_tier`. One Colab job at
 a time avoids conflicting work. A research failure, undesirable metric or
-uncertain outcome never triggers cross-provider rerun.
+uncertain outcome never triggers cross-provider rerun. `infra worker show`
+reports the recorded billing mode and observed CU rate.
 
 Both transports use the reviewed `worker/job_runner.py` and Phase 5 transfer
 module: detached checkout verifies the full commit and clean tree, required

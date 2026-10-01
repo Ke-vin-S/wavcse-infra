@@ -1478,6 +1478,10 @@ plaintext history. The controller is a trusted single-user execution control
 plane; Colab sessions are ephemeral and must not be conflated with RunPod Pods.
 The Phase 7 foundation separated provider and execution-transport identities
 but intentionally blocked allocation and recorded jobs under the older guards.
+Direct use of the pinned CLI then established that its `Current balance`
+(`paidComputeUnitsBalance`) can be `0.00` while a free-tier T4 allocates, reports
+a nonzero `1.07/hr` usage rate, and completes GPU work — so the original
+`balance_cu < projected` guard wrongly rejected every zero-paid-balance job.
 
 ### Decision
 
@@ -1490,6 +1494,18 @@ but intentionally blocked allocation and recorded jobs under the older guards.
   account usage and assignment count before/after allocation and release
   confirmed owned sessions that fail the post-allocation guard. A small amount
   of CU can be consumed before rejection.
+- Model Colab execution as two modes selected by the paid CU balance, not as a
+  second provider: `PAID_CU` when the paid balance is positive, `FREE_TIER` when
+  it is zero. The pinned CLI's `Current balance` is `paidComputeUnitsBalance`,
+  so a zero balance is not zero entitlement: a free-tier T4 allocates and runs
+  with a `0.00` paid balance and a nonzero provider-reported rate (observed
+  `1.07/hr`). Free tier is best-effort and gated by `colab.allow_free_tier`;
+  a zero balance must never be read as "no Colab compute". In `FREE_TIER` the
+  reported usage rate is recorded as metering evidence, never a paid-balance or
+  rate-ceiling gate, while assignment count, ownership, readiness, accelerator
+  and free-tier permission are still enforced. `PAID_CU` keeps the existing
+  minimum-balance, maximum incremental CU/hour, maximum job CU and projected-CU
+  coverage policy unchanged.
 - Accept the pinned CLI's plaintext execution history **only** on the trusted
   controller. Restrict local directory/file permissions, use short-lived
   object-scoped presigned URLs in private temporary uploaded envelopes, and
@@ -1508,6 +1524,12 @@ but intentionally blocked allocation and recorded jobs under the older guards.
   distinct native metrics.
 - Require a pre-allocation Colab price: the CLI does not provide it, so a
   documented post-allocation rejection is the enforceable policy available.
+- Treat `paidComputeUnitsBalance == 0` as "no Colab compute entitlement" and
+  reject allocation: empirically false. Colab's free tier allocates and runs a
+  T4 at zero paid balance; the correct meaning is "eligible to attempt
+  best-effort free tier".
+- Use `minimum_balance_cu` as the free-tier permission: the paid-CU floor and
+  the free-tier permission are independent policies.
 - Put presigned URLs or job secrets in `colab exec` source or `--env`: local
   history would retain them. Use the validated upload path instead.
 - Treat Colab as a long-lived RunPod Pod, a network-volume cache, or a second
@@ -1521,4 +1543,7 @@ Provider failure before an experiment begins may allow choosing another
 eligible existing worker; a nonzero experiment result never does. An orphaned
 unknown create remains blocked until reconciled. The operator owns ADC login,
 CU ceilings, history retention, and explicit release of a compatible batch.
+Free-tier execution is best-effort — capacity, accelerator, runtime and usage
+limits are not guaranteed — so its failures are classified as provider
+capacity/quota or infrastructure session loss, not as guard defects.
 University static-provider integration remains separate.

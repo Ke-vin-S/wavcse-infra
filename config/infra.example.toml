@@ -34,8 +34,12 @@ command_timeout_seconds = 300.0
 lifecycle_timeout_seconds = 300.0
 default_gpu = "T4"
 max_simultaneous_workers = 1
-# Human CU policy; no USD/hour conversion. A rejected allocation may cost a
-# small amount of CU before the post-allocation guard releases it.
+# A zero paid CU balance selects Colab's best-effort free tier, not a failed
+# account. Set false to require a paid CU balance for allocation and jobs.
+allow_free_tier = true
+# Human paid-CU policy; no USD/hour conversion. Enforced only when the paid
+# balance is positive. A rejected allocation may cost a small amount of CU
+# before the post-allocation guard releases it.
 minimum_balance_cu = 5
 max_incremental_rate_cu_per_hour = 3
 max_job_cu = 10

@@ -20,12 +20,18 @@ compute in diagnostics or CI. `infra provider list`, `infra doctor` and
 - Every invocation uses `--auth=adc`; upstream defaults to interactive OAuth.
   Never call `colab auth` or copy ADC/session credentials to the runtime.
 - Check account balance and aggregate CU/hour before requesting a T4 or another
-  explicitly required GPU. `infra worker create --provider colab --gpu T4`
-  prints the CU plan and requires confirmation unless `--yes`. Creation claims
-  one unique infra identity before issuing a billable request, measures account
-  usage after allocation, and enforces the configured incremental CU/hour limit.
-  The guard is post-allocation and may consume a small amount of CU before a
-  rejected owned lease is released. One active infra-owned lease at a time.
+  explicitly required GPU. The CLI's `Current balance` is the account's
+  `paidComputeUnitsBalance`: `> 0` selects `PAID_CU`, `0` selects best-effort
+  `FREE_TIER` (permitted by `colab.allow_free_tier`), and zero does **not** mean
+  no compute entitlement. `infra worker create --provider colab --gpu T4`
+  prints the mode and requires confirmation unless `--yes`. Creation claims one
+  unique infra identity before issuing a billable request and measures account
+  usage after allocation. In `PAID_CU` it enforces the configured minimum
+  balance, incremental CU/hour ceiling and projected job CU; the guard is
+  post-allocation and may consume a small amount of CU before a rejected owned
+  lease is released. In `FREE_TIER` the observed CU/hour is recorded, not gated,
+  and the job still requires ownership, readiness, exactly one owned active
+  assignment and the requested accelerator. One active infra-owned lease at a time.
 - Provider RUNNING is not READY: bootstrap checks Python, Git, uv, physical GPU,
   PyTorch CUDA, disk and network; compare the observed model with the requested
   accelerator. Never install OMP/Codex on a normal worker.

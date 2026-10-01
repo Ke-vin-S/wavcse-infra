@@ -36,8 +36,11 @@ time.
 
 RunPod GPU discovery reports exact type, VRAM, cloud tier, availability,
 maximum GPUs per machine and provider list price. Colab instead exposes
-account CU balance and aggregate CU/hour; use its one-owned-session
-before/after guard and never invent a USD/hour conversion. Compare candidates
+account CU balance and aggregate CU/hour; a positive paid balance is `PAID_CU`
+and enforces the one-owned-session before/after CU guard, while a zero paid
+balance is best-effort `FREE_TIER` (when `colab.allow_free_tier`), whose
+observed CU/hour is metering evidence rather than billable cost. Never invent a
+USD/hour conversion. Compare candidates
 on provider-native cost, expected time and verified artifact outcome:
 
 - RunPod's discovered hourly price, or Colab's observed incremental CU/hour;
@@ -58,9 +61,11 @@ For RunPod, `--max-price` is the maximum accepted total GPU USD/hour for the
 whole request and is checked before billable creation. Always supply it for
 an autonomous RunPod create; never widen an authorized ceiling silently.
 For Colab, configure minimum balance, maximum incremental CU/hour and
-maximum job CU. The rate is observable only after a single owned allocation,
+maximum job CU; these are paid-CU policy and apply only while the balance is
+positive. The paid rate is observable only after a single owned allocation,
 so a rejected allocation may consume a small amount of CU before immediate
-release. Never substitute a guessed Colab USD/hour value.
+release. `colab.allow_free_tier` controls best-effort zero-balance execution.
+Never substitute a guessed Colab USD/hour value.
 
 Raise authorized limits only with a human decision; never widen a ceiling,
 bypass the guard or create by another route. Billable create and irreversible
