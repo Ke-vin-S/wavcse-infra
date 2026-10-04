@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 
 from wavcse_infra import cli
 from wavcse_infra.cli import app
+from wavcse_infra.config import SshConfig
 from wavcse_infra.doctor import CheckStatus, DoctorCheck, DoctorReport
 from wavcse_infra.errors import CredentialError, ProviderNotFoundError
 from wavcse_infra.models import (
@@ -24,6 +25,7 @@ from wavcse_infra.models import (
 )
 from wavcse_infra.providers import runpod as runpod_provider
 from wavcse_infra.state import WorkerStateStore
+from wavcse_infra.workers.bootstrap import WorkerBootstrapper
 from wavcse_infra.workers.ssh import SshCommandResult, SshWaitResult
 
 runner = CliRunner()
@@ -788,6 +790,11 @@ def test_bootstrap_command_reports_ready_health(monkeypatch, tmp_path: Path) -> 
             assert kwargs == {"wait_timeout_seconds": None, "command_timeout_seconds": None}
             return _health_report()
 
+        def install_app_config(self, worker_id: str, **kwargs: object) -> tuple[object, ...]:
+            assert worker_id == "pod-123"
+            assert kwargs == {"wait_timeout_seconds": None, "command_timeout_seconds": None}
+            return ()
+
     monkeypatch.setattr(cli, "_worker_access", lambda client, settings: (Bootstrapper(), object()))
     result = runner.invoke(
         app,
@@ -799,6 +806,105 @@ def test_bootstrap_command_reports_ready_health(monkeypatch, tmp_path: Path) -> 
     assert "Readiness: READY" in result.stdout
     assert "PASS gpu: GPU result" in result.stdout
     assert "Disk available: 50.00 GiB" in result.stdout
+
+
+class _AppConfigExecutor:
+    """Answer the app configuration protocol and record every remote call."""
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+        self.calls: list[tuple[tuple[str, ...], str | None]] = []
+
+    def run_checked(
+        self,
+        connection: WorkerConnectionInfo,
+        remote_argv: tuple[str, ...],
+        *,
+        input_text: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> SshCommandResult:
+        self.calls.append((tuple(remote_argv), input_text))
+        mode, *rest = remote_argv[3:]
+        if mode == "inspect":
+            return SshCommandResult(0, f"wavcse_app_config\t{rest[0]}\t{self.state}\t0\n", "")
+        return SshCommandResult(
+            0,
+            f"wavcse_app_config\t{rest[0]}\tinstalled\t{rest[0]}.wavcse-backup-20261004T153000Z\n",
+            "",
+        )
+
+
+class _AppConfigWaiter:
+    def wait(self, worker_id: str, *, timeout_seconds: float | None = None) -> SshWaitResult:
+        assert (worker_id, timeout_seconds) == ("pod-123", None)
+        return SshWaitResult(worker=_worker(), connection=_connection())
+
+
+def _install_app_config_bootstrapper(monkeypatch, tmp_path: Path, executor: object) -> None:
+    """Wire the CLI to a real bootstrapper that only ever speaks to `executor`."""
+    _install_fakes(monkeypatch, tmp_path, FakeClient())
+
+    bootstrapper = WorkerBootstrapper(
+        _AppConfigWaiter(),  # type: ignore[arg-type]
+        executor,  # type: ignore[arg-type]
+        WorkerStateStore(tmp_path / "workers.json"),
+        SshConfig(
+            private_key=tmp_path / "unused",
+            known_hosts_file=tmp_path / "known_hosts",
+            command_timeout_seconds=30,
+            bootstrap_timeout_seconds=120,
+        ),
+    )
+    monkeypatch.setattr(cli, "_worker_access", lambda client, settings: (bootstrapper, object()))
+
+
+def test_worker_apply_config_declines_a_differing_file_without_yes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    executor = _AppConfigExecutor("differs")
+    _install_app_config_bootstrapper(monkeypatch, tmp_path, executor)
+
+    result = runner.invoke(
+        app,
+        ["worker", "apply-config", "pod-123"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "tmux: skipped ~/.tmux.conf" in result.stdout
+    assert [argv[3] for argv, _ in executor.calls] == ["inspect"]
+
+
+def test_worker_apply_config_overrides_with_yes(monkeypatch, tmp_path: Path) -> None:
+    executor = _AppConfigExecutor("differs")
+    _install_app_config_bootstrapper(monkeypatch, tmp_path, executor)
+
+    result = runner.invoke(
+        app,
+        ["worker", "apply-config", "pod-123", "--yes"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "tmux: overridden ~/.tmux.conf (backup ~/.tmux.conf.wavcse-backup-20261004T153000Z)"
+        in result.stdout
+    )
+    assert [argv[3] for argv, _ in executor.calls] == ["inspect", "install"]
+    assert executor.calls[1][1] is not None and "C-a" in executor.calls[1][1]
+
+
+def test_worker_apply_config_refuses_an_unknown_application(monkeypatch, tmp_path: Path) -> None:
+    _install_fakes(monkeypatch, tmp_path, FakeClient())
+
+    result = runner.invoke(
+        app,
+        ["worker", "apply-config", "pod-123", "--app", "nope"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 2
+    assert "mirrored apps are: tmux" in result.stderr
 
 
 def test_health_command_exits_nonzero_without_ready_transition(monkeypatch, tmp_path: Path) -> None:

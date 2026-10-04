@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 
+from wavcse_infra.app_config import (
+    APP_CONFIG_TIMEOUT_SECONDS,
+    AppConfigEntry,
+    AppConfigOutcome,
+    apply_worker_app_config,
+)
 from wavcse_infra.config import SshConfig
 from wavcse_infra.errors import (
     SshCommandError,
@@ -84,6 +91,30 @@ class WorkerBootstrapper:
         _require_bootstrap_completion(worker_id, result)
         self._state.mark_bootstrapped(worker_id, BOOTSTRAP_VERSION)
         return self._health(ready, command_timeout_seconds=command_timeout_seconds)
+
+    def install_app_config(
+        self,
+        worker_id: str,
+        *,
+        app: str | None = None,
+        confirm: Callable[[AppConfigEntry], bool] | None = None,
+        wait_timeout_seconds: float | None = None,
+        command_timeout_seconds: float | None = None,
+    ) -> tuple[AppConfigOutcome, ...]:
+        """Mirror this repository's application configuration onto one worker."""
+
+        ready = self._waiter.wait(worker_id, timeout_seconds=wait_timeout_seconds)
+        return apply_worker_app_config(
+            self._executor,
+            ready.connection,
+            app=app,
+            confirm=confirm,
+            timeout_seconds=(
+                min(self._config.command_timeout_seconds, APP_CONFIG_TIMEOUT_SECONDS)
+                if command_timeout_seconds is None
+                else command_timeout_seconds
+            ),
+        )
 
     def health(
         self,

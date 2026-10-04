@@ -116,9 +116,16 @@ class StateRecorder:
 
 
 class Executor:
-    def __init__(self, health_output: str, *, health_stderr: str = "") -> None:
+    def __init__(
+        self,
+        health_output: str,
+        *,
+        health_stderr: str = "",
+        config_state: str = "absent",
+    ) -> None:
         self.health_output = health_output
         self.health_stderr = health_stderr
+        self.config_state = config_state
         self.calls: list[tuple[tuple[str, ...], str | None, float | None]] = []
 
     def run_checked(
@@ -131,6 +138,19 @@ class Executor:
     ) -> SshCommandResult:
         assert connection.provider_worker_id == "pod-123"
         self.calls.append((remote_argv, input_text, timeout_seconds))
+        if remote_argv[:1] == ("python3",):
+            mode, *rest = remote_argv[3:]
+            if mode == "inspect":
+                return SshCommandResult(
+                    exit_code=0,
+                    stdout=(f"wavcse_app_config\t{rest[0]}\t{self.config_state}\t0\n"),
+                    stderr="",
+                )
+            return SshCommandResult(
+                exit_code=0,
+                stdout=f"wavcse_app_config\t{rest[0]}\tinstalled\t-\n",
+                stderr="",
+            )
         is_health = input_text is not None and "wavcse_health_schema" in input_text
         stdout = (
             self.health_output if is_health else f"wavcse_bootstrap_complete\t{BOOTSTRAP_VERSION}\n"
@@ -185,6 +205,34 @@ def test_bootstrap_runs_versioned_script_then_health_and_reaches_ready(tmp_path:
     assert executor.calls[1][1] is not None
     assert "wavcse_health_schema" in executor.calls[1][1]
     assert [event[0] for event in state.events] == ["bootstrapped", "gpu", "health"]
+
+
+def test_install_app_config_installs_an_absent_worker_file(tmp_path: Path) -> None:
+    executor = Executor(_health_output())
+    bootstrapper = WorkerBootstrapper(Waiter(), executor, StateRecorder(), _config(tmp_path))
+
+    outcomes = bootstrapper.install_app_config("pod-123")
+
+    assert [outcome.state for outcome in outcomes] == ["installed"]
+    assert outcomes[0].describe() == "tmux: installed ~/.tmux.conf"
+    inspect_argv, inspect_payload, inspect_timeout = executor.calls[0]
+    install_argv, install_payload, install_timeout = executor.calls[1]
+    assert inspect_argv[:4] == ("python3", "-c", inspect_argv[2], "inspect")
+    assert inspect_payload is None
+    assert install_argv[3] == "install"
+    assert install_argv[-1] == "0644"
+    assert install_payload is not None and "C-a" in install_payload
+    assert inspect_timeout == install_timeout == 30
+
+
+def test_install_app_config_preserves_a_differing_worker_file(tmp_path: Path) -> None:
+    executor = Executor(_health_output(), config_state="differs")
+    bootstrapper = WorkerBootstrapper(Waiter(), executor, StateRecorder(), _config(tmp_path))
+
+    outcomes = bootstrapper.install_app_config("pod-123")
+
+    assert [outcome.state for outcome in outcomes] == ["preserved"]
+    assert len(executor.calls) == 1
 
 
 def test_bootstrap_uses_stdin_script_transport_over_direct_ssh(tmp_path: Path) -> None:
@@ -534,6 +582,7 @@ def test_worker_scripts_are_strict_idempotent_and_contain_no_controller_secrets(
     assert bootstrap.startswith("#!/usr/bin/env bash\nset -Eeuo pipefail")
     assert health.startswith("#!/usr/bin/env bash\nset -Eeuo pipefail")
     assert "dpkg-query" in bootstrap
+    assert re.search(r"^\s+tmux$", bootstrap, re.MULTILINE) is not None
     assert "command -v uv" in bootstrap
     assert "mktemp" in bootstrap and "bootstrap-version" in bootstrap
     assert "wavcse_bootstrap_complete" in bootstrap

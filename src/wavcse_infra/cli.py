@@ -6,7 +6,8 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Iterator
+import sys
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -18,6 +19,7 @@ import typer
 from pydantic import ValidationError
 
 from wavcse_infra import __version__
+from wavcse_infra.app_config import AppConfigEntry, load_app_config_entries
 from wavcse_infra.config import Settings, load_settings, resolved_config_path
 from wavcse_infra.doctor import CheckStatus, DoctorReport, run_doctor
 from wavcse_infra.errors import (
@@ -800,6 +802,11 @@ def bootstrap_worker(
                 wait_timeout_seconds=wait_timeout,
                 command_timeout_seconds=command_timeout,
             )
+            outcomes = bootstrapper.install_app_config(
+                worker_id,
+                wait_timeout_seconds=wait_timeout,
+                command_timeout_seconds=command_timeout,
+            )
     except ConfigurationError as exc:
         _configuration_failure(exc)
     except ProviderError as exc:
@@ -807,6 +814,8 @@ def bootstrap_worker(
     except InfraError as exc:
         _operation_failure(exc)
     _print_health(report, json_output=json_output)
+    for outcome in outcomes:
+        typer.echo(f"App config {outcome.describe()}", err=json_output)
     if not report.ready:
         typer.echo(
             f"Worker {worker_id} bootstrap completed, but required health checks failed; "
@@ -814,6 +823,58 @@ def bootstrap_worker(
             err=True,
         )
         raise typer.Exit(code=1)
+
+
+@worker_app.command("apply-config")
+def apply_worker_config(
+    context: typer.Context,
+    worker_id: Annotated[str, typer.Argument(help="Exact RunPod worker ID.")],
+    app: Annotated[
+        str | None,
+        typer.Option("--app", help="Limit to one mirrored application."),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help=(
+                "Override a differing remote file without prompting; the previous file is "
+                "backed up."
+            ),
+        ),
+    ] = False,
+    wait_timeout: Annotated[
+        float | None,
+        typer.Option("--wait-timeout", min=0.1, help="Direct SSH readiness timeout."),
+    ] = None,
+    command_timeout: Annotated[
+        float | None,
+        typer.Option("--command-timeout", min=0.1, help="Remote command timeout."),
+    ] = None,
+) -> None:
+    """Apply the repository's mirrored application configuration to one worker."""
+
+    settings = _load_cli_settings(_context(context))
+    try:
+        load_app_config_entries(app=app)
+        _require_runpod_transport(worker_id, "apply the worker application configuration")
+        with RunPodClient.from_settings(settings) as client:
+            bootstrapper, _ = _worker_access(client, settings)
+            outcomes = bootstrapper.install_app_config(
+                worker_id,
+                app=app,
+                confirm=(lambda entry: True) if yes else _app_config_confirmation(worker_id),
+                wait_timeout_seconds=wait_timeout,
+                command_timeout_seconds=command_timeout,
+            )
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    for outcome in outcomes:
+        typer.echo(outcome.describe())
 
 
 @worker_app.command("health")
@@ -2596,6 +2657,24 @@ def _require_runpod_transport(worker_id: str, operation: str) -> None:
             f"Colab worker {worker_id} cannot {operation}: that operation requires "
             "RunPod SSH or a resumable Pod. Colab destroy is terminal"
         )
+
+
+def _app_config_confirmation(worker_id: str) -> Callable[[AppConfigEntry], bool]:
+    """Prompt before replacing a differing worker file, and never prompt without a TTY.
+
+    A scripted run must neither hang nor silently overwrite remote configuration, so
+    without an interactive terminal every override is declined.
+    """
+
+    def confirm(entry: AppConfigEntry) -> bool:
+        if not sys.stdin.isatty():
+            return False
+        return typer.confirm(
+            f"Override ~/{entry.destination} on worker {worker_id}? The current file is backed up",
+            default=False,
+        )
+
+    return confirm
 
 
 def _colab_client(settings: Settings) -> ColabClient:

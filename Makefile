@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 SHELL_FILES := $(shell find controller scripts worker -type f -name '*.sh' 2>/dev/null)
 
-.PHONY: agents-check agents-sync bootstrap-controller check cloud-init-check doctor format format-check install-agents lint omp-overlay omp-overlay-check test
+.PHONY: agents-check agents-sync app-config app-config-check bootstrap-controller check cloud-init-check doctor format format-check install-agents lint omp-overlay omp-overlay-check test
 
 agents-sync:
 	python3 scripts/agents/agent_assets.py sync
@@ -22,6 +22,14 @@ omp-overlay:
 
 omp-overlay-check:
 	./controller/omp-overlay.sh --check
+
+# Apply the repository's mirrored application configuration (apps/manifest) to
+# this controller. A differing file is never replaced without confirmation.
+app-config:
+	./controller/app-config.sh
+
+app-config-check:
+	./controller/app-config.sh --check
 
 doctor:
 	uv run --locked infra doctor

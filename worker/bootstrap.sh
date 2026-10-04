@@ -34,6 +34,7 @@ required_packages=(
   python3
   python3-venv
   tar
+  tmux
   util-linux
 )
 missing_packages=()

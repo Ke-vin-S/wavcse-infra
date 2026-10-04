@@ -183,8 +183,10 @@ Prerequisites outside this repository:
    ```
 
    Bootstrap creates the user configuration if missing and preserves it on every later
-   run. It installs controller agent tools by default; use `--skip-agents` only when
-   they are managed separately.
+   run. It also installs the mirrored application configuration from `apps/`
+   (`~/.tmux.conf` from `apps/tmux/tmux.conf`), preserving a differing existing file.
+   It installs controller agent tools by default; use `--skip-agents` only when they
+   are managed separately.
 5. Create the RunPod SSM `SecureString`, add its non-secret parameter name to the TOML,
    and grant the instance profile the scoped read permission described above. Complete
    other user-specific GitHub and DagsHub/MLflow authentication. Agent authentication
@@ -203,6 +205,28 @@ Prerequisites outside this repository:
 Bootstrap installs controller prerequisites and the locked Python project. It is
 idempotent and safe to rerun. It delegates OMP, Codex, and AGF installation to
 `controller/install-agents.sh`; it does not inject secrets or provision cloud resources.
+
+## Application configuration
+
+`apps/manifest` is the source of truth for the operator's application settings, and
+each entry names a file under `apps/<app>/` plus its home-relative destination. The
+controller applies it with `controller/app-config.sh`, which bootstrap runs with
+`--preserve-existing`; workers get the same files through `infra worker bootstrap`
+and `infra worker apply-config <id>`.
+
+To change a setting, edit the file in this repository, commit and push it, then apply
+it on the controller:
+
+```bash
+make app-config-check   # report drift without writing; exits 1 when anything drifted
+make app-config         # install an absent file, leave a matching one alone
+```
+
+A file whose content differs from the repository is never overwritten implicitly: a
+default run prompts, a run without a TTY reports `preserved`, and `--yes` replaces it
+after copying the previous file to a `.wavcse-backup-<UTC timestamp>` sibling. Use
+`--app NAME` to limit the run to one application. On a worker the same rules apply
+through `infra worker apply-config <id> [--yes]`.
 
 ## Controller agent installation
 

@@ -1,3 +1,5 @@
+import os
+import pty
 import stat
 import subprocess
 from pathlib import Path
@@ -6,6 +8,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP_SCRIPT = REPOSITORY_ROOT / "controller" / "bootstrap.sh"
 INSTALL_AGENTS_SCRIPT = REPOSITORY_ROOT / "controller" / "install-agents.sh"
 EXAMPLE_CONFIG = REPOSITORY_ROOT / "config" / "infra.example.toml"
+
+APP_CONFIG_SCRIPT = REPOSITORY_ROOT / "controller" / "app-config.sh"
+TMUX_SOURCE = REPOSITORY_ROOT / "apps" / "tmux" / "tmux.conf"
 
 
 def _run_user_config_step(controller_home: Path) -> subprocess.CompletedProcess[str]:
@@ -224,3 +229,154 @@ def test_colab_install_rejects_success_without_binary(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "not executable" in result.stderr
+
+
+def _app_config_argv(controller_home: Path, *arguments: str) -> list[str]:
+    command = (
+        'source "$1"\n'
+        'CONTROLLER_USER="$(id -un)"\n'
+        'WAVCSE_INFRA_CONTROLLER_HOME="$2"\n'
+        "shift 2\n"
+        'main "$@"\n'
+    )
+    return [
+        "bash",
+        "-c",
+        command,
+        "app-config-test",
+        str(APP_CONFIG_SCRIPT),
+        str(controller_home),
+        *arguments,
+    ]
+
+
+def _run_app_config(
+    controller_home: Path, *arguments: str, stdin: str = ""
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        _app_config_argv(controller_home, *arguments),
+        check=False,
+        capture_output=True,
+        text=True,
+        input=stdin,
+    )
+
+
+def _run_app_config_on_tty(
+    controller_home: Path, *arguments: str, answer: str
+) -> subprocess.CompletedProcess[str]:
+    """Answer the interactive override prompt through a real terminal."""
+    master, slave = pty.openpty()
+    try:
+        os.write(master, answer.encode("utf-8"))
+        return subprocess.run(
+            _app_config_argv(controller_home, *arguments),
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=slave,
+        )
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_controller_app_config_installs_then_reports_unchanged(tmp_path: Path) -> None:
+    target = tmp_path / ".tmux.conf"
+
+    installed = _run_app_config(tmp_path)
+    rerun = _run_app_config(tmp_path)
+    checked = _run_app_config(tmp_path, "--check")
+
+    assert installed.returncode == 0, installed.stderr
+    assert installed.stdout == "tmux: installed ~/.tmux.conf\n"
+    assert target.read_bytes() == TMUX_SOURCE.read_bytes()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    assert rerun.stdout == "tmux: unchanged ~/.tmux.conf\n"
+    assert checked.returncode == 0, checked.stderr
+    assert checked.stdout == "tmux: current ~/.tmux.conf\n"
+
+
+def test_controller_app_config_preserves_a_drifted_file_without_confirmation(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / ".tmux.conf"
+    target.write_text("# local edit\n", encoding="utf-8")
+
+    checked = _run_app_config(tmp_path, "--check")
+    applied = _run_app_config(tmp_path)
+
+    assert checked.returncode == 1
+    assert checked.stdout == "tmux: drifted ~/.tmux.conf\n"
+    assert applied.returncode == 0, applied.stderr
+    assert (
+        "tmux: preserved ~/.tmux.conf (local content differs; rerun with --yes to override)"
+        in applied.stdout
+    )
+    assert target.read_text(encoding="utf-8") == "# local edit\n"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [".tmux.conf"]
+
+
+def test_controller_app_config_declined_prompt_keeps_the_local_file(tmp_path: Path) -> None:
+    target = tmp_path / ".tmux.conf"
+    target.write_text("# local edit\n", encoding="utf-8")
+
+    result = _run_app_config_on_tty(tmp_path, answer="n\n")
+
+    assert result.returncode == 0, result.stderr
+    assert "Override ~/.tmux.conf with apps/tmux/tmux.conf?" in result.stdout
+    assert "tmux: skipped ~/.tmux.conf" in result.stdout
+    assert target.read_text(encoding="utf-8") == "# local edit\n"
+
+
+def test_controller_app_config_confirmed_prompt_overrides_and_backs_up(tmp_path: Path) -> None:
+    target = tmp_path / ".tmux.conf"
+    target.write_text("# local edit\n", encoding="utf-8")
+
+    result = _run_app_config_on_tty(tmp_path, answer="y\n")
+
+    assert result.returncode == 0, result.stderr
+    assert target.read_bytes() == TMUX_SOURCE.read_bytes()
+    backups = list(tmp_path.glob(".tmux.conf.wavcse-backup-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "# local edit\n"
+
+
+def test_controller_app_config_override_backs_up_the_previous_file(tmp_path: Path) -> None:
+    target = tmp_path / ".tmux.conf"
+    target.write_text("# local edit\n", encoding="utf-8")
+
+    result = _run_app_config(tmp_path, "--yes")
+
+    assert result.returncode == 0, result.stderr
+    backups = list(tmp_path.glob(".tmux.conf.wavcse-backup-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "# local edit\n"
+    assert target.read_bytes() == TMUX_SOURCE.read_bytes()
+    assert f"tmux: overridden ~/.tmux.conf (backup ~/{backups[0].name})\n" in result.stdout
+
+
+def test_controller_app_config_rejects_contradictory_and_unknown_arguments(tmp_path: Path) -> None:
+    contradictory = _run_app_config(tmp_path, "--yes", "--preserve-existing")
+    unknown = _run_app_config(tmp_path, "--bogus")
+
+    assert contradictory.returncode == 2
+    assert "contradict each other" in contradictory.stderr
+    assert unknown.returncode == 2
+    assert "unknown argument: --bogus" in unknown.stderr
+    assert not (tmp_path / ".tmux.conf").exists()
+
+
+def test_controller_app_config_reports_an_unknown_application(tmp_path: Path) -> None:
+    result = _run_app_config(tmp_path, "--app", "nope")
+
+    assert result.returncode != 0
+    assert "unknown app 'nope'; mirrored apps are: tmux" in result.stderr
+
+
+def test_controller_bootstrap_installs_mirrored_app_config_without_overriding() -> None:
+    bootstrap = BOOTSTRAP_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'script="${REPOSITORY_ROOT}/controller/app-config.sh"' in bootstrap
+    assert '"${script}" --preserve-existing' in bootstrap
+    assert bootstrap.index("install_app_config\n") < bootstrap.index("install_os_packages\n")

@@ -665,6 +665,8 @@ tmux, no daemon, no message queue, and no controller-side long-running process.
 
 - tmux on workers: rejected because Phase 4 does not install it, adding it would grow the
   worker bootstrap contract, and a session multiplexer is not needed to detach one job.
+  (Amended by ADR-031: tmux is now installed for interactive use and its configuration is
+  mirrored, but job execution still never uses it and this detachment mechanism is unchanged.)
 - `nohup`/`setsid` around a shell string: rejected because the exit status, timeout, and
   cancellation logic would become an un-reviewed shell program rather than a tested one.
 - A worker-side job service or queue: rejected as a daemon, explicitly out of scope.
@@ -1547,3 +1549,54 @@ Free-tier execution is best-effort — capacity, accelerator, runtime and usage
 limits are not guaranteed — so its failures are classified as provider
 capacity/quota or infrastructure session loss, not as guard defects.
 University static-provider integration remains separate.
+
+## ADR-031: Mirror repository application configuration to the controller and to workers
+
+### Context
+
+The operator's terminal settings (`C-a` prefix, `|`/`-` splits, `mouse on`) lived only
+on the operator's workstation. The controller EC2 runs live tmux sessions but has no
+`~/.tmux.conf` at all, and worker bootstrap installed no multiplexer, which ADR-018
+recorded as a deliberate rejection. Every environment therefore needed its own
+configuration, maintained out of band and never verifiable against a source of truth.
+
+### Decision
+
+`apps/manifest` is the single registry of mirrored files, read by both Bash
+(`controller/app-config.sh`) and Python (`wavcse_infra.app_config`), so adding an
+application is a data edit rather than new code. On the controller,
+`controller/bootstrap.sh` runs `app-config.sh --preserve-existing` right after the
+controller configuration exists, so the settings are present even if a later network
+step fails. On a worker, `infra worker bootstrap` applies them through a reviewed,
+digest-verified, atomic SSH applier after the bootstrap completion marker, and
+`infra worker apply-config <id>` re-applies them on demand.
+
+A remote file that differs from the repository is never overwritten implicitly:
+bootstrap and `--preserve-existing` preserve it, an interactive run prompts, and only
+`--yes` (controller) or `infra worker apply-config --yes` replaces it — always after
+copying the previous file to a `.wavcse-backup-<UTC timestamp>` sibling. A file whose
+digest already matches is a no-op that makes no remote write. The payload is verified
+against the digest computed from the repository file before anything on the worker is
+touched, and file content never appears in argv or logs.
+
+### Alternatives rejected
+
+- Copying the workstation file out of band, or generating it per machine: no
+  verifiable source of truth and nothing to diff or re-apply.
+- One file per application with its own format, or a TOML/JSON registry: two parsers
+  and more bytes for no gain, given the line-oriented registry Bash can read.
+- Overwriting a differing remote file silently: it would destroy a hand-tuned worker or
+  controller setting with no evidence and no way back.
+- Embedding the configuration payload in the streamed worker bootstrap script: the
+  script is a reviewed constant whose digest is checked; a payload would break that
+  contract for every future edit.
+
+### Consequences
+
+`apps/tmux/tmux.conf` is a byte-identical copy of the operator's settings and is
+installed to `~/.tmux.conf` on both remotes. Job execution still does not use tmux:
+ADR-018's detachment mechanism and `worker/job_runner.py` are untouched, so tmux on a
+worker is for interactive debugging only. Worker bootstrap now also installs the
+`tmux` package. The manifest deliberately covers files only — an application that also
+needs a package keeps that line in `controller/bootstrap.sh:install_os_packages` or
+`worker/bootstrap.sh:required_packages`.

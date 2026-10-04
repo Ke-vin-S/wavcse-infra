@@ -218,6 +218,12 @@ ensure_user_config() {
   fi
 }
 
+install_app_config() {
+  local script="${REPOSITORY_ROOT}/controller/app-config.sh"
+  [[ -x "${script}" ]] || fail "app config script is missing: ${script}"
+  env WAVCSE_INFRA_CONTROLLER_USER="${CONTROLLER_USER}" "${script}" --preserve-existing
+}
+
 main() {
   parse_args "$@"
   require_ubuntu
@@ -232,6 +238,7 @@ main() {
 
   printf 'Bootstrapping controller for %s from %s\n' "${CONTROLLER_USER}" "${REPOSITORY_ROOT}"
   ensure_user_config
+  install_app_config
   install_os_packages
   install_uv
   sync_project

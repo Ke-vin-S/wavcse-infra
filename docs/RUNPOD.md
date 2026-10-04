@@ -209,10 +209,20 @@ avoiding an undocumented guess between the two names.
 over direct SSH stdin and runs it with `bash -s`; it does not require SCP/SFTP or an
 interactive PTY. The script is non-interactive and idempotent: on a
 supported Ubuntu image it installs missing CA certificates, curl, Git, Python, uv,
-tar/gzip, and basic process/filesystem utilities, creates `/workspace`, then atomically
-writes the expected version to `~/.local/state/wavcse-worker/bootstrap-version`. A
-successful exit is accepted only with the expected completion marker. It does not clone
-wavCSE or install PyTorch, research dependencies, OMP, Codex, or AGF.
+tar/gzip, tmux, and basic process/filesystem utilities, creates `/workspace`, then
+atomically writes the expected version to
+`~/.local/state/wavcse-worker/bootstrap-version`. A successful exit is accepted only
+with the expected completion marker. It does not clone wavCSE or install PyTorch,
+research dependencies, OMP, Codex, or AGF.
+
+After the completion marker, the controller also mirrors this repository's
+application configuration onto the worker, installing `~/.tmux.conf` from
+`apps/tmux/tmux.conf` and reporting `App config tmux: installed ~/.tmux.conf`. A
+remote file that already matches is left untouched (`unchanged`), and a differing
+existing file is preserved rather than overwritten. `infra worker apply-config <id>`
+re-applies the configuration on demand; it prompts before replacing a differing file
+and never prompts without a TTY, and `--yes` replaces it after backing the previous
+file up to a `.wavcse-backup-<UTC timestamp>` sibling.
 
 `/workspace` is a conventional execution directory, not evidence that storage is
 mounted. RunPod's official image also defines `/workspace` as its workspace location,

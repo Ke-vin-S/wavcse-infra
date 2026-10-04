@@ -30,6 +30,9 @@ slice:
   modes and bounded authenticated direct-SSH readiness;
 - idempotent stdin-streamed worker bootstrap plus version, tool, disk, and NVIDIA GPU
   health;
+- repository-mirrored application configuration (`apps/`) installed on the controller at
+  bootstrap and on workers at bootstrap, updated only by an explicit, permission-gated
+  command that never overwrites a differing remote file without confirmation and a backup;
 - a separate local readiness model in which provider `RUNNING` does not imply `READY`;
 - a prefix-constrained S3 namespace with listing, metadata, existence, and verification;
 - bounded, object-scoped presigned GET/PUT URLs that are redacted from logs, state, and

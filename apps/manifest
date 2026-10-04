@@ -1,0 +1,5 @@
+# wavcse-infra mirrored application configuration.
+# Fields: <app> <source-relative-to-apps/<app>> <home-relative-destination> [octal-mode]
+# Blank lines and lines whose first field starts with '#' are ignored.
+# Mode defaults to 0644. Destinations are relative to the account's home directory.
+tmux	tmux.conf	.tmux.conf	0644
