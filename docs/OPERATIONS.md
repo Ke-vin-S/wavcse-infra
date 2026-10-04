@@ -304,6 +304,7 @@ or expired ADC requires the human login above; do not automate it.
 infra worker create --provider colab --gpu T4
 infra worker show <exact-infra-owned-session>
 infra worker health <exact-infra-owned-session>
+infra worker reconcile <exact-intent-id>
 infra job submit <job-spec.json> --worker <exact-infra-owned-session> --wait
 infra job status <job-id>
 infra worker destroy <exact-infra-owned-session>
@@ -320,7 +321,12 @@ one owned active assignment and the accelerator. A rejected confirmed lease is
 released immediately. A small amount of CU may be charged before a paid-mode
 rejection; inspect usage after release. An ambiguous intent must be reconciled,
 never blindly retried. One active infra-owned lease at a time; release it after
-a bounded compatible job batch.
+a bounded compatible job batch. An intent whose session never appeared is
+retired only by `infra worker reconcile <exact-intent-id>`, which reads the
+provider and changes local bookkeeping only; nothing else retires it, and that
+recovery refuses a young intent, a failed read, an identity the provider still
+lists, or observations that disagree. See [Colab](COLAB.md) §"An abandoned
+allocation intent".
 `infra job submit <spec>` prefers an existing READY Colab worker over RunPod;
 `--provider runpod` restricts placement and `--worker` pins the exact worker.
 There is no implicit paid provisioning on submit or provider retry of a failed
@@ -530,6 +536,16 @@ infra worker list
 ```
 
 Inspect the generated identity shown in the error before issuing another create.
+
+A Colab allocation intent is written the same way and for the same reason, so it also
+survives a lost response. It differs in one respect that matters here: `worker list` does
+**not** retire a pending intent it cannot see at the provider, because absence from one
+listing is not proof that the allocation never happened, and a retired intent would allow
+a second paid session. Such an intent therefore blocks every later Colab allocation until
+it is reconciled deliberately with `infra worker reconcile <exact-intent-id>`, which
+requires repeated successful listings that omit the exact identity and agree with the
+account's assignment count, and an intent at least an hour old. See
+[Colab](COLAB.md) §"An abandoned allocation intent".
 
 ## Network volume operations
 

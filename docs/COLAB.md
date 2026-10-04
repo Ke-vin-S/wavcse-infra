@@ -109,6 +109,7 @@ infra doctor
 infra worker create --provider colab --gpu T4
 infra worker show <exact-owned-session-id>
 infra worker health <exact-owned-session-id>
+infra worker reconcile <exact-intent-id>
 infra job submit <job-spec.json> --worker <exact-owned-session-id> --wait
 infra job status <job-id>
 infra worker destroy <exact-owned-session-id>
@@ -121,6 +122,42 @@ PyTorch CUDA, scratch disk and GitHub reachability. `infra worker stop/start`
 remain unsupported. Worker release requires locally tracked confirmed ownership,
 provider-confirmed exact identity, and confirmation (or `--yes`). Destroy never
 targets a prefix, an arbitrary user session, or a network volume.
+
+### An abandoned allocation intent
+
+Only one infra-owned allocation exists at a time, so a single unresolved create
+intent blocks every later Colab allocation. That is deliberate: the intent is
+written before the billable request precisely so a lost response cannot become a
+second paid session, and a missing provider read is never treated as proof that
+the allocation never happened.
+
+The consequence is that a create whose session never appeared leaves an intent
+that nothing retires on its own — `worker list` skips a pending record it cannot
+see at the provider, and `worker destroy`/`bootstrap`/`show` refuse a record with
+no confirmed ownership. The supported recovery is one explicit, bounded
+operation on that exact identity:
+
+```bash
+infra worker reconcile <exact-intent-id>
+```
+
+It reads the provider and changes only local bookkeeping; it never creates,
+starts, stops or destroys anything. It refuses unless **all** of these hold:
+
+- the record is this controller's own Colab allocation, by exact infra identity;
+- the intent is still unresolved (`create_pending`);
+- it is at least one hour old — far longer than any create round trip, so it
+  cannot still be an in-flight request;
+- consecutive successful `sessions` listings omit the exact identity; and
+- those listings agree with each other and with the account's own
+  active-assignment count.
+
+Anything else fails closed: an unreadable provider, an identity the provider
+still lists, observations that disagree, a younger intent, a record that is not
+this controller's allocation, or a confirmed session (which is released with
+`infra worker destroy` instead). On success the intent becomes terminal and
+provider-absent — the record is kept as history, and a later `worker create
+--provider colab` is allowed again. Repeating the command is a no-op.
 
 `infra job submit <spec>` selects an existing compatible READY worker in
 configured provider order (Colab, then RunPod); `--provider runpod` restricts

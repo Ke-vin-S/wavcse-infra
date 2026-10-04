@@ -50,6 +50,12 @@ compute in diagnostics or CI. `infra provider list`, `infra doctor` and
   infra-owned session after confirmation. Never adopt or delete unrelated names.
   Reuse an existing READY owned ID only while healthy, idle and within CU policy;
   release it after a bounded compatible batch.
+- An unresolved allocation intent whose session never appeared blocks every later
+  Colab allocation, and nothing retires it from a missing listing: that is the
+  guard against a second paid session. Recover it with
+  `infra worker reconcile <exact-intent-id>`, which reads the provider and changes
+  local bookkeeping only, and refuses a young intent, a failed read, an identity
+  the provider still lists, or observations that disagree.
 - Auth, quota, accelerator and session loss are provider failures. A research
   command's nonzero exit is a job failure, not a provider fallback opportunity.
   An interrupted phase remains reconcilable; inspect its job ID instead of

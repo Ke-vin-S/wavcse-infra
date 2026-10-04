@@ -194,6 +194,11 @@ class _AtomicJsonDocumentStore:
 
         return self.path.with_name(f"{self.path.name}.lock")
 
+    def now(self) -> datetime:
+        """This store's clock, so a caller ages a record by the instant it was recorded."""
+
+        return self._now()
+
     @contextmanager
     def locked(self) -> Iterator[None]:
         """Hold this document's local lock for one read-decide-write transition.
@@ -485,6 +490,38 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
                 "last_observed_at": self._now(),
                 "readiness_state": WorkerReadinessState.NOT_READY,
                 "provider_absent": True,
+            }
+        )
+        document.workers[worker_id] = updated
+        self._write(document)
+        return updated
+
+    @_serialized
+    def mark_colab_intent_absent(self, worker_id: str) -> WorkerRecord | None:
+        """Retire an unresolved Colab allocation intent that authoritative reads proved absent.
+
+        The record is kept: it is the audit trail of the exact identity this controller once
+        claimed. ``create_pending`` is cleared because the question the intent asked - did
+        this allocation create a session? - now has an answer, and leaving it set would keep
+        every ownership check treating the identity as still unresolved. This is a local
+        bookkeeping transition only; it contacts no provider and changes nothing at one.
+        """
+
+        document = self._load()
+        existing = document.workers.get(worker_id)
+        if (
+            existing is None
+            or existing.provider is not ProviderKind.COLAB
+            or not existing.create_pending
+        ):
+            return None
+        updated = existing.model_copy(
+            update={
+                "last_observed_state": WorkerState.DESTROYED,
+                "last_observed_at": self._now(),
+                "readiness_state": WorkerReadinessState.NOT_READY,
+                "provider_absent": True,
+                "create_pending": False,
             }
         )
         document.workers[worker_id] = updated

@@ -100,7 +100,7 @@ from wavcse_infra.volumes.lifecycle import (
     volume_placement_failure_message,
 )
 from wavcse_infra.workers.bootstrap import WorkerBootstrapper
-from wavcse_infra.workers.colab import ColabLifecycle
+from wavcse_infra.workers.colab import INTENT_ABANDON_AFTER_HOURS, ColabLifecycle
 from wavcse_infra.workers.lifecycle import WorkerLifecycle
 from wavcse_infra.workers.ssh import SshExecutor, WorkerSshWaiter, select_worker_connection
 
@@ -875,6 +875,89 @@ def apply_worker_config(
         _operation_failure(exc)
     for outcome in outcomes:
         typer.echo(outcome.describe())
+
+
+@worker_app.command("reconcile")
+def reconcile_worker(
+    context: typer.Context,
+    worker_id: Annotated[
+        str,
+        typer.Argument(
+            help="Exact infra-owned identity of an unresolved Colab allocation intent.",
+        ),
+    ],
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Bypass only the interactive confirmation.")
+    ] = False,
+) -> None:
+    """Retire one unresolved Colab allocation intent the provider proves absent.
+
+    This is the supported recovery for a create whose session never appeared: without it an
+    abandoned intent blocks every later Colab allocation. It reads the provider and changes
+    only local bookkeeping, and it refuses unless the identity is this controller's own
+    allocation, still unresolved, past the abandonment bound, and repeatedly absent from
+    successful listings that agree with the account's own assignment count.
+    """
+
+    settings = _load_cli_settings(_context(context))
+    record = _state_record(worker_id)
+    if record is None:
+        typer.echo(
+            f"No tracked worker record has infra identity {worker_id!r}; "
+            "`infra worker list` shows the tracked identities."
+        )
+        return
+    if record.provider is not ProviderKind.COLAB:
+        _configuration_failure(
+            ConfigurationError(
+                f"Worker {worker_id} is a {record.provider.value} record; only an unresolved "
+                "Colab allocation intent is reconciled this way"
+            )
+        )
+    lifecycle = ColabLifecycle(_colab_client(settings), _state_store(), settings.colab)
+    try:
+        assessment = lifecycle.assess_intent(worker_id)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc, provider="Colab")
+    except InfraError as exc:
+        _operation_failure(exc)
+
+    typer.echo("Unresolved Colab allocation intent")
+    typer.echo(f"Infra identity: {assessment.identity}")
+    typer.echo(f"Age: {assessment.age_hours} h (abandonment bound {INTENT_ABANDON_AFTER_HOURS} h)")
+    typer.echo(f"Provider evidence: {assessment.detail}")
+    if assessment.observations:
+        typer.echo(
+            f"Consecutive successful listings: {assessment.observations}, exact identity "
+            f"absent in each; account assignments observed: {assessment.observed_assignments}"
+        )
+    if not assessment.retirable:
+        typer.echo("Nothing to do; the local record is already terminal and provider-absent.")
+        return
+    typer.echo(
+        "No provider resource is created, changed or deleted by this command; only the local "
+        "booking of this intent is retired."
+    )
+    typer.echo(
+        "A later `infra worker create --provider colab` is allowed again; the provider "
+        "listing showed no session with this identity."
+    )
+    if not yes and not typer.confirm(
+        f"Retire the local allocation intent {assessment.identity!r}?"
+    ):
+        typer.echo("Reconciliation cancelled; the record is unchanged.")
+        return
+    try:
+        lifecycle.retire_intent(assessment)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    typer.echo(
+        f"Colab allocation intent {assessment.identity} is now terminal and provider-absent."
+    )
 
 
 @worker_app.command("health")

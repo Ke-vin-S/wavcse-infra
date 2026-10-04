@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 from contextlib import suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -17,11 +19,12 @@ from wavcse_infra.errors import (
     ProviderError,
     ProviderOperationAmbiguousError,
     ProviderResponseError,
+    StateError,
     WorkerBootstrapError,
 )
-from wavcse_infra.models import ColabBillingMode, Worker
+from wavcse_infra.models import ColabBillingMode, ProviderKind, Worker
 from wavcse_infra.providers.colab import ColabClient, ColabUsage
-from wavcse_infra.state import WorkerStateStore
+from wavcse_infra.state import WorkerRecord, WorkerStateStore
 
 # Stable, non-secret code; only its results are written to CLI execution history.
 _HEALTH = """import json, os, shutil, subprocess, sys, urllib.request
@@ -57,6 +60,40 @@ def normalize_gpu(model: str) -> str:
     if match is None:
         raise ColabAcceleratorUnavailableError("Colab reported an unsupported physical GPU model")
     return match[1].upper()
+
+
+# An unresolved allocation intent older than this, whose exact identity consecutive
+# successful provider listings show absent, can no longer be an in-flight create: the
+# bound is far longer than any provider create round trip, so absence is proof rather than
+# a possibly incomplete read. It is the same one-hour bound the orchestration side applies
+# to its own durable create intents, so both halves of the system answer that question the
+# same way instead of inventing a second timeout.
+INTENT_ABANDON_AFTER_HOURS = Decimal("1")
+
+# Consecutive authoritative listings that must agree before an intent is retired. This is
+# the repeated-observation rule ambiguous creation already applies to its own identity.
+INTENT_ABSENCE_OBSERVATIONS = 2
+
+
+def _hours_since(started: datetime, now: datetime) -> Decimal:
+    """Fractional hours between two timestamps; never negative."""
+
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    seconds = (now - started).total_seconds()
+    return (Decimal(max(seconds, 0)) / Decimal(3600)).quantize(Decimal("0.01"))
+
+
+@dataclass(frozen=True)
+class ColabIntentAssessment:
+    """Read-only evidence about one unresolved Colab allocation intent."""
+
+    identity: str
+    age_hours: Decimal
+    observations: int
+    observed_assignments: int
+    retirable: bool
+    detail: str
 
 
 class ColabLifecycle:
@@ -249,3 +286,90 @@ class ColabLifecycle:
             billing_mode=billing_mode,
         )
         return model
+
+    def assess_intent(self, name: str, *, now: datetime | None = None) -> ColabIntentAssessment:
+        """Gather the evidence for retiring one unresolved allocation intent. Read-only.
+
+        Every condition is required and none is inferred: an exact infra-owned identity, a
+        still-unresolved intent, an age past the abandonment bound, and consecutive
+        successful provider listings that all omit the identity and agree with the
+        account's own active-assignment count. Anything else raises, because the failure
+        this guards against is retiring the intent for a session that does exist and then
+        allocating a second one.
+        """
+
+        record = self.state.get(name)
+        if record is None:
+            raise StateError(f"No tracked worker record has infra identity {name!r}")
+        if record.provider is not ProviderKind.COLAB:
+            raise StateError(
+                f"Worker {name} is a {record.provider.value} record, not a Colab session"
+            )
+        if record.infra_identity != name or record.provider_worker_id != name:
+            raise StateError(
+                f"Worker {name} does not carry the exact infra identity of this allocation"
+            )
+        moment = now or self.state.now()
+        age = _hours_since(record.creation_timestamp, moment)
+        if not record.create_pending:
+            if record.provider_absent:
+                return ColabIntentAssessment(
+                    identity=name,
+                    age_hours=age,
+                    observations=0,
+                    observed_assignments=0,
+                    retirable=False,
+                    detail="the intent is already terminal and provider-absent",
+                )
+            raise StateError(
+                f"Colab session {name} is a confirmed allocation, not an unresolved intent; "
+                "reconcile it with `infra worker list` and release it with `infra worker destroy`"
+            )
+        if age < INTENT_ABANDON_AFTER_HOURS:
+            raise StateError(
+                f"Colab allocation intent {name} is only {age} h old; an intent younger than "
+                f"{INTENT_ABANDON_AFTER_HOURS} h may still be an in-flight create and is never "
+                "abandoned on inference"
+            )
+        listed: list[int] = []
+        for _ in range(INTENT_ABSENCE_OBSERVATIONS):
+            listing = self.client.list_workers()
+            if any(worker.id == name for worker in listing):
+                raise StateError(
+                    f"Colab session {name} is present in the provider listing; it is not an "
+                    "abandoned intent and is never retired by inference"
+                )
+            listed.append(len(listing))
+        usage = self.client.usage_snapshot()
+        if len(set(listed)) != 1 or usage.assignments != listed[0]:
+            raise StateError(
+                f"Colab observations for {name} disagree: sessions listed {listed} against "
+                f"{usage.assignments} active assignment(s); refusing to retire an intent whose "
+                "absence is not consistently proven"
+            )
+        return ColabIntentAssessment(
+            identity=name,
+            age_hours=age,
+            observations=len(listed),
+            observed_assignments=usage.assignments,
+            retirable=True,
+            detail="consecutive successful listings omit the exact identity",
+        )
+
+    def retire_intent(self, assessment: ColabIntentAssessment) -> WorkerRecord | None:
+        """Apply the local transition an assessment authorizes. Never contacts a provider.
+
+        The store re-checks the structural precondition, so an assessment that has gone
+        stale - the session appeared, or another controller process already retired the
+        intent - cannot retire anything but a still-unresolved intent.
+        """
+
+        if not assessment.retirable:
+            return None
+        retired = self.state.mark_colab_intent_absent(assessment.identity)
+        if retired is None:
+            raise StateError(
+                f"Colab allocation intent {assessment.identity} is no longer an unresolved "
+                "intent; reconcile it again before acting"
+            )
+        return retired
