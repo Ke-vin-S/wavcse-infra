@@ -380,3 +380,116 @@ def test_controller_bootstrap_installs_mirrored_app_config_without_overriding() 
     assert 'script="${REPOSITORY_ROOT}/controller/app-config.sh"' in bootstrap
     assert '"${script}" --preserve-existing' in bootstrap
     assert bootstrap.index("install_app_config\n") < bootstrap.index("install_os_packages\n")
+
+
+def _run_git_configuration_step(
+    controller_home: Path, **environment: str
+) -> subprocess.CompletedProcess[str]:
+    command = 'source "$1"\nCONTROLLER_USER="$(id -un)"\nCONTROLLER_HOME="$2"\nconfigure_git\n'
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in ("WAVCSE_INFRA_GIT_USER_NAME", "WAVCSE_INFRA_GIT_USER_EMAIL", "XDG_CONFIG_HOME")
+    }
+    env["HOME"] = str(controller_home)
+    env.update(environment)
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            command,
+            "bootstrap-git-test",
+            str(BOOTSTRAP_SCRIPT),
+            str(controller_home),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_bootstrap_configures_the_controller_git_identity(tmp_path: Path) -> None:
+    result = _run_git_configuration_step(
+        tmp_path,
+        WAVCSE_INFRA_GIT_USER_NAME="Controller User",
+        WAVCSE_INFRA_GIT_USER_EMAIL="controller@example.com",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Configured Git identity for" in result.stdout
+    config = (tmp_path / ".gitconfig").read_text(encoding="utf-8")
+    assert "name = Controller User" in config
+    assert "email = controller@example.com" in config
+
+
+def test_bootstrap_git_identity_is_idempotent(tmp_path: Path) -> None:
+    environment = {
+        "WAVCSE_INFRA_GIT_USER_NAME": "Controller User",
+        "WAVCSE_INFRA_GIT_USER_EMAIL": "controller@example.com",
+    }
+
+    first = _run_git_configuration_step(tmp_path, **environment)
+    before = (tmp_path / ".gitconfig").read_bytes()
+    second = _run_git_configuration_step(tmp_path, **environment)
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert "Git identity already configured" in second.stdout
+    assert (tmp_path / ".gitconfig").read_bytes() == before
+
+
+def test_bootstrap_reports_a_replaced_git_identity_without_hiding_the_previous_one(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".gitconfig").write_text(
+        "[user]\n\tname = Old Name\n\temail = old@example.com\n",
+        encoding="utf-8",
+    )
+
+    result = _run_git_configuration_step(
+        tmp_path,
+        WAVCSE_INFRA_GIT_USER_NAME="New Name",
+        WAVCSE_INFRA_GIT_USER_EMAIL="new@example.com",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Replacing Git identity Old Name <old@example.com>" in result.stdout
+    config = (tmp_path / ".gitconfig").read_text(encoding="utf-8")
+    assert "name = New Name" in config
+    assert "email = new@example.com" in config
+
+
+def test_bootstrap_reports_a_missing_git_identity_without_failing(tmp_path: Path) -> None:
+    result = _run_git_configuration_step(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "Git identity not configured" in result.stdout
+    assert "WAVCSE_INFRA_GIT_USER_NAME" in result.stdout
+    assert not (tmp_path / ".gitconfig").exists()
+
+
+def test_bootstrap_rejects_a_partial_or_invalid_git_identity(tmp_path: Path) -> None:
+    partial = _run_git_configuration_step(tmp_path, WAVCSE_INFRA_GIT_USER_NAME="Only Name")
+    invalid = _run_git_configuration_step(
+        tmp_path,
+        WAVCSE_INFRA_GIT_USER_NAME="Controller User",
+        WAVCSE_INFRA_GIT_USER_EMAIL="not-an-email",
+    )
+
+    assert partial.returncode != 0
+    assert "set both WAVCSE_INFRA_GIT_USER_NAME" in partial.stderr
+    assert invalid.returncode != 0
+    assert "invalid WAVCSE_INFRA_GIT_USER_EMAIL: not-an-email" in invalid.stderr
+    assert not (tmp_path / ".gitconfig").exists()
+
+
+def test_controller_bootstrap_applies_the_git_identity_after_installing_git() -> None:
+    bootstrap = BOOTSTRAP_SCRIPT.read_text(encoding="utf-8")
+
+    assert (
+        bootstrap.index("install_os_packages\n")
+        < bootstrap.index("  configure_git\n")
+        < bootstrap.index("install_uv\n")
+    )

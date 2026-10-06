@@ -99,6 +99,48 @@ install_os_packages() {
     tmux
 }
 
+configure_git() {
+  local user_name="${WAVCSE_INFRA_GIT_USER_NAME:-}"
+  local user_email="${WAVCSE_INFRA_GIT_USER_EMAIL:-}"
+
+  if [[ -z "${user_name}" && -z "${user_email}" ]]; then
+    printf 'Git identity not configured; set WAVCSE_INFRA_GIT_USER_NAME and\n'
+    printf 'WAVCSE_INFRA_GIT_USER_EMAIL for %s, or run git config --global user.name ' \
+      "${CONTROLLER_USER}"
+    printf 'and user.email yourself.\n'
+    return 0
+  fi
+  [[ -n "${user_name}" && -n "${user_email}" ]] ||
+    fail 'set both WAVCSE_INFRA_GIT_USER_NAME and WAVCSE_INFRA_GIT_USER_EMAIL, or neither'
+  [[ -n "${user_name//[[:space:]]/}" ]] || fail 'WAVCSE_INFRA_GIT_USER_NAME must not be blank'
+  [[ "${user_email}" =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]] ||
+    fail "invalid WAVCSE_INFRA_GIT_USER_EMAIL: ${user_email}"
+  command -v git >/dev/null 2>&1 || fail 'git is required to configure the controller identity'
+
+  local current_name
+  local current_email
+  current_name="$(run_as_controller env HOME="${CONTROLLER_HOME}" \
+    git config --global --get user.name || true)"
+  current_email="$(run_as_controller env HOME="${CONTROLLER_HOME}" \
+    git config --global --get user.email || true)"
+
+  if [[ "${current_name}" == "${user_name}" && "${current_email}" == "${user_email}" ]]; then
+    printf 'Git identity already configured: %s <%s>\n' "${user_name}" "${user_email}"
+    return 0
+  fi
+
+  # The identity is supplied deliberately for this controller, so an operator-provided
+  # value wins, but the previous one is printed rather than replaced silently.
+  if [[ -n "${current_name}" || -n "${current_email}" ]]; then
+    printf 'Replacing Git identity %s <%s> with %s <%s>\n' \
+      "${current_name:-unset}" "${current_email:-unset}" "${user_name}" "${user_email}"
+  fi
+  run_as_controller env HOME="${CONTROLLER_HOME}" git config --global user.name "${user_name}"
+  run_as_controller env HOME="${CONTROLLER_HOME}" git config --global user.email "${user_email}"
+  printf 'Configured Git identity for %s: %s <%s>\n' \
+    "${CONTROLLER_USER}" "${user_name}" "${user_email}"
+}
+
 install_uv() {
   local uv_bin="${CONTROLLER_HOME}/.local/bin/uv"
   local installed_version=''
@@ -240,6 +282,7 @@ main() {
   ensure_user_config
   install_app_config
   install_os_packages
+  configure_git
   install_uv
   sync_project
   install_colab_cli

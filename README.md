@@ -18,6 +18,7 @@ slice:
 - Ruff, pytest, ShellCheck, and shfmt validation;
 - a locked `uv` environment and credential-free CI;
 - idempotent Ubuntu controller bootstrap and thin cloud-init;
+- controller Git commit identity applied by bootstrap from non-secret environment settings;
 - reproducible controller-only installation of OMP, Codex CLI, and AGF;
 - `infra doctor` controller, credential-source, configuration, and connectivity checks;
 - normalized RunPod REST v2 list/show and GPU offer discovery;
@@ -136,7 +137,10 @@ infra doctor
 On its first run, bootstrap copies the committed non-secret example to the controller's
 user configuration. It never overwrites an existing `config.toml`, so the command is
 safe to rerun. It delegates agent installation to `controller/install-agents.sh` and
-preserves commands that are already installed. Bootstrap never configures credentials
+preserves commands that are already installed. Supplying `WAVCSE_INFRA_GIT_USER_NAME` and
+`WAVCSE_INFRA_GIT_USER_EMAIL` sets the controller's Git commit identity, which the
+writable controller needs to commit; without them bootstrap prints what it needs and
+changes nothing. Bootstrap never configures credentials
 or creates cloud resources. Use `./controller/bootstrap.sh --skip-agents` only when
 agent installation is intentionally managed separately. See
 [Operations](docs/OPERATIONS.md) for controller setup and reconstruction.

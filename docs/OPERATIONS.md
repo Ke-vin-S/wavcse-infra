@@ -76,6 +76,8 @@ Agent-installer overrides are intentionally separate from runtime configuration:
 | Variable | Purpose |
 | --- | --- |
 | `WAVCSE_INFRA_CONTROLLER_USER` | Target account when root cannot infer the controller user |
+| `WAVCSE_INFRA_GIT_USER_NAME` | Controller Git commit name applied by bootstrap |
+| `WAVCSE_INFRA_GIT_USER_EMAIL` | Controller Git commit email applied by bootstrap |
 | `WAVCSE_INFRA_OMP_VERSION` | Controlled OMP release-tag override |
 | `WAVCSE_INFRA_OMP_X86_64_SHA256` | Required x86-64 digest when overriding the OMP pin |
 | `WAVCSE_INFRA_OMP_AARCH64_SHA256` | Required ARM64 digest when overriding the OMP pin |
@@ -189,7 +191,9 @@ Prerequisites outside this repository:
    run. It also installs the mirrored application configuration from `apps/`
    (`~/.tmux.conf` from `apps/tmux/tmux.conf`), preserving a differing existing file.
    It installs controller agent tools by default; use `--skip-agents` only when they
-   are managed separately.
+   are managed separately. It also sets the controller Git commit identity from
+   `WAVCSE_INFRA_GIT_USER_NAME` and `WAVCSE_INFRA_GIT_USER_EMAIL`; when both are unset
+   it prints the identity it needs and changes nothing, and supplying only one fails.
 5. Create the RunPod SSM `SecureString`, add its non-secret parameter name to the TOML,
    and grant the instance profile the scoped read permission described above. Complete
    other user-specific GitHub and DagsHub/MLflow authentication. Agent authentication
@@ -1390,7 +1394,9 @@ Expected: `State: FAILED`, `Exit code: 9`, the log containing `intentional failu
 ## Controller reconstruction
 
 1. Recreate an Ubuntu EC2 instance and attach the existing scoped instance profile.
-2. Apply the thin cloud-init or clone `wavcse-infra` and run bootstrap.
+2. Apply the thin cloud-init or clone `wavcse-infra` and run bootstrap, passing
+   `WAVCSE_INFRA_GIT_USER_NAME` and `WAVCSE_INFRA_GIT_USER_EMAIL` so the controller
+   commit identity is restored.
 3. Restore the non-secret SSM reference and verify the instance profile can decrypt the
    existing `SecureString`; do not copy the key onto the controller filesystem.
 4. Clone `wavCSE` and check out the required development branch.

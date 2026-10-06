@@ -1649,3 +1649,52 @@ controller whose `credential_process` assumes a role, and still fail on static k
 EC2 reference deployment is unchanged and no code path gained an AWS dependency on a
 non-EC2 host. A non-EC2 controller must supply its own credential mechanism, certificate
 lifecycle, and renewal, which this repository neither installs nor manages.
+
+## ADR-033: Set the controller Git commit identity during bootstrap
+
+### Context
+
+The controller is the only environment where commits are deliberately made, but nothing
+created its Git commit identity. A freshly created controller therefore produced
+`Author identity unknown` on the first commit, and the identity was restored by hand
+every time a controller was rebuilt — an unrecorded step that ADR-010's "seed once from a
+committed template" and ADR-011's "install the controller's tools" both exist to remove.
+The identity is a durable, non-secret, machine-specific value, and bootstrap already
+runs as the controller user and installs Git.
+
+Bootstrap cannot read the value from the user TOML it has just created: on a first run
+that file is the `CHANGE_ME` template, and the identity must exist before the first
+commit, not after the operator edits configuration.
+
+### Decision
+
+`controller/bootstrap.sh` sets `user.name` and `user.email` in the controller's global
+Git configuration from `WAVCSE_INFRA_GIT_USER_NAME` and `WAVCSE_INFRA_GIT_USER_EMAIL`,
+using the same environment-override mechanism as `WAVCSE_INFRA_CONTROLLER_USER`. Git
+configuration is itself the durable store, so nothing is duplicated into TOML.
+
+The step is idempotent and explicit: a matching identity is reported and left alone, an
+operator-supplied value replaces a differing one only after printing the previous value,
+supplying exactly one of the two fails, a malformed email fails, and supplying neither
+prints the actionable command and changes nothing so that a controller used only to run
+jobs is not blocked. The write runs with an explicit `HOME="${CONTROLLER_HOME}"` because
+`runuser` does not reset it, and a global write without that would land in the invoking
+account's configuration.
+
+### Alternatives rejected
+
+- Requiring the operator to run `git config --global` by hand: the reconstruction failure
+  this ADR exists to remove, and it leaves no record of what a controller needs.
+- Storing the identity in `config/infra.example.toml`: bootstrap would have to read the
+  TOML it creates in the same run, and the file cannot hold the value on a first run.
+- Failing bootstrap when the identity is absent: a controller that only submits jobs has
+  no need to author commits, and ADR-010's principle is to preserve rather than to force.
+- Setting `init.defaultBranch` or other habit preferences at the same time: unrelated to
+  authoring a commit, and a global default is the operator's to choose.
+
+### Consequences
+
+A controller created with the two variables can commit immediately, and reconstruction
+restores the identity without a manual step. Operators who never pass them see one
+instruction line instead of an unexplained failure later. Workers are untouched: they
+never author commits, so no worker path gained a Git identity.

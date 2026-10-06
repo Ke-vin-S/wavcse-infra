@@ -10,4 +10,7 @@ packages:
 runcmd:
   - [install, -d, -o, ubuntu, -g, ubuntu, /home/ubuntu/projects]
   - [bash, -c, 'if [[ ! -d /home/ubuntu/projects/wavcse-infra/.git ]]; then runuser --user ubuntu -- git clone --branch main --single-branch https://github.com/Ke-vin-S/wavcse-infra.git /home/ubuntu/projects/wavcse-infra; fi']
+  # The controller's non-secret Git commit identity is supplied through the bootstrap
+  # environment when constructing the launch template, for example by adding
+  # WAVCSE_INFRA_GIT_USER_NAME=<name> and WAVCSE_INFRA_GIT_USER_EMAIL=<email> to this env.
   - [env, WAVCSE_INFRA_CONTROLLER_USER=ubuntu, /home/ubuntu/projects/wavcse-infra/controller/bootstrap.sh]
