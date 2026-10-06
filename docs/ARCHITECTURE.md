@@ -265,7 +265,7 @@ RUNPOD_API_KEY (if non-empty)
 
 otherwise:
 config runpod.api_key_parameter
-  -> SSM GetParameter(WithDecryption=True) via EC2 instance profile
+  -> SSM GetParameter(WithDecryption=True) via temporary role credentials
   -> in-memory RunPod client credential
 ```
 

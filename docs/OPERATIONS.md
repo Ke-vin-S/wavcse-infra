@@ -104,7 +104,7 @@ The three credential concerns are deliberately separate:
 | --- | --- |
 | Non-secret configuration | `~/.config/wavcse-infra/config.toml` |
 | Secret storage | AWS SSM Parameter Store `SecureString` |
-| AWS authentication | Attached EC2 instance profile using temporary role credentials |
+| AWS authentication | Temporary role credentials via Boto3's chain: an EC2 instance profile, or a role-assuming `credential_process` on a non-EC2 controller |
 
 Add the non-secret reference to the controller configuration. Bootstrap includes this
 entry for newly created configurations but preserves existing files, so existing
@@ -168,10 +168,13 @@ Credential precedence is:
 
 Prerequisites outside this repository:
 
-1. Launch a supported Ubuntu EC2 instance.
-2. Attach an instance profile with least-privilege access to the private artifact
-   bucket/prefix and the configured RunPod SSM parameter. Do not create local static
-   AWS credentials.
+1. Launch a supported Ubuntu controller. The reference deployment is an EC2 instance;
+   any host that can satisfy the credential requirement below is acceptable.
+2. Give the controller temporary, least-privilege AWS role credentials for the private
+   artifact bucket/prefix and the configured RunPod SSM parameter. Attach an instance
+   profile on EC2; on another host configure a role-assuming `credential_process` (for
+   example the IAM Roles Anywhere signing helper). Do not create local static AWS
+   credentials.
 3. Configure controller SSH access and host security through normal AWS operations.
 4. Apply `controller/cloud-init.yaml` as user data, or run:
 
@@ -1439,8 +1442,10 @@ artifacts from S3, and experiment metadata from MLflow/DagsHub.
 - Health failure: inspect the named failed check. A missing marker requires bootstrap;
   missing/no-GPU `nvidia-smi` prevents `READY`; AMD workers are explicitly unsupported
   in Phase 4.
-- AWS identity failure: verify an instance profile is attached and IMDS access is not
-  blocked. Do not work around it by creating permanent access keys.
+- AWS identity failure: verify the controller resolves temporary role credentials. On EC2
+  check that an instance profile is attached and IMDS access is not blocked; on another
+  host check that the configured `credential_process` returns an assumed-role session.
+  Do not work around it by creating permanent access keys.
 - S3 failure: verify region, bucket, prefix, and role policy separately.
 - S3 403 on a storage command: `HeadObject` needs `s3:GetObject` on the object and
   listing needs `s3:ListBucket` with the `s3:prefix` condition on the bucket ARN.

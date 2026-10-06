@@ -87,9 +87,11 @@ implicitly provisioned by job submission. See [Colab execution](docs/COLAB.md).
 
 The persistent/stoppable EC2 controller is the writable development environment. It
 contains OMP, Codex CLI, AGF, the `wavCSE` checkout, this repository, and the `infra`
-CLI. AWS access comes from an EC2 instance profile. The RunPod API key comes from the
-`RUNPOD_API_KEY` environment variable for local/temporary use or, on the controller,
-from an AWS Systems Manager Parameter Store `SecureString` resolved at runtime.
+CLI. AWS access comes from temporary role credentials resolved by Boto3's standard chain
+(an EC2 instance profile, or a role-assuming `credential_process` on another host). The
+RunPod API key comes from the `RUNPOD_API_KEY` environment variable for local/temporary
+use or, on the controller, from an AWS Systems Manager Parameter Store `SecureString`
+resolved at runtime.
 
 Disposable GPU workers execute immutable wavCSE commits. GitHub distributes code, a
 private S3 bucket is the canonical store for large artifacts, and wavCSE retains
@@ -223,7 +225,7 @@ graphql_url = "https://api.runpod.io/graphql"
 ```
 
 The key itself remains in an SSM `SecureString`. Boto3 reads it with decryption through
-the controller's EC2 instance profile; no permanent AWS access keys are installed.
+the controller's temporary role credentials; no permanent AWS access keys are installed.
 `RUNPOD_API_KEY`, when non-empty, takes precedence for local development, CI, and
 temporary testing. Do not put the key in TOML or commit a populated `.env` file.
 [`.env.example`](.env.example) documents variables but is not automatically loaded.
@@ -534,7 +536,7 @@ reference, operator procedure, and the two Phase 6 integration tests.
 
 ## Security model
 
-- The controller is trusted and uses its EC2 IAM role through the normal AWS SDK
+- The controller is trusted and uses its temporary AWS role through the normal AWS SDK
   credential chain (Boto3's provider chain, never an explicit metadata fetch).
 - RunPod credentials resolve in memory from an environment override or SSM
   `SecureString`; authorization values are redacted and never persisted.
@@ -562,11 +564,11 @@ See [Security](docs/SECURITY.md) for the threat assumptions and IAM guidance.
 
 ## Recovery
 
-A controller can be reconstructed by launching supported Ubuntu, attaching the scoped
-instance profile, applying the thin cloud-init configuration, cloning both repositories,
-restoring user-managed authentication, and running `infra doctor`. Source remains in
-GitHub, large artifacts remain in S3, and experiment metadata remains in MLflow/DagsHub.
-Local operational state is never the sole source of truth.
+A controller can be reconstructed by launching supported Ubuntu, providing the scoped
+temporary role credentials, applying the thin cloud-init configuration, cloning both
+repositories, restoring user-managed authentication, and running `infra doctor`. Source
+remains in GitHub, large artifacts remain in S3, and experiment metadata remains in
+MLflow/DagsHub. Local operational state is never the sole source of truth.
 
 Detailed steps are in [Operations](docs/OPERATIONS.md).
 

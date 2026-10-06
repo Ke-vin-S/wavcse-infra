@@ -644,7 +644,9 @@ takes precedence.
 
 # 22. IAM
 
-The controller uses an EC2 IAM instance profile.
+The controller uses temporary AWS role credentials resolved by Boto3's standard
+credential chain: an EC2 instance profile, or a role-assuming `credential_process` on a
+non-EC2 controller. Long-lived static access keys are never used.
 
 It should receive only required S3 permissions for the wavCSE bucket/prefix.
 

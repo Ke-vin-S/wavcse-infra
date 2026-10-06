@@ -1600,3 +1600,52 @@ worker is for interactive debugging only. Worker bootstrap now also installs the
 `tmux` package. The manifest deliberately covers files only — an application that also
 needs a package keeps that line in `controller/bootstrap.sh:install_os_packages` or
 `worker/bootstrap.sh:required_packages`.
+
+## ADR-032: Accept any temporary role credential, and prove the identity is a role session
+
+### Context
+
+The controller was assumed to be an EC2 instance, so `infra doctor` required Boto3's
+resolved credential method to be exactly `iam-role` before it would make an STS or S3
+call. A controller hosted outside AWS — for example an Azure virtual machine — has no
+instance profile, and the natural substitute, an out-of-tree `credential_process` such as
+the IAM Roles Anywhere signing helper, resolves as `custom-process`. Every SSM and S3
+operation outside `infra doctor` already used Boto3's ordinary credential chain and
+worked, so the doctor check alone reported a correctly configured non-EC2 controller as
+broken and exited non-zero.
+
+The property that actually matters is invariant 4: the controller holds no long-lived
+static AWS key and does not put one on a worker. Pinning one Boto3 provider implementation
+was a proxy for that property, and a wrong one.
+
+### Decision
+
+`doctor.py` refuses only the credential methods that denote a static, long-lived key
+(`env`, `shared-credentials-file`, `config-file`) before it contacts AWS, and then
+requires the identity STS returns to be a temporary role session — an `assumed-role` or
+`federated-user` ARN. Both the EC2 instance profile and a role-assuming
+`credential_process` satisfy it; a static IAM user, whose ARN is `.../user/...`, does not,
+even if it somehow reaches the identity check. The check is renamed from
+`_require_instance_profile` to `_require_temporary_role_credentials` so the code states
+the invariant it enforces rather than the deployment that first satisfied it.
+
+### Alternatives rejected
+
+- Keep `== "iam-role"` and document the Azure controller as unsupported: makes the
+  required gate lie about a working controller, and pushes operators toward permanent
+  access keys, which is the outcome invariant 4 exists to prevent.
+- Accept any resolved credential, including static keys, on a non-EC2 host: discards the
+  invariant rather than restating it.
+- Install a local IMDS emulator so Boto3 reports `iam-role`: adds a resident unauthenticated
+  credential service to the controller to satisfy a string comparison.
+- Trust the credential method alone: `custom-process` is opaque, so the method is evidence
+  about the source while the STS ARN is evidence about the result; the decision requires
+  both.
+
+### Consequences
+
+`infra doctor`'s AWS identity and S3 checks pass on an EC2 controller and on a non-EC2
+controller whose `credential_process` assumes a role, and still fail on static keys. The
+EC2 reference deployment is unchanged and no code path gained an AWS dependency on a
+non-EC2 host. A non-EC2 controller must supply its own credential mechanism, certificate
+lifecycle, and renewal, which this repository neither installs nor manages.

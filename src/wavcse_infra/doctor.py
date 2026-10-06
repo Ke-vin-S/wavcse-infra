@@ -27,6 +27,13 @@ from wavcse_infra.models import ColabBillingMode
 from wavcse_infra.providers.colab import ColabClient
 from wavcse_infra.redaction import redact
 
+# Long-lived static keys resolve through the process environment or a shared credentials
+# file. Every other Boto3 credential source yields temporary, refreshable credentials,
+# which is what the controller requires; the resolved STS identity is additionally
+# checked to be an assumed-role session before the credential is trusted.
+_STATIC_CREDENTIAL_METHODS = frozenset({"env", "shared-credentials-file", "config-file"})
+_TEMPORARY_ROLE_ARN_MARKERS = (":assumed-role/", ":federated-user/")
+
 
 class CheckStatus(StrEnum):
     """Outcome of one independent diagnostic check."""
@@ -103,7 +110,7 @@ class SystemProbes:
 
     def aws_identity(self, timeout_seconds: float, region: str | None) -> AwsIdentity:
         session = _aws_session(region)
-        credential_method = _require_instance_profile(session)
+        credential_method = _require_temporary_role_credentials(session)
         client = session.client("sts", config=_botocore_config(timeout_seconds))
         response = client.get_caller_identity()
         return AwsIdentity(
@@ -121,7 +128,7 @@ class SystemProbes:
         region: str | None,
     ) -> int:
         session = _aws_session(region)
-        _require_instance_profile(session)
+        _require_temporary_role_credentials(session)
         client = session.client("s3", config=_botocore_config(timeout_seconds))
         response: dict[str, Any] = client.list_objects_v2(
             Bucket=bucket,
@@ -411,17 +418,18 @@ def _aws_identity_check(
         identity = probes.aws_identity(timeout_seconds, region)
     except Exception as exc:  # Botocore failures are converted to one actionable result.
         return DoctorCheck("AWS identity", CheckStatus.FAIL, redact(exc))
-    if identity.credential_method != "iam-role":
+    if not _is_temporary_role_session(identity.arn):
         return DoctorCheck(
             "AWS identity",
             CheckStatus.FAIL,
-            f"credentials resolved from {identity.credential_method}; "
-            "expected EC2 instance profile",
+            f"credentials resolved from {identity.credential_method} as {identity.arn}; "
+            "expected temporary role-session credentials",
         )
     return DoctorCheck(
         "AWS identity",
         CheckStatus.PASS,
-        f"account {identity.account}, {identity.arn} (instance profile, region {identity.region})",
+        f"account {identity.account}, {identity.arn} "
+        f"({identity.credential_method}, region {identity.region})",
     )
 
 
@@ -472,15 +480,29 @@ def _botocore_config(timeout_seconds: float) -> BotocoreConfig:
     )
 
 
-def _require_instance_profile(session: boto3.Session) -> str:
+def _require_temporary_role_credentials(session: boto3.Session) -> str:
+    """Reject long-lived static keys before any AWS call reads the RunPod secret.
+
+    Any Boto3 source that yields temporary, refreshable role credentials is accepted,
+    including an EC2 instance profile and an out-of-tree `credential_process` such as the
+    IAM Roles Anywhere signing helper. Only static keys are refused.
+    """
+
     credentials = session.get_credentials()
     if credentials is None:
         raise RuntimeError("Boto3 did not resolve AWS credentials")
-    if credentials.method != "iam-role":
+    if credentials.method in _STATIC_CREDENTIAL_METHODS:
         raise RuntimeError(
-            f"AWS credentials resolved from {credentials.method}; expected EC2 instance profile"
+            f"AWS credentials resolved from {credentials.method}; "
+            "expected temporary role credentials, not a static key"
         )
     return credentials.method
+
+
+def _is_temporary_role_session(arn: str) -> bool:
+    """Whether an STS identity ARN denotes a temporary role session, not a static user."""
+
+    return any(marker in arn for marker in _TEMPORARY_ROLE_ARN_MARKERS)
 
 
 def _aws_session(region: str | None) -> boto3.Session:

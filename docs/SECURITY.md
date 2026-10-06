@@ -24,10 +24,13 @@ SSM Parameter Store and are never committed.
 
 ### AWS
 
-The controller uses an attached EC2 instance profile. Boto3 discovers and refreshes the
-temporary role credentials through its standard credential chain; the project does not
-accept or install static AWS access keys. `infra doctor` requires Boto3's resolved
-credential method to be `iam-role` before making STS or S3 calls, so an accidentally
+The controller uses temporary role credentials resolved by Boto3's standard credential
+chain. On EC2 that is the attached instance profile; on a non-EC2 controller it may be an
+out-of-tree `credential_process`, such as the IAM Roles Anywhere signing helper, that
+assumes a role. The project does not accept or install static AWS access keys.
+`infra doctor` rejects a credential whose resolved method is a static source (`env`,
+`shared-credentials-file`, `config-file`) before making STS or S3 calls, and requires the
+resolved STS identity to be an assumed-role or federated-user session, so an accidentally
 exported static key is reported rather than used for the diagnostic.
 
 The role should grant only required actions for the configured bucket and `wavcse/`
@@ -56,7 +59,8 @@ parameter ARN:
 If the `SecureString` uses a customer-managed KMS key, the controller role also needs
 `kms:Decrypt` on that key ARN. Do not grant account-wide SSM, KMS, or administrator
 access. The application relies on Boto3's normal credential chain; on EC2 the attached
-instance profile supplies and refreshes temporary AWS credentials.
+instance profile, or on a non-EC2 controller a role-assuming `credential_process`,
+supplies and refreshes temporary AWS credentials.
 
 ### Google Colab
 

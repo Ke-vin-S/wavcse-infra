@@ -10,7 +10,7 @@ from wavcse_infra.doctor import (
     CheckStatus,
     DoctorCheck,
     SystemProbes,
-    _require_instance_profile,
+    _require_temporary_role_credentials,
     run_doctor,
 )
 from wavcse_infra.errors import CredentialError
@@ -411,7 +411,7 @@ def test_doctor_reports_each_missing_agent_tool_with_install_command(
     assert f"./controller/install-agents.sh --only {command}" in check.detail
 
 
-def test_doctor_rejects_non_instance_profile_aws_credentials(tmp_path: Path) -> None:
+def test_doctor_rejects_static_user_aws_credentials(tmp_path: Path) -> None:
     settings = _configured_settings(tmp_path)
     config_path = _config_file(tmp_path)
 
@@ -433,7 +433,32 @@ def test_doctor_rejects_non_instance_profile_aws_credentials(tmp_path: Path) -> 
 
     identity_check = next(check for check in report.checks if check.name == "AWS identity")
     assert identity_check.status is CheckStatus.FAIL
-    assert "expected EC2 instance profile" in identity_check.detail
+    assert "expected temporary role-session credentials" in identity_check.detail
+
+
+def test_doctor_accepts_a_credential_process_role_session(tmp_path: Path) -> None:
+    settings = _configured_settings(tmp_path)
+    config_path = _config_file(tmp_path)
+
+    class RolesAnywhereProbes(HealthyProbes):
+        def aws_identity(self, timeout_seconds: float, region: str | None) -> AwsIdentity:
+            del timeout_seconds, region
+            return AwsIdentity(
+                credential_method="custom-process",
+                region="ap-south-1",
+                account="123456789012",
+                arn="arn:aws:sts::123456789012:assumed-role/wavcse-controller/azure-vm",
+            )
+
+    report = run_doctor(
+        settings,
+        RolesAnywhereProbes({settings.paths.wavcse, settings.ssh.private_key, config_path}),
+        config_path=config_path,
+    )
+
+    identity_check = next(check for check in report.checks if check.name == "AWS identity")
+    assert identity_check.status is CheckStatus.PASS
+    assert "custom-process" in identity_check.detail
 
 
 def test_doctor_redacts_external_error_details(tmp_path: Path) -> None:
@@ -568,5 +593,16 @@ def test_system_probe_refuses_static_aws_credentials_before_use() -> None:
         def get_credentials(self) -> StaticCredentials:
             return StaticCredentials()
 
-    with pytest.raises(RuntimeError, match="expected EC2 instance profile"):
-        _require_instance_profile(StaticCredentialSession())
+    with pytest.raises(RuntimeError, match="expected temporary role credentials"):
+        _require_temporary_role_credentials(StaticCredentialSession())
+
+
+def test_temporary_role_credentials_accept_a_credential_process() -> None:
+    class ProcessCredentials:
+        method = "custom-process"
+
+    class ProcessCredentialSession:
+        def get_credentials(self) -> ProcessCredentials:
+            return ProcessCredentials()
+
+    assert _require_temporary_role_credentials(ProcessCredentialSession()) == "custom-process"
