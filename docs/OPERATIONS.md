@@ -244,7 +244,7 @@ The reviewed default pins and upstream mechanisms are:
 
 | Tool | Default | Installation mechanism | Installed command |
 | --- | --- | --- | --- |
-| OMP | `v18.3.2` | Installer from the exact `can1357/oh-my-pi` Git tag, binary mode, release SHA-256 verified | `~/.local/bin/omp` |
+| OMP | `v18.8.0` | Installer from the exact `can1357/oh-my-pi` Git tag, binary mode, release SHA-256 verified | `~/.local/bin/omp` |
 | Codex CLI | `0.157.1` | OpenAI standalone installer with `--release`; upstream release digest verification | `~/.local/bin/codex` |
 | AGF | `v0.15.1` | Official GitHub release archive with pinned SHA-256 | `~/.local/bin/agf` |
 
