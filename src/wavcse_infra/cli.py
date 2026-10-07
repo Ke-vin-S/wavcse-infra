@@ -856,7 +856,7 @@ def apply_worker_config(
 
     settings = _load_cli_settings(_context(context))
     try:
-        load_app_config_entries(app=app)
+        load_app_config_entries(app=app, target="worker")
         _require_runpod_transport(worker_id, "apply the worker application configuration")
         with RunPodClient.from_settings(settings) as client:
             bootstrapper, _ = _worker_access(client, settings)

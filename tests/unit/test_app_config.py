@@ -103,8 +103,9 @@ def test_manifest_uses_the_operator_tmux_settings() -> None:
 @pytest.mark.parametrize(
     ("manifest", "line", "reason"),
     [
-        ("tmux tmux.conf", 1, "expected <app> <source> <destination> [mode]"),
-        ("tmux tmux.conf .tmux.conf 0644 extra", 1, "expected <app> <source>"),
+        ("tmux tmux.conf", 1, "expected <app> <source> <destination> [mode] [target]"),
+        ("tmux tmux.conf .tmux.conf 0644 both extra", 1, "expected <app> <source>"),
+        ("tmux tmux.conf .tmux.conf 0644 elsewhere", 1, "invalid target"),
         ("tmux /etc/tmux.conf .tmux.conf", 1, "unsafe source"),
         ("tmux ../tmux.conf .tmux.conf", 1, "unsafe source"),
         ("tmux tmux.conf /root/.tmux.conf", 1, "unsafe destination"),
@@ -132,7 +133,9 @@ def test_an_empty_manifest_is_refused_rather_than_silently_applied() -> None:
 
 
 def test_unknown_app_names_the_mirrored_apps() -> None:
-    with pytest.raises(ConfigurationError, match=r"unknown app 'nope'; mirrored apps are: tmux"):
+    with pytest.raises(
+        ConfigurationError, match=r"unknown app 'nope'; mirrored apps are: opencode, tmux"
+    ):
         load_app_config_entries(app="nope")
 
 

@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, cast
 
 from wavcse_infra.errors import ConfigurationError, InfraError
 from wavcse_infra.redaction import redact
@@ -28,6 +28,8 @@ _APP_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _MODE_PATTERN = re.compile(r"^[0-7]{3,4}$")
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DEFAULT_MODE = 0o644
+_DEFAULT_TARGET: Literal["controller", "worker", "both"] = "both"
+_TARGETS = ("controller", "worker", "both")
 _DIAGNOSTIC_LIMIT = 500
 
 # Applied on the worker to inspect and then install the reviewed configuration files.
@@ -129,12 +131,16 @@ _APP_CONFIG_PROGRAM = (
 
 @dataclass(frozen=True)
 class AppConfigEntry:
-    """One mirrored file: where it lives in this repository and where it belongs."""
+    """One mirrored file: where it lives in this repository and where it belongs.
+
+    `target` selects the account that receives it: the controller, a worker, or both.
+    """
 
     app: str
     source: str
     destination: str
     mode: int
+    target: Literal["controller", "worker", "both"] = _DEFAULT_TARGET
 
 
 @dataclass(frozen=True)
@@ -163,17 +169,37 @@ class AppConfigOutcome:
         return f"{self.app}: error {target} ({self.detail or 'unknown remote error'})"
 
 
-def load_app_config_entries(*, app: str | None = None) -> tuple[AppConfigEntry, ...]:
-    """Load the mirrored application registry, optionally limited to one app."""
+def load_app_config_entries(
+    *,
+    app: str | None = None,
+    target: Literal["controller", "worker", "both"] | None = None,
+) -> tuple[AppConfigEntry, ...]:
+    """Load the mirrored application registry, optionally limited to one app or target."""
 
     entries = _parse_manifest(_read_registry_file("manifest"))
     if app is None:
-        return entries
+        return _for_target(entries, target)
     selected = tuple(entry for entry in entries if entry.app == app)
     if not selected:
         mirrored = ", ".join(sorted({entry.app for entry in entries}))
         raise ConfigurationError(f"unknown app {app!r}; mirrored apps are: {mirrored}")
-    return selected
+    visible = _for_target(selected, target)
+    if not visible:
+        raise ConfigurationError(
+            f"app {app!r} has no {target} entries in {_MANIFEST}; it targets {selected[0].target}"
+        )
+    return visible
+
+
+def _for_target(
+    entries: tuple[AppConfigEntry, ...],
+    target: Literal["controller", "worker", "both"] | None,
+) -> tuple[AppConfigEntry, ...]:
+    """Keep the entries that the given account receives; `None` keeps everything."""
+
+    if target is None:
+        return entries
+    return tuple(entry for entry in entries if entry.target in (target, "both"))
 
 
 def load_app_config_content(entry: AppConfigEntry) -> str:
@@ -202,7 +228,9 @@ def apply_worker_app_config(
     accepts it, and is backed up first; with no `confirm` it is preserved as-is.
     """
 
-    entries = load_app_config_entries(app=app)
+    entries = load_app_config_entries(app=app, target="worker")
+    if not entries:
+        return ()
     contents = {entry.destination: load_app_config_content(entry) for entry in entries}
     digests = {destination: app_config_digest(content) for destination, content in contents.items()}
     inspect_argv = (
@@ -344,18 +372,26 @@ def _parse_manifest(text: str) -> tuple[AppConfigEntry, ...]:
         fields = line.split()
         if not fields or fields[0].startswith("#"):
             continue
-        if len(fields) not in (3, 4):
-            _manifest_error(number, "expected <app> <source> <destination> [mode]")
+        if len(fields) not in (3, 4, 5):
+            _manifest_error(number, "expected <app> <source> <destination> [mode] [target]")
         app, source, destination = fields[0], fields[1], fields[2]
         if not _APP_PATTERN.match(app):
             _manifest_error(number, f"invalid app name {app!r}")
         _reject_unsafe(number, source, "source")
         _reject_unsafe(number, destination, "destination")
         mode = _DEFAULT_MODE
-        if len(fields) == 4:
+        if len(fields) >= 4:
             if not _MODE_PATTERN.match(fields[3]):
                 _manifest_error(number, f"invalid mode {fields[3]!r}; expected 3 or 4 octal digits")
             mode = int(fields[3], 8)
+        target = _DEFAULT_TARGET
+        if len(fields) == 5:
+            if fields[4] not in _TARGETS:
+                _manifest_error(
+                    number,
+                    f"invalid target {fields[4]!r}; expected controller, worker, or both",
+                )
+            target = cast(Literal["controller", "worker", "both"], fields[4])
         if destination in destinations:
             _manifest_error(
                 number,
@@ -369,6 +405,7 @@ def _parse_manifest(text: str) -> tuple[AppConfigEntry, ...]:
                 source=f"apps/{app}/{source}",
                 destination=destination,
                 mode=mode,
+                target=target,
             )
         )
     if not entries:

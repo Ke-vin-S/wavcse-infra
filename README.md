@@ -19,7 +19,7 @@ slice:
 - a locked `uv` environment and credential-free CI;
 - idempotent Ubuntu controller bootstrap and thin cloud-init;
 - controller Git commit identity applied by bootstrap from non-secret environment settings;
-- reproducible controller-only installation of OMP, Codex CLI, and AGF;
+- reproducible controller-only installation of OMP, Codex CLI, AGF, and OpenCode;
 - `infra doctor` controller, credential-source, configuration, and connectivity checks;
 - normalized RunPod REST v2 list/show and GPU offer discovery;
 - explicit create/start/stop/destroy with bounded polling and exact-ID safeguards;
@@ -87,8 +87,9 @@ implicitly provisioned by job submission. See [Colab execution](docs/COLAB.md).
 ## Architecture
 
 The persistent/stoppable EC2 controller is the writable development environment. It
-contains OMP, Codex CLI, AGF, the `wavCSE` checkout, this repository, and the `infra`
-CLI. AWS access comes from temporary role credentials resolved by Boto3's standard chain
+contains OMP, Codex CLI, AGF, OpenCode, the `wavCSE` checkout, this repository, and
+the `infra` CLI. AWS access comes from temporary role credentials resolved by Boto3's
+standard chain
 (an EC2 instance profile, or a role-assuming `credential_process` on another host). The
 RunPod API key comes from the `RUNPOD_API_KEY` environment variable for local/temporary
 use or, on the controller, from an AWS Systems Manager Parameter Store `SecureString`
@@ -156,24 +157,26 @@ make install-agents
 ```
 
 The installer uses reviewed upstream release pins, reports detected versions, and
-supports `--only omp`, `--only codex`, `--only agf`, and the explicit `--upgrade` mode.
-It places managed binaries in `~/.local/bin` and configures the controller login shell
-to find `~/.local/bin`, `~/.cargo/bin`, and `~/.bun/bin` without duplicate profile
-entries. The latter two preserve compatibility with historical installations; the
-default installer does not require Cargo or Bun.
+supports `--only omp`, `--only codex`, `--only agf`, `--only opencode`, and the explicit
+`--upgrade` mode. It places managed binaries in `~/.local/bin` and configures the
+controller login shell to find `~/.local/bin`, `~/.cargo/bin`, and `~/.bun/bin` without
+duplicate profile entries. The latter two preserve compatibility with historical
+installations; the default installer does not require Cargo or Bun.
 
 Installation and authentication are separate. On a headless controller, authenticate
 after installation:
 
 ```text
-OMP:   start omp, then run /login (or /login <provider>)
-Codex: codex login --device-auth
-AGF:   no authentication required
+OMP:      start omp, then run /login (or /login <provider>)
+Codex:    codex login --device-auth
+AGF:      no authentication required
+OpenCode: opencode auth login
 ```
 
-OMP, Codex, and AGF are controller development tools. They are not installed on normal
-GPU training workers. The selected upstream mechanisms and version policy are recorded
-in [ADR-011](docs/DECISIONS.md#adr-011-install-controller-agents-from-pinned-official-releases).
+OMP, Codex, AGF, and OpenCode are controller development tools. They are not installed
+on normal GPU training workers. The selected upstream mechanisms and version policy are
+recorded in
+[ADR-011](docs/DECISIONS.md#adr-011-install-controller-agents-from-pinned-official-releases).
 
 ## Google Colab CLI
 
@@ -351,9 +354,9 @@ first-worker procedure and current limitations.
 
 Normal GPU bootstrap installs only stable Ubuntu prerequisites: Git, Python, uv, curl,
 CA certificates, archive tools, and basic process/filesystem utilities. It does not
-install OMP, Codex, AGF, PyTorch, wavCSE, or research dependencies. The current GPU
-health contract supports NVIDIA workers with `nvidia-smi`; unsupported accelerators are
-never silently marked ready.
+install OMP, Codex, AGF, OpenCode, PyTorch, wavCSE, or research dependencies. The
+current GPU health contract supports NVIDIA workers with `nvidia-smi`; unsupported
+accelerators are never silently marked ready.
 
 ## Storage model
 

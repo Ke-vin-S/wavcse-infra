@@ -7,6 +7,9 @@ region = "us-east-1"
 
 [controller]
 expect_omp = true
+# OpenCode is installed by controller/install-agents.sh but is not required
+# until this is set to true.
+expect_opencode = false
 github_url = "https://github.com"
 # mlflow_url = "https://dagshub.com/<owner>/<repository>.mlflow"
 

@@ -31,6 +31,24 @@ def test_defaults_are_safe_and_do_not_require_secrets(
     )
 
 
+def test_controller_agent_expectations_follow_defaults_and_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    settings = load_settings(environ={})
+
+    assert settings.controller.expect_omp is True
+    assert settings.controller.expect_opencode is False
+
+    overridden = load_settings(
+        environ={"WAVCSE_INFRA_EXPECT_OMP": "false", "WAVCSE_INFRA_EXPECT_OPENCODE": "true"}
+    )
+
+    assert overridden.controller.expect_omp is False
+    assert overridden.controller.expect_opencode is True
+
+
 def test_default_user_config_is_loaded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     config_file = tmp_path / ".config" / "wavcse-infra" / "config.toml"

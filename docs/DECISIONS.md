@@ -1698,3 +1698,76 @@ A controller created with the two variables can commit immediately, and reconstr
 restores the identity without a manual step. Operators who never pass them see one
 instruction line instead of an unexplained failure later. Workers are untouched: they
 never author commits, so no worker path gained a Git identity.
+
+## ADR-034: Install OpenCode as a pinned controller tool, and scope mirrored configuration per account
+
+- **Status:** Accepted
+- **Date:** 2026-10-07
+
+### Context
+
+ADR-011 made OMP, Codex, and AGF reproducible controller tools, but the operator also
+works in OpenCode and nothing installed it: a rebuilt controller had no `opencode` and
+no `~/.config/opencode/opencode.jsonc`, so the tool and its configuration were
+reconstructed by hand outside the source of truth.
+
+Two parts of the existing design did not fit it. ADR-011's pins are installed by
+`controller/install-agents.sh`, which knows nothing about OpenCode. ADR-031's
+`apps/manifest` is account-agnostic — every entry is pushed to the controller *and* to
+workers — but OpenCode is controller development tooling, and a normal GPU worker must
+not receive it (ADR-011 and hard invariant 4). `infra doctor` also needs a way to
+require the tool only after the operator has adopted it.
+
+### Decision
+
+Install OpenCode exactly like AGF: `controller/install-agents.sh` gains
+`install_opencode()`, downloading the official `anomalyco/opencode` GitHub release
+archive for the pinned version, verifying a reviewed per-architecture SHA-256 before
+extraction, and installing `opencode` into `~/.local/bin` with `--only opencode`,
+`--upgrade`, and `WAVCSE_INFRA_OPENCODE_*` overrides that follow the OMP/AGF rule (a
+version override must supply the digest override). x86-64 machines without AVX2 use the
+pinned `x64-baseline` archive, matching upstream's own selection. The OMP pin moves to
+`v18.8.0` with its re-verified digests; the mechanism is unchanged.
+
+`apps/manifest` gains an optional fifth field, `target`, taking `controller`, `worker`,
+or `both` and defaulting to `both`. Both parsers — `controller/app-config.sh` and
+`wavcse_infra.app_config` — validate it identically and filter by their own account:
+the controller script never applies a `worker` entry, and the worker applier never
+sends a `controller` entry. OpenCode's entry is `controller`-scoped.
+
+`apps/opencode/opencode.jsonc` is a scaffold carrying only `$schema`, ready for
+configuration the operator chooses to version. Credentials are never mirrored: OpenCode
+keeps them in `auth.json`, which stays out of the repository, out of the manifest, and
+out of every worker.
+
+Doctor gains `controller.expect_opencode`, default `false`, overridable with
+`WAVCSE_INFRA_EXPECT_OPENCODE`. When false the OpenCode check reports `SKIP`; when true
+a missing `opencode` fails with the `--only opencode` remediation, mirroring the
+existing `expect_omp` gate.
+
+### Alternatives rejected
+
+- Upstream's `opencode.ai/install` script: it verifies no pinned digest and installs to
+  its own `~/.opencode/bin`, breaking ADR-011's reviewed-pin and `~/.local/bin`
+  contract.
+- Mirroring the whole `~/.config/opencode` tree: the operator's plugins, commands, and
+  skills live partly as symlinks into machine-local paths and would push workstation
+  state onto the controller and the wheel.
+- Requiring OpenCode in `infra doctor` unconditionally: nothing in the control plane
+  depends on it, so a hard requirement would fail every controller that has not adopted
+  it yet.
+- Scoping entries only in the Bash parser or only in the Python one: the two readers
+  would disagree and a worker would silently receive controller-only configuration.
+- Adding OpenCode to worker bootstrap: agent development tooling on normal GPU workers
+  is explicitly rejected by ADR-011.
+
+### Consequences
+
+A rebuilt controller installs `opencode` from a pinned, digest-verified release and
+receives the scaffolded configuration; workers never see `.config/opencode`. Operators
+who have not opted in see one `SKIP` line from doctor, then `expect_opencode = true`
+turns it into a real gate. OpenCode releases frequently, so its pin needs the same
+maintenance cadence as OMP's — bump the default version and digests together and run
+`--upgrade`. The `target` field is now part of the manifest contract, so a future entry
+may be scoped without further schema changes; a `target` value still requires an
+explicit mode column before it.

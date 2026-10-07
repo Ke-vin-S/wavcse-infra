@@ -10,7 +10,7 @@ experiment semantics, model dependencies, or MLflow instrumentation.
 The components are:
 
 - **AWS EC2 controller:** persistent but stoppable; authoritative writable environment
-  containing OMP, Codex CLI, and AGF.
+  containing OMP, Codex CLI, AGF, and OpenCode.
 - **wavCSE repository:** research code and experiment source of truth.
 - **wavcse-infra repository:** infrastructure CLI and machine bootstrap.
 - **RunPod Pods:** disposable GPU execution environments.
@@ -226,8 +226,8 @@ state and the worker's own files remain authoritative; a local record is never u
   descendants behind is reaped before its outcome is written.
 - `controller/bootstrap.sh` converges supported Ubuntu controllers on required tools
   and the locked project environment, then delegates controller agent installation.
-- `controller/install-agents.sh` installs pinned, verified OMP, Codex CLI, and AGF
-  releases for the controller user without performing authentication.
+- `controller/install-agents.sh` installs pinned, verified OMP, Codex CLI, AGF, and
+  OpenCode releases for the controller user without performing authentication.
 - `controller/cloud-init.yaml` performs only initial public clone and bootstrap dispatch.
 
 No broad generic provider framework exists. RunPod lifecycle remains Pod-specific,
@@ -236,8 +236,8 @@ guarded release. The transport changes while exact-commit checkout, input digest
 checks, job result semantics and canonical output verification remain shared.
 
 Controller agent installation is not part of the worker lifecycle. Normal GPU workers
-remain minimal execution environments and do not receive OMP, Codex, AGF, or controller
-authentication state.
+remain minimal execution environments and do not receive OMP, Codex, AGF, OpenCode, or
+controller authentication state.
 
 ## Configuration flow
 

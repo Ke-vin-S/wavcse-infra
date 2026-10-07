@@ -8,10 +8,15 @@ readonly DEFAULT_CODEX_VERSION='0.157.1'
 readonly DEFAULT_AGF_VERSION='v0.15.1'
 readonly DEFAULT_AGF_X86_64_SHA256='db21c06f0a288f832879828278303cafa6d8f1e967751ee7da9962a3c0c0aeeb'
 readonly DEFAULT_AGF_AARCH64_SHA256='671f34411c49806ccc0e9f580f0c3205f6693d8e893dc114872107c60ff2645e'
+readonly DEFAULT_OPENCODE_VERSION='1.18.35'
+readonly DEFAULT_OPENCODE_X86_64_SHA256='c8f888b451f5494a18f858fffb0e0b68f4e4baa9c241761c5f206884f0fa640d'
+readonly DEFAULT_OPENCODE_X86_64_BASELINE_SHA256='90c97d4a24d36437bce36f27195c9cd2e0b70ed037a04d1c6a6740eb246c2a73'
+readonly DEFAULT_OPENCODE_AARCH64_SHA256='f7f2ba59ee8aa94d388f9696575a32d20e71c2ee48def9f80fc693a60fec6c72'
 
 readonly OMP_VERSION="${WAVCSE_INFRA_OMP_VERSION:-${DEFAULT_OMP_VERSION}}"
 readonly CODEX_VERSION="${WAVCSE_INFRA_CODEX_VERSION:-${DEFAULT_CODEX_VERSION}}"
 readonly AGF_VERSION="${WAVCSE_INFRA_AGF_VERSION:-${DEFAULT_AGF_VERSION}}"
+readonly OPENCODE_VERSION="${WAVCSE_INFRA_OPENCODE_VERSION:-${DEFAULT_OPENCODE_VERSION}}"
 
 CONTROLLER_USER=''
 CONTROLLER_HOME=''
@@ -36,7 +41,7 @@ on_error() {
 
 usage() {
   cat <<'EOF'
-Usage: ./controller/install-agents.sh [--only omp|codex|agf] [--upgrade]
+Usage: ./controller/install-agents.sh [--only omp|codex|agf|opencode] [--upgrade]
 
 Install the pinned controller agent tools. Existing commands are preserved unless
 --upgrade is supplied. Installation never performs provider authentication.
@@ -47,10 +52,10 @@ parse_args() {
   while (($# > 0)); do
     case "$1" in
     --only)
-      (($# >= 2)) || fail '--only requires omp, codex, or agf'
+      (($# >= 2)) || fail '--only requires omp, codex, agf, or opencode'
       [[ -z "${ONLY_TOOL}" ]] || fail '--only may be supplied once'
       case "$2" in
-      omp | codex | agf) ONLY_TOOL="$2" ;;
+      omp | codex | agf | opencode) ONLY_TOOL="$2" ;;
       *) fail "unsupported tool for --only: $2" ;;
       esac
       shift 2
@@ -126,7 +131,7 @@ ensure_download_prerequisites() {
     packages+=(ca-certificates)
   fi
   command -v curl >/dev/null 2>&1 || packages+=(curl)
-  if { selected codex || selected agf; } && ! command -v tar >/dev/null 2>&1; then
+  if { selected codex || selected agf || selected opencode; } && ! command -v tar >/dev/null 2>&1; then
     packages+=(tar)
   fi
   command -v sha256sum >/dev/null 2>&1 || packages+=(coreutils)
@@ -211,6 +216,9 @@ installation_required() {
     return 0
   fi
   if selected agf && ! tool_is_installed agf; then
+    return 0
+  fi
+  if selected opencode && ! tool_is_installed opencode; then
     return 0
   fi
   return 1
@@ -405,6 +413,89 @@ install_agf() {
   INSTALL_STATUS[agf]='installed'
 }
 
+opencode_release_details() {
+  local architecture
+  architecture="$(uname -m)"
+  case "${architecture}" in
+  x86_64 | amd64)
+    if [[ -r /proc/cpuinfo ]] && ! grep -qwi avx2 /proc/cpuinfo; then
+      printf 'opencode-linux-x64-baseline.tar.gz\t%s\n' \
+        "${WAVCSE_INFRA_OPENCODE_X86_64_BASELINE_SHA256:-${DEFAULT_OPENCODE_X86_64_BASELINE_SHA256}}"
+    else
+      printf 'opencode-linux-x64.tar.gz\t%s\n' \
+        "${WAVCSE_INFRA_OPENCODE_X86_64_SHA256:-${DEFAULT_OPENCODE_X86_64_SHA256}}"
+    fi
+    ;;
+  aarch64 | arm64)
+    printf 'opencode-linux-arm64.tar.gz\t%s\n' \
+      "${WAVCSE_INFRA_OPENCODE_AARCH64_SHA256:-${DEFAULT_OPENCODE_AARCH64_SHA256}}"
+    ;;
+  *) fail "OpenCode has no configured release archive for architecture ${architecture}" ;;
+  esac
+}
+
+validate_opencode_version_override() {
+  [[ "${OPENCODE_VERSION}" == "${DEFAULT_OPENCODE_VERSION}" ]] && return
+  case "$(uname -m)" in
+  x86_64 | amd64)
+    if [[ -r /proc/cpuinfo ]] && ! grep -qwi avx2 /proc/cpuinfo; then
+      [[ -n "${WAVCSE_INFRA_OPENCODE_X86_64_BASELINE_SHA256:-}" ]] ||
+        fail 'set WAVCSE_INFRA_OPENCODE_X86_64_BASELINE_SHA256 when overriding WAVCSE_INFRA_OPENCODE_VERSION'
+    else
+      [[ -n "${WAVCSE_INFRA_OPENCODE_X86_64_SHA256:-}" ]] ||
+        fail 'set WAVCSE_INFRA_OPENCODE_X86_64_SHA256 when overriding WAVCSE_INFRA_OPENCODE_VERSION'
+    fi
+    ;;
+  aarch64 | arm64)
+    [[ -n "${WAVCSE_INFRA_OPENCODE_AARCH64_SHA256:-}" ]] ||
+      fail 'set WAVCSE_INFRA_OPENCODE_AARCH64_SHA256 when overriding WAVCSE_INFRA_OPENCODE_VERSION'
+    ;;
+  esac
+}
+
+install_opencode() {
+  local archive_name
+  local expected_sha256
+  local temporary_directory
+  local archive
+  local actual_sha256
+  local extracted_binary
+  local url
+  if ! should_install 'OpenCode' opencode; then
+    return 0
+  fi
+  validate_opencode_version_override
+
+  IFS=$'\t' read -r archive_name expected_sha256 < <(opencode_release_details)
+  url="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/${archive_name}"
+  temporary_directory="$(run_controller mktemp -d)"
+  archive="${temporary_directory}/${archive_name}"
+  printf 'Installing OpenCode %s from anomalyco/opencode.\n' "${OPENCODE_VERSION}"
+
+  if ! run_controller curl --fail --location --proto '=https' --tlsv1.2 \
+    --silent --show-error "${url}" --output "${archive}"; then
+    run_controller rm -rf -- "${temporary_directory}"
+    fail "could not download the official OpenCode archive from ${url}"
+  fi
+  actual_sha256="$(run_controller sha256sum "${archive}" | awk '{print $1}')"
+  if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
+    run_controller rm -rf -- "${temporary_directory}"
+    fail "OpenCode archive checksum mismatch (expected ${expected_sha256}, got ${actual_sha256})"
+  fi
+
+  run_controller tar -xzf "${archive}" -C "${temporary_directory}"
+  extracted_binary="$(run_controller find "${temporary_directory}" -type f -name opencode -print -quit)"
+  if [[ -z "${extracted_binary}" ]]; then
+    run_controller rm -rf -- "${temporary_directory}"
+    fail "OpenCode archive did not contain an opencode binary"
+  fi
+  run_controller install -D -m 0755 -- "${extracted_binary}" \
+    "${CONTROLLER_HOME}/.local/bin/opencode"
+  run_controller rm -rf -- "${temporary_directory}"
+  tool_is_installed opencode || fail 'OpenCode archive was installed but opencode was not found on PATH'
+  INSTALL_STATUS[opencode]='installed'
+}
+
 tool_version() {
   local command_name="$1"
   local path
@@ -433,16 +524,22 @@ print_summary() {
   if selected agf; then
     printf '  PASS AGF    (%s)\n' "${INSTALL_STATUS[agf]:-available}"
   fi
+  if selected opencode; then
+    printf '  PASS OpenCode (%s)\n' "${INSTALL_STATUS[opencode]:-available}"
+  fi
 
   printf '\nController agent tools:\n\n'
   if selected omp; then
-    printf '  %-8s %s\n' 'OMP' "$(tool_version omp)"
+    printf '  %-11s %s\n' 'OMP' "$(tool_version omp)"
   fi
   if selected codex; then
-    printf '  %-8s %s\n' 'Codex' "$(tool_version codex)"
+    printf '  %-11s %s\n' 'Codex' "$(tool_version codex)"
   fi
   if selected agf; then
-    printf '  %-8s %s\n' 'AGF' "$(tool_version agf)"
+    printf '  %-11s %s\n' 'AGF' "$(tool_version agf)"
+  fi
+  if selected opencode; then
+    printf '  %-11s %s\n' 'OpenCode' "$(tool_version opencode)"
   fi
 
   printf '\nManual authentication may still be required:\n'
@@ -454,6 +551,9 @@ print_summary() {
   fi
   if selected agf; then
     printf '  AGF: no authentication required; it reads local agent session stores.\n'
+  fi
+  if selected opencode; then
+    printf '  OpenCode: run opencode auth login, then follow the prompt.\n'
   fi
   printf '\nStart a new login shell before relying on persisted PATH changes.\n'
 }
@@ -484,6 +584,7 @@ main() {
   selected omp && install_omp
   selected codex && install_codex
   selected agf && install_agf
+  selected opencode && install_opencode
 
   print_summary
 }

@@ -11,6 +11,7 @@ EXAMPLE_CONFIG = REPOSITORY_ROOT / "config" / "infra.example.toml"
 
 APP_CONFIG_SCRIPT = REPOSITORY_ROOT / "controller" / "app-config.sh"
 TMUX_SOURCE = REPOSITORY_ROOT / "apps" / "tmux" / "tmux.conf"
+OPENCODE_SOURCE = REPOSITORY_ROOT / "apps" / "opencode" / "opencode.jsonc"
 
 
 def _run_user_config_step(controller_home: Path) -> subprocess.CompletedProcess[str]:
@@ -63,6 +64,7 @@ def _run_existing_agent_install_steps(controller_home: Path) -> subprocess.Compl
         "install_omp\n"
         "install_codex\n"
         "install_agf\n"
+        "install_opencode\n"
     )
     return subprocess.run(
         [
@@ -133,7 +135,7 @@ def test_agent_path_configuration_is_idempotent_and_preserves_existing_content(
 def test_agent_installer_preserves_existing_commands_without_network(tmp_path: Path) -> None:
     binary_directory = tmp_path / ".local" / "bin"
     binary_directory.mkdir(parents=True)
-    for command in ("omp", "codex", "agf"):
+    for command in ("omp", "codex", "agf", "opencode"):
         binary = binary_directory / command
         binary.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         binary.chmod(0o755)
@@ -141,8 +143,62 @@ def test_agent_installer_preserves_existing_commands_without_network(tmp_path: P
     result = _run_existing_agent_install_steps(tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.count("preserving it") == 3
-    assert all((binary_directory / command).exists() for command in ("omp", "codex", "agf"))
+    assert result.stdout.count("preserving it") == 4
+    assert all(
+        (binary_directory / command).exists() for command in ("omp", "codex", "agf", "opencode")
+    )
+
+
+def test_agent_installer_accepts_only_the_documented_tools() -> None:
+    help_result = subprocess.run(
+        ["bash", str(INSTALL_AGENTS_SCRIPT), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    missing_argument = subprocess.run(
+        ["bash", str(INSTALL_AGENTS_SCRIPT), "--only"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    unknown = subprocess.run(
+        ["bash", str(INSTALL_AGENTS_SCRIPT), "--only", "nope"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert help_result.returncode == 0, help_result.stderr
+    assert "--only omp|codex|agf|opencode" in help_result.stdout
+    assert missing_argument.returncode != 0
+    assert "omp, codex, agf, or opencode" in missing_argument.stderr
+    assert unknown.returncode != 0
+    assert "unsupported tool for --only: nope" in unknown.stderr
+
+
+def test_opencode_release_details_matches_a_pinned_digest_for_this_architecture() -> None:
+    command = 'source "$1"\nopencode_release_details\n'
+    result = subprocess.run(
+        ["bash", "-c", command, "opencode-release-test", str(INSTALL_AGENTS_SCRIPT)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    archive, digest = result.stdout.rstrip("\n").split("\t")
+    pinned = {
+        "opencode-linux-x64.tar.gz": (
+            "c8f888b451f5494a18f858fffb0e0b68f4e4baa9c241761c5f206884f0fa640d",
+            "90c97d4a24d36437bce36f27195c9cd2e0b70ed037a04d1c6a6740eb246c2a73",
+        ),
+        "opencode-linux-arm64.tar.gz": (
+            "f7f2ba59ee8aa94d388f9696575a32d20e71c2ee48def9f80fc693a60fec6c72",
+        ),
+    }
+    assert archive in pinned
+    assert digest in pinned[archive]
 
 
 def test_bootstrap_delegates_agent_installation_and_supports_explicit_skip() -> None:
@@ -231,7 +287,9 @@ def test_colab_install_rejects_success_without_binary(tmp_path: Path) -> None:
     assert "not executable" in result.stderr
 
 
-def _app_config_argv(controller_home: Path, *arguments: str) -> list[str]:
+def _app_config_argv(
+    controller_home: Path, *arguments: str, script: Path = APP_CONFIG_SCRIPT
+) -> list[str]:
     command = (
         'source "$1"\n'
         'CONTROLLER_USER="$(id -un)"\n'
@@ -244,7 +302,7 @@ def _app_config_argv(controller_home: Path, *arguments: str) -> list[str]:
         "-c",
         command,
         "app-config-test",
-        str(APP_CONFIG_SCRIPT),
+        str(script),
         str(controller_home),
         *arguments,
     ]
@@ -283,18 +341,28 @@ def _run_app_config_on_tty(
 
 def test_controller_app_config_installs_then_reports_unchanged(tmp_path: Path) -> None:
     target = tmp_path / ".tmux.conf"
+    opencode_target = tmp_path / ".config" / "opencode" / "opencode.jsonc"
 
     installed = _run_app_config(tmp_path)
     rerun = _run_app_config(tmp_path)
     checked = _run_app_config(tmp_path, "--check")
 
     assert installed.returncode == 0, installed.stderr
-    assert installed.stdout == "tmux: installed ~/.tmux.conf\n"
+    assert installed.stdout == (
+        "tmux: installed ~/.tmux.conf\nopencode: installed ~/.config/opencode/opencode.jsonc\n"
+    )
     assert target.read_bytes() == TMUX_SOURCE.read_bytes()
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
-    assert rerun.stdout == "tmux: unchanged ~/.tmux.conf\n"
+    assert opencode_target.read_bytes() == OPENCODE_SOURCE.read_bytes()
+    assert stat.S_IMODE(opencode_target.stat().st_mode) == 0o644
+    assert stat.S_IMODE(opencode_target.parent.stat().st_mode) == 0o700
+    assert rerun.stdout == (
+        "tmux: unchanged ~/.tmux.conf\nopencode: unchanged ~/.config/opencode/opencode.jsonc\n"
+    )
     assert checked.returncode == 0, checked.stderr
-    assert checked.stdout == "tmux: current ~/.tmux.conf\n"
+    assert checked.stdout == (
+        "tmux: current ~/.tmux.conf\nopencode: current ~/.config/opencode/opencode.jsonc\n"
+    )
 
 
 def test_controller_app_config_preserves_a_drifted_file_without_confirmation(
@@ -307,14 +375,17 @@ def test_controller_app_config_preserves_a_drifted_file_without_confirmation(
     applied = _run_app_config(tmp_path)
 
     assert checked.returncode == 1
-    assert checked.stdout == "tmux: drifted ~/.tmux.conf\n"
+    assert checked.stdout == (
+        "tmux: drifted ~/.tmux.conf\nopencode: absent ~/.config/opencode/opencode.jsonc\n"
+    )
     assert applied.returncode == 0, applied.stderr
     assert (
         "tmux: preserved ~/.tmux.conf (local content differs; rerun with --yes to override)"
         in applied.stdout
     )
+    assert "opencode: installed ~/.config/opencode/opencode.jsonc" in applied.stdout
     assert target.read_text(encoding="utf-8") == "# local edit\n"
-    assert sorted(path.name for path in tmp_path.iterdir()) == [".tmux.conf"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == [".config", ".tmux.conf"]
 
 
 def test_controller_app_config_declined_prompt_keeps_the_local_file(tmp_path: Path) -> None:
@@ -371,7 +442,52 @@ def test_controller_app_config_reports_an_unknown_application(tmp_path: Path) ->
     result = _run_app_config(tmp_path, "--app", "nope")
 
     assert result.returncode != 0
-    assert "unknown app 'nope'; mirrored apps are: tmux" in result.stderr
+    assert "unknown app 'nope'; mirrored apps are: opencode, tmux" in result.stderr
+
+
+def test_controller_app_config_skips_worker_only_entries(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    script = repository / "controller" / "app-config.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text(APP_CONFIG_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    for app, source, content in (
+        ("tmux", "tmux.conf", "# tmux\n"),
+        ("control", "control.conf", "# control\n"),
+        ("workeronly", "workeronly.conf", "# worker only\n"),
+    ):
+        directory = repository / "apps" / app
+        directory.mkdir(parents=True)
+        (directory / source).write_text(content, encoding="utf-8")
+    manifest = repository / "apps" / "manifest"
+    manifest.write_text(
+        "tmux\ttmux.conf\t.tmux.conf\t0644\n"
+        "control\tcontrol.conf\t.control.conf\t0644\tcontroller\n"
+        "workeronly\tworkeronly.conf\t.worker.conf\t0644\tworker\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+
+    applied = subprocess.run(
+        _app_config_argv(home, script=script),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    rejected = subprocess.run(
+        _app_config_argv(home, "--app", "workeronly", script=script),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert applied.returncode == 0, applied.stderr
+    assert (home / ".tmux.conf").read_text(encoding="utf-8") == "# tmux\n"
+    assert (home / ".control.conf").read_text(encoding="utf-8") == "# control\n"
+    assert not (home / ".worker.conf").exists()
+    assert "workeronly: installed" not in applied.stdout
+    assert rejected.returncode != 0
+    assert "worker-only" in rejected.stderr
 
 
 def test_controller_bootstrap_installs_mirrored_app_config_without_overriding() -> None:

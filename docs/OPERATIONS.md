@@ -69,6 +69,7 @@ Supported environment variables:
 | `WAVCSE_INFRA_SSH_POLL_INTERVAL_SECONDS` | Initial SSH readiness polling delay |
 | `WAVCSE_INFRA_SSH_MAX_POLL_INTERVAL_SECONDS` | Maximum SSH readiness polling delay |
 | `WAVCSE_INFRA_EXPECT_OMP` | Whether doctor requires `omp` |
+| `WAVCSE_INFRA_EXPECT_OPENCODE` | Whether doctor requires `opencode` (default false) |
 | `WAVCSE_INFRA_MLFLOW_URL` | Optional MLflow health endpoint |
 
 Agent-installer overrides are intentionally separate from runtime configuration:
@@ -85,6 +86,10 @@ Agent-installer overrides are intentionally separate from runtime configuration:
 | `WAVCSE_INFRA_AGF_VERSION` | Controlled AGF release-tag override |
 | `WAVCSE_INFRA_AGF_X86_64_SHA256` | Required x86-64 digest when overriding the AGF pin |
 | `WAVCSE_INFRA_AGF_AARCH64_SHA256` | Required ARM64 digest when overriding the AGF pin |
+| `WAVCSE_INFRA_OPENCODE_VERSION` | Controlled OpenCode release override |
+| `WAVCSE_INFRA_OPENCODE_X86_64_SHA256` | Required x86-64 digest when overriding the OpenCode pin |
+| `WAVCSE_INFRA_OPENCODE_X86_64_BASELINE_SHA256` | Digest for the no-AVX2 x86-64 fallback archive |
+| `WAVCSE_INFRA_OPENCODE_AARCH64_SHA256` | Required ARM64 digest when overriding the OpenCode pin |
 
 Empty values are treated as unset. CLI options override environment values. Validate the
 result without network calls:
@@ -189,7 +194,9 @@ Prerequisites outside this repository:
 
    Bootstrap creates the user configuration if missing and preserves it on every later
    run. It also installs the mirrored application configuration from `apps/`
-   (`~/.tmux.conf` from `apps/tmux/tmux.conf`), preserving a differing existing file.
+   (`~/.tmux.conf` from `apps/tmux/tmux.conf` and
+   `~/.config/opencode/opencode.jsonc` from `apps/opencode/opencode.jsonc`), preserving
+   a differing existing file.
    It installs controller agent tools by default; use `--skip-agents` only when they
    are managed separately. It also sets the controller Git commit identity from
    `WAVCSE_INFRA_GIT_USER_NAME` and `WAVCSE_INFRA_GIT_USER_EMAIL`; when both are unset
@@ -200,9 +207,10 @@ Prerequisites outside this repository:
    remains manual:
 
    ```text
-   OMP:   start omp, then run /login (or /login <provider>)
-   Codex: codex login --device-auth
-   AGF:   no authentication required
+   OMP:      start omp, then run /login (or /login <provider>)
+   Codex:    codex login --device-auth
+   AGF:      no authentication required
+   OpenCode: opencode auth login
    ```
 
    Standard browser-based Codex authentication is also available with `codex login`.
@@ -210,16 +218,19 @@ Prerequisites outside this repository:
 7. Run `infra doctor`.
 
 Bootstrap installs controller prerequisites and the locked Python project. It is
-idempotent and safe to rerun. It delegates OMP, Codex, and AGF installation to
+idempotent and safe to rerun. It delegates OMP, Codex, AGF, and OpenCode installation to
 `controller/install-agents.sh`; it does not inject secrets or provision cloud resources.
 
 ## Application configuration
 
 `apps/manifest` is the source of truth for the operator's application settings, and
-each entry names a file under `apps/<app>/` plus its home-relative destination. The
-controller applies it with `controller/app-config.sh`, which bootstrap runs with
-`--preserve-existing`; workers get the same files through `infra worker bootstrap`
-and `infra worker apply-config <id>`.
+each entry names a file under `apps/<app>/` plus its home-relative destination and an
+optional mode and target. The target is one of `controller`, `worker`, or `both` and
+defaults to `both`; a `controller` entry is never pushed to a worker, and a `worker`
+entry is not applied by the controller script. The controller applies the manifest with
+`controller/app-config.sh`, which bootstrap runs with `--preserve-existing`; workers get
+the applicable files through `infra worker bootstrap` and
+`infra worker apply-config <id>`.
 
 To change a setting, edit the file in this repository, commit and push it, then apply
 it on the controller:
@@ -232,8 +243,12 @@ make app-config         # install an absent file, leave a matching one alone
 A file whose content differs from the repository is never overwritten implicitly: a
 default run prompts, a run without a TTY reports `preserved`, and `--yes` replaces it
 after copying the previous file to a `.wavcse-backup-<UTC timestamp>` sibling. Use
-`--app NAME` to limit the run to one application. On a worker the same rules apply
-through `infra worker apply-config <id> [--yes]`.
+`--app NAME` to limit the run to one application; on a controller-side run naming a
+worker-only app is an error, and the reverse is true on a worker. On a worker the same
+rules apply through `infra worker apply-config <id> [--yes]`.
+
+OpenCode's `auth.json` credential file is deliberately never mirrored: the repository
+carries only the non-secret `opencode.jsonc` scaffold.
 
 ## Controller agent installation
 
@@ -247,11 +262,13 @@ The reviewed default pins and upstream mechanisms are:
 | OMP | `v18.8.0` | Installer from the exact `can1357/oh-my-pi` Git tag, binary mode, release SHA-256 verified | `~/.local/bin/omp` |
 | Codex CLI | `0.157.1` | OpenAI standalone installer with `--release`; upstream release digest verification | `~/.local/bin/codex` |
 | AGF | `v0.15.1` | Official GitHub release archive with pinned SHA-256 | `~/.local/bin/agf` |
+| OpenCode | `1.18.35` | Official `anomalyco/opencode` GitHub release archive with pinned SHA-256 | `~/.local/bin/opencode` |
 
 Current OMP and Codex Linux installers do not require Node, npm, or Bun. AGF supports
 `cargo install agf --locked`, which requires Rust 1.88 or newer and a C compiler, but
-the selected official prebuilt archive does not require Rust/Cargo. The controller
-therefore does not install those development runtimes solely for these tools.
+the selected official prebuilt archive does not require Rust/Cargo. OpenCode likewise
+ships a standalone prebuilt binary archive. The controller therefore does not install
+those development runtimes solely for these tools.
 
 Run the full installer or repair one missing tool:
 
@@ -260,6 +277,7 @@ make install-agents
 ./controller/install-agents.sh --only omp
 ./controller/install-agents.sh --only codex
 ./controller/install-agents.sh --only agf
+./controller/install-agents.sh --only opencode
 ```
 
 A normal run detects and preserves any existing command on the controller PATH,
@@ -270,8 +288,9 @@ command with the configured pinned release, request it explicitly:
 ./controller/install-agents.sh --only omp --upgrade
 ```
 
-For a controlled one-off version override, set the matching version variable. OMP and
-AGF overrides must also provide the matching architecture-specific SHA-256 variable.
+For a controlled one-off version override, set the matching version variable. OMP, AGF,
+and OpenCode overrides must also provide the matching architecture-specific SHA-256
+variable (OpenCode needs the digest of whichever archive the current CPU selects).
 Repository maintenance should normally update the reviewed pins and digests together,
 after which `git pull` followed by `--upgrade` converges the controller.
 
@@ -282,9 +301,10 @@ not duplicate PATH entries or overwrite existing shell configuration. Cargo and 
 paths preserve historical installations; the default installation does not require
 either runtime. Start a new login shell after the first run.
 
-The installer downloads official installer scripts to a temporary file before
-execution; it does not use an opaque `curl | sudo bash` pipeline. It never runs login,
-writes provider credentials, or changes existing OMP/Codex authentication stores.
+The installer downloads official release archives and installer scripts to temporary
+files before execution; it does not use an opaque `curl | sudo bash` pipeline. It never
+runs login, writes provider credentials, or changes existing OMP/Codex/OpenCode
+authentication stores.
 
 ## Google Colab ephemeral execution
 
@@ -1582,3 +1602,4 @@ through the CLI alone. It may rely on exactly this much:
 - [OpenAI Codex CLI installation](https://developers.openai.com/codex/cli)
 - [OpenAI Codex authentication](https://developers.openai.com/codex/auth)
 - [AGF install options](https://github.com/subinium/agf#install)
+- [OpenCode releases](https://github.com/anomalyco/opencode/releases)

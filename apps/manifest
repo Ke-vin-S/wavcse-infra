@@ -1,5 +1,8 @@
 # wavcse-infra mirrored application configuration.
-# Fields: <app> <source-relative-to-apps/<app>> <home-relative-destination> [octal-mode]
+# Fields: <app> <source-relative-to-apps/<app>> <home-relative-destination> [octal-mode] [target]
 # Blank lines and lines whose first field starts with '#' are ignored.
 # Mode defaults to 0644. Destinations are relative to the account's home directory.
+# Target defaults to 'both' and is one of controller, worker, or both: which account
+# receives the entry. A controller-only entry is never pushed to a worker.
 tmux	tmux.conf	.tmux.conf	0644
+opencode	opencode.jsonc	.config/opencode/opencode.jsonc	0644	controller

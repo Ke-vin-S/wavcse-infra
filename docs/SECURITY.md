@@ -224,8 +224,8 @@ user's normal `~/.ssh/known_hosts` and global SSH configuration are not weakened
 Bootstrap and health scripts contain no credentials. Their small reviewed content is
 sent on stdin to `bash -s` over direct SSH; fixed provider-derived values remain
 separate positional arguments. The worker stores only a non-secret bootstrap-version
-marker. Normal workers do not receive OMP, Codex, AGF, controller authentication
-stores, or permanent cloud credentials.
+marker. Normal workers do not receive OMP, Codex, AGF, OpenCode, controller
+authentication stores, or permanent cloud credentials.
 
 ### Controller agent tools
 
@@ -234,14 +234,17 @@ downloaded from the exact pinned `can1357/oh-my-pi` Git tag and its resulting re
 binary is checked against a reviewed SHA-256 digest. Codex uses OpenAI's official
 standalone installer with an explicit release; that installer verifies the selected
 release digest. AGF is downloaded from the pinned `subinium/agf` GitHub release and
-checked against its reviewed SHA-256 digest. Installer scripts are saved to temporary
+OpenCode from the pinned `anomalyco/opencode` GitHub release; both are checked against a
+reviewed SHA-256 digest before extraction. Installer scripts are saved to temporary
 files before execution rather than piped directly into a privileged shell.
 
 These tools run as the controller user, not as root. The script may use `apt` only for
 missing download primitives, and never weakens filesystem permissions. Tool
 installation does not perform authentication. OMP and Codex credentials remain in
 their user-owned upstream stores; AGF needs no account and reads existing local agent
-session stores. No agent tool or controller authentication state is installed on a
+session stores; OpenCode credentials stay in its user-owned `auth.json`, which is never
+mirrored into this repository — `apps/opencode/opencode.jsonc` carries configuration
+only. No agent tool or controller authentication state is installed on a
 normal GPU worker.
 
 ## Presigned URLs and worker transfer
@@ -524,7 +527,7 @@ Never log:
 - authorization headers or API tokens;
 - AWS access keys, secret keys, or session tokens;
 - private SSH keys;
-- OMP or Codex authentication stores and tokens;
+- OMP, Codex, or OpenCode authentication stores and tokens;
 - full presigned URLs or query strings;
 - SSM `SecureString` values;
 - complete environment dumps.

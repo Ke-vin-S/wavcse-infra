@@ -103,6 +103,9 @@ def test_doctor_passes_with_expected_controller_dependencies(tmp_path: Path) -> 
     assert checks["OMP"] == DoctorCheck("OMP", CheckStatus.PASS, "/usr/bin/omp")
     assert checks["Codex"] == DoctorCheck("Codex", CheckStatus.PASS, "/usr/bin/codex")
     assert checks["AGF"] == DoctorCheck("AGF", CheckStatus.PASS, "/usr/bin/agf")
+    assert checks["OpenCode"] == DoctorCheck(
+        "OpenCode", CheckStatus.SKIP, "not required by configuration"
+    )
     assert checks["RunPod credential"] == DoctorCheck(
         "RunPod credential",
         CheckStatus.PASS,
@@ -381,15 +384,25 @@ def test_doctor_reports_inaccessible_ssm_parameter_cleanly(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize(
-    ("command", "check_name"),
-    (("omp", "OMP"), ("codex", "Codex"), ("agf", "AGF")),
+    ("command", "check_name", "expect_opencode"),
+    (
+        ("omp", "OMP", False),
+        ("codex", "Codex", False),
+        ("agf", "AGF", False),
+        ("opencode", "OpenCode", True),
+    ),
 )
 def test_doctor_reports_each_missing_agent_tool_with_install_command(
     tmp_path: Path,
     command: str,
     check_name: str,
+    expect_opencode: bool,
 ) -> None:
     settings = _configured_settings(tmp_path)
+    if expect_opencode:
+        settings = settings.model_copy(
+            update={"controller": settings.controller.model_copy(update={"expect_opencode": True})}
+        )
     config_path = _config_file(tmp_path)
     existing_paths = {settings.paths.wavcse, settings.ssh.private_key, config_path}
 
@@ -409,6 +422,26 @@ def test_doctor_reports_each_missing_agent_tool_with_install_command(
     assert check.status is CheckStatus.FAIL
     assert f"{command} was not found on PATH" in check.detail
     assert f"./controller/install-agents.sh --only {command}" in check.detail
+
+
+def test_opencode_check_is_gated_by_expect_opencode(tmp_path: Path) -> None:
+    config_path = _config_file(tmp_path)
+    settings = _configured_settings(tmp_path)
+    existing_paths = {settings.paths.wavcse, settings.ssh.private_key, config_path}
+
+    skipped = run_doctor(settings, HealthyProbes(existing_paths), config_path=config_path)
+    expecting = settings.model_copy(
+        update={"controller": settings.controller.model_copy(update={"expect_opencode": True})}
+    )
+    required = run_doctor(expecting, HealthyProbes(existing_paths), config_path=config_path)
+
+    assert {check.name: check for check in skipped.checks}["OpenCode"] == DoctorCheck(
+        "OpenCode", CheckStatus.SKIP, "not required by configuration"
+    )
+    assert {check.name: check for check in required.checks}["OpenCode"] == DoctorCheck(
+        "OpenCode", CheckStatus.PASS, "/usr/bin/opencode"
+    )
+    assert required.failed_count == 0
 
 
 def test_doctor_rejects_static_user_aws_credentials(tmp_path: Path) -> None:
@@ -513,6 +546,7 @@ def test_unconfigured_optional_ssh_and_mlflow_checks_do_not_fail(tmp_path: Path)
     statuses = {check.name: check.status for check in report.checks}
     assert statuses["Worker SSH key"] is CheckStatus.WARN
     assert statuses["OMP"] is CheckStatus.SKIP
+    assert statuses["OpenCode"] is CheckStatus.SKIP
     assert statuses["MLflow connectivity"] is CheckStatus.SKIP
 
 

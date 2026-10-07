@@ -1,0 +1,8 @@
+// Mirrored application configuration for OpenCode on the controller.
+// Applied to ~/.config/opencode/opencode.jsonc by controller/app-config.sh.
+//
+// This file is a scaffold: add the configuration you want version-controlled here.
+// Never add credentials — OpenCode stores them in auth.json, which is never mirrored.
+{
+  "$schema": "https://opencode.ai/config.json"
+}

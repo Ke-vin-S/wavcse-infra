@@ -128,8 +128,8 @@ reject_unsafe() {
   esac
 }
 
-# Emit "<app>\t<source>\t<destination>\t<mode>" for every manifest entry, refusing
-# an ambiguous or unsafe registry rather than silently applying part of it.
+# Emit "<app>\t<source>\t<destination>\t<mode>\t<target>" for every manifest entry,
+# refusing an ambiguous or unsafe registry rather than silently applying part of it.
 manifest_entries() {
   local -A seen=()
   local line='' line_number=0 app
@@ -139,8 +139,9 @@ manifest_entries() {
     read -r -a fields <<<"${line}"
     [[ "${#fields[@]}" -gt 0 ]] || continue
     [[ "${fields[0]}" == \#* ]] && continue
-    if [[ "${#fields[@]}" -lt 3 || "${#fields[@]}" -gt 4 ]]; then
-      manifest_error "${line_number}" 'expected <app> <source> <destination> [mode]'
+    if [[ "${#fields[@]}" -lt 3 || "${#fields[@]}" -gt 5 ]]; then
+      manifest_error "${line_number}" \
+        'expected <app> <source> <destination> [mode] [target]'
     fi
     app="${fields[0]}"
     if ! [[ "${app}" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
@@ -149,35 +150,59 @@ manifest_entries() {
     reject_unsafe "${line_number}" "${fields[1]}" source
     reject_unsafe "${line_number}" "${fields[2]}" destination
     local mode='0644'
-    if [[ "${#fields[@]}" -eq 4 ]]; then
+    if [[ "${#fields[@]}" -ge 4 ]]; then
       mode="${fields[3]}"
       if ! [[ "${mode}" =~ ^[0-7]{3,4}$ ]]; then
         manifest_error "${line_number}" "invalid mode '${mode}'; expected 3 or 4 octal digits"
       fi
+    fi
+    local target='both'
+    if [[ "${#fields[@]}" -eq 5 ]]; then
+      target="${fields[4]}"
+      case "${target}" in
+      controller | worker | both) ;;
+      *) manifest_error "${line_number}" \
+        "invalid target '${target}'; expected controller, worker, or both" ;;
+      esac
     fi
     if [[ -n "${seen[${fields[2]}]:-}" ]]; then
       manifest_error "${line_number}" \
         "duplicate destination '${fields[2]}', already declared on line ${seen[${fields[2]}]}"
     fi
     seen["${fields[2]}"]="${line_number}"
-    printf '%s\t%s\t%s\t%s\n' "${app}" "${fields[1]}" "${fields[2]}" "${mode}"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "${app}" "${fields[1]}" "${fields[2]}" "${mode}" "${target}"
   done <"${MANIFEST}"
 }
 
+# This script applies to the controller account, so worker-only entries are filtered
+# out before any app selection; a --app that names a worker-only entry is an error.
 selected_entries() {
-  local entries matched available
-  entries="$(manifest_entries)"
-  if [[ -n "${entries}" ]]; then
-    if [[ -n "${APP_NAME}" ]]; then
-      matched="$(awk -F'\t' -v app="${APP_NAME}" '$1 == app' <<<"${entries}")"
-      if [[ -z "${matched}" ]]; then
-        available="$(cut -f1 <<<"${entries}" | sort -u | paste -sd', ' -)"
-        fail "unknown app '${APP_NAME}'; mirrored apps are: ${available}"
-      fi
-      entries="${matched}"
-    fi
+  local entries matched available all_entries
+  all_entries="$(manifest_entries)"
+  if [[ -n "${all_entries}" ]]; then
+    entries="$(awk -F'\t' '$5 != "worker"' <<<"${all_entries}")"
+  else
+    entries=''
   fi
-  [[ -n "${entries}" ]] || fail "application configuration manifest has no entries: ${MANIFEST}"
+  if [[ -n "${all_entries}" && -z "${entries}" ]]; then
+    fail "application configuration manifest has no controller entries: ${MANIFEST}"
+  fi
+  if [[ -n "${entries}" && -n "${APP_NAME}" ]]; then
+    matched="$(awk -F'\t' -v app="${APP_NAME}" '$1 == app' <<<"${entries}")"
+    if [[ -z "${matched}" ]]; then
+      if awk -F'\t' -v app="${APP_NAME}" '$1 == app' <<<"${all_entries}" | grep -q .; then
+        fail "app '${APP_NAME}' is worker-only and is not applied on this controller"
+      fi
+      available="$(
+        cut -f1 <<<"${entries}" | sort -u | paste -sd, - | sed 's/,/, /g'
+      )"
+      fail "unknown app '${APP_NAME}'; mirrored apps are: ${available}"
+    fi
+    entries="${matched}"
+  fi
+  [[ -n "${entries}" ]] ||
+    fail "application configuration manifest has no entries: ${MANIFEST}"
   printf '%s\n' "${entries}"
 }
 
@@ -306,14 +331,14 @@ main() {
   [[ -n "${CONTROLLER_HOME}" && -d "${CONTROLLER_HOME}" ]] ||
     fail "could not determine home directory for ${CONTROLLER_USER}"
 
-  local entries app source destination mode status=0
+  local entries app source destination mode target status=0
   local -a rows=()
   entries="$(selected_entries)"
   # The rows are read here, not in the apply loop, so the loop's stdin stays the
   # operator's terminal and a differing file can still be confirmed interactively.
   mapfile -t rows <<<"${entries}"
   for row in "${rows[@]}"; do
-    IFS=$'\t' read -r app source destination mode <<<"${row}"
+    IFS=$'\t' read -r app source destination mode target <<<"${row}"
     if ! apply_entry "${app}" "${source}" "${destination}" "${mode}"; then
       status=1
     fi

@@ -46,6 +46,7 @@ class ControllerConfig(FrozenModel):
     """Controller expectations used by diagnostics."""
 
     expect_omp: bool = True
+    expect_opencode: bool = False
     github_url: AnyHttpUrl = AnyHttpUrl("https://github.com")
     mlflow_url: AnyHttpUrl | None = None
 
@@ -287,6 +288,7 @@ ENVIRONMENT_FIELDS: dict[str, tuple[str, str]] = {
     "WAVCSE_INFRA_COLAB_DEFAULT_GPU": ("colab", "default_gpu"),
     "WAVCSE_INFRA_COLAB_ALLOW_FREE_TIER": ("colab", "allow_free_tier"),
     "WAVCSE_INFRA_EXPECT_OMP": ("controller", "expect_omp"),
+    "WAVCSE_INFRA_EXPECT_OPENCODE": ("controller", "expect_opencode"),
     "WAVCSE_INFRA_MLFLOW_URL": ("controller", "mlflow_url"),
     "WAVCSE_INFRA_RUNPOD_API_KEY_PARAMETER": ("runpod", "api_key_parameter"),
     "WAVCSE_INFRA_RUNPOD_API_URL": ("runpod", "api_url"),

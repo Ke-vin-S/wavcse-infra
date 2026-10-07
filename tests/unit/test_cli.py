@@ -904,7 +904,20 @@ def test_worker_apply_config_refuses_an_unknown_application(monkeypatch, tmp_pat
     )
 
     assert result.exit_code == 2
-    assert "mirrored apps are: tmux" in result.stderr
+    assert "mirrored apps are: opencode, tmux" in result.stderr
+
+
+def test_worker_apply_config_refuses_a_controller_only_application(monkeypatch, tmp_path) -> None:
+    _install_fakes(monkeypatch, tmp_path, FakeClient())
+
+    result = runner.invoke(
+        app,
+        ["worker", "apply-config", "pod-123", "--app", "opencode"],
+        env={"RUNPOD_API_KEY": "fake-token"},
+    )
+
+    assert result.exit_code == 2
+    assert "app 'opencode' has no worker entries" in result.stderr
 
 
 def test_health_command_exits_nonzero_without_ready_transition(monkeypatch, tmp_path: Path) -> None:

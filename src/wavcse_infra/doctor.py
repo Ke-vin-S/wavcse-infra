@@ -161,6 +161,7 @@ def run_doctor(
         _omp_check(active_probes, settings.controller.expect_omp),
         _agent_tool_check(active_probes, "Codex", "codex"),
         _agent_tool_check(active_probes, "AGF", "agf"),
+        _opencode_check(active_probes, settings.controller.expect_opencode),
         _wavcse_directory_check(active_probes, settings.paths.wavcse, expanded_config_path),
         _runpod_credential_check(active_probes, settings),
         _http_check(
@@ -327,6 +328,12 @@ def _omp_check(probes: SystemProbes, expected: bool) -> DoctorCheck:
     if not expected:
         return DoctorCheck("OMP", CheckStatus.SKIP, "not required by configuration")
     return _agent_tool_check(probes, "OMP", "omp")
+
+
+def _opencode_check(probes: SystemProbes, expected: bool) -> DoctorCheck:
+    if not expected:
+        return DoctorCheck("OpenCode", CheckStatus.SKIP, "not required by configuration")
+    return _agent_tool_check(probes, "OpenCode", "opencode")
 
 
 def _wavcse_directory_check(probes: SystemProbes, path: Path, config_path: Path) -> DoctorCheck:
