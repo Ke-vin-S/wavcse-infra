@@ -1879,6 +1879,21 @@ interactive non-login shell reads `~/.bashrc` instead, and `bash -c` — the for
 `ssh controller '<command>'`, an agent's shell tool, a cron job, and a systemd unit — reads
 none of them.
 
+That the block targets the login profile is deliberate, not an accident of history:
+`profile_path()` maps zsh to `~/.zprofile`, bash to the first of `~/.bash_profile`,
+`~/.bash_login`, or `~/.profile`, and any other shell to `~/.profile`. A headless controller
+is entered through `ssh`, where the interactive session *is* a login shell, so the login file
+is the one that fires, while `.bashrc` is read only by an interactive non-login shell — on a
+server usually a shell that some tool spawned. PATH belongs to the environment layer rather
+than the interactive layer, one "login file" notion covers bash and zsh alike, and the Ubuntu
+image already puts `~/.local/bin` on PATH from `~/.profile`, so the block extends the
+distribution's own convention instead of competing with it. The upstream installers this
+repository pins choose differently for a desktop-shaped reason — Codex's installer targets
+`~/.bashrc` on Linux (`~/.zshrc` for zsh) and AGF's `agf setup` targets `~/.bashrc` outside
+macOS, both observing that a terminal application opens a non-login interactive shell and
+that no universal startup file exists — which decides only *which interactive* shell resolves
+the tools and leaves every context below untouched, because `bash -c` reads no startup file.
+
 The result was a fully provisioned controller that reported none of its tools as installed.
 A check made that way (`ssh controller 'command -v omp opencode lazygit'`) returns nothing
 and exits 1 while all three binaries are present and executable, so a working controller is
@@ -1912,7 +1927,8 @@ creating it was enough.
 
 - **Add the block to `~/.bashrc` as well**: fixes interactive non-login shells only. `bash
   -c`, which is exactly the failing context, reads neither `.bashrc` nor `.profile`, so the
-  reported symptom would survive the fix.
+  reported symptom would survive the fix; with the links published, such a block would also
+  leave no context uncovered and would make two files own the same PATH entries.
 - **`/etc/environment`**: pam_env applies it to non-login sessions, but the file is plain
   `KEY=value` and cannot expand `$HOME`, so it would hardcode one account's path
   system-wide.
