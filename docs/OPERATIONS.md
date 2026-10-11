@@ -244,6 +244,9 @@ make app-config-check   # report drift without writing; exits 1 when anything dr
 make app-config         # install an absent file, leave a matching one alone
 ```
 
+The controller does not install `make`, so on the controller itself run the script the
+targets wrap: `./controller/app-config.sh --check` and `./controller/app-config.sh`.
+
 A file whose content differs from the repository is never overwritten implicitly: a
 default run prompts, a run without a TTY reports `preserved`, and `--yes` replaces it
 after copying the previous file to a `.wavcse-backup-<UTC timestamp>` sibling. Use
@@ -348,9 +351,12 @@ the installers manage, so a version bump or `--upgrade` is picked up automatical
 Check or repair the links independently of a full bootstrap:
 
 ```bash
-make tool-links-check   # report drift; exit 1 when an installed tool is not published
-make tool-links         # publish what is missing
+./controller/tool-links.sh --check   # report drift; exit 1 when an installed tool is unpublished
+./controller/tool-links.sh           # publish what is missing
 ```
+
+`make tool-links-check` and `make tool-links` wrap the same two invocations where `make` is
+installed; the controller itself does not install `make`, so run the script directly there.
 
 Publishing is idempotent and never destructive on someone else's file: an entry that is
 already a symlink to this repository's binary — including a relative or differently spelled
