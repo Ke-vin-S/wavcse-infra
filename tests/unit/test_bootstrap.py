@@ -12,6 +12,7 @@ EXAMPLE_CONFIG = REPOSITORY_ROOT / "config" / "infra.example.toml"
 APP_CONFIG_SCRIPT = REPOSITORY_ROOT / "controller" / "app-config.sh"
 TMUX_SOURCE = REPOSITORY_ROOT / "apps" / "tmux" / "tmux.conf"
 OPENCODE_SOURCE = REPOSITORY_ROOT / "apps" / "opencode" / "opencode.jsonc"
+LAZYGIT_SOURCE = REPOSITORY_ROOT / "apps" / "lazygit" / "config.yml"
 
 
 def _run_user_config_step(controller_home: Path) -> subprocess.CompletedProcess[str]:
@@ -342,6 +343,7 @@ def _run_app_config_on_tty(
 def test_controller_app_config_installs_then_reports_unchanged(tmp_path: Path) -> None:
     target = tmp_path / ".tmux.conf"
     opencode_target = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+    lazygit_target = tmp_path / ".config" / "lazygit" / "config.yml"
 
     installed = _run_app_config(tmp_path)
     rerun = _run_app_config(tmp_path)
@@ -349,19 +351,28 @@ def test_controller_app_config_installs_then_reports_unchanged(tmp_path: Path) -
 
     assert installed.returncode == 0, installed.stderr
     assert installed.stdout == (
-        "tmux: installed ~/.tmux.conf\nopencode: installed ~/.config/opencode/opencode.jsonc\n"
+        "tmux: installed ~/.tmux.conf\n"
+        "opencode: installed ~/.config/opencode/opencode.jsonc\n"
+        "lazygit: installed ~/.config/lazygit/config.yml\n"
     )
     assert target.read_bytes() == TMUX_SOURCE.read_bytes()
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
     assert opencode_target.read_bytes() == OPENCODE_SOURCE.read_bytes()
     assert stat.S_IMODE(opencode_target.stat().st_mode) == 0o644
     assert stat.S_IMODE(opencode_target.parent.stat().st_mode) == 0o700
+    assert lazygit_target.read_bytes() == LAZYGIT_SOURCE.read_bytes()
+    assert stat.S_IMODE(lazygit_target.stat().st_mode) == 0o644
+    assert stat.S_IMODE(lazygit_target.parent.stat().st_mode) == 0o700
     assert rerun.stdout == (
-        "tmux: unchanged ~/.tmux.conf\nopencode: unchanged ~/.config/opencode/opencode.jsonc\n"
+        "tmux: unchanged ~/.tmux.conf\n"
+        "opencode: unchanged ~/.config/opencode/opencode.jsonc\n"
+        "lazygit: unchanged ~/.config/lazygit/config.yml\n"
     )
     assert checked.returncode == 0, checked.stderr
     assert checked.stdout == (
-        "tmux: current ~/.tmux.conf\nopencode: current ~/.config/opencode/opencode.jsonc\n"
+        "tmux: current ~/.tmux.conf\n"
+        "opencode: current ~/.config/opencode/opencode.jsonc\n"
+        "lazygit: current ~/.config/lazygit/config.yml\n"
     )
 
 
@@ -376,7 +387,9 @@ def test_controller_app_config_preserves_a_drifted_file_without_confirmation(
 
     assert checked.returncode == 1
     assert checked.stdout == (
-        "tmux: drifted ~/.tmux.conf\nopencode: absent ~/.config/opencode/opencode.jsonc\n"
+        "tmux: drifted ~/.tmux.conf\n"
+        "opencode: absent ~/.config/opencode/opencode.jsonc\n"
+        "lazygit: absent ~/.config/lazygit/config.yml\n"
     )
     assert applied.returncode == 0, applied.stderr
     assert (
@@ -442,7 +455,7 @@ def test_controller_app_config_reports_an_unknown_application(tmp_path: Path) ->
     result = _run_app_config(tmp_path, "--app", "nope")
 
     assert result.returncode != 0
-    assert "unknown app 'nope'; mirrored apps are: opencode, tmux" in result.stderr
+    assert "unknown app 'nope'; mirrored apps are: lazygit, opencode, tmux" in result.stderr
 
 
 def test_controller_app_config_skips_worker_only_entries(tmp_path: Path) -> None:
@@ -608,4 +621,115 @@ def test_controller_bootstrap_applies_the_git_identity_after_installing_git() ->
         bootstrap.index("install_os_packages\n")
         < bootstrap.index("  configure_git\n")
         < bootstrap.index("install_uv\n")
+    )
+
+
+def _run_lazygit_install_step(
+    controller_home: Path, environment: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    command = 'source "$1"\nCONTROLLER_USER="$(id -un)"\nCONTROLLER_HOME="$2"\ninstall_lazygit\n'
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            command,
+            "lazygit-install-test",
+            str(BOOTSTRAP_SCRIPT),
+            str(controller_home),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **(environment or {})},
+    )
+
+
+def test_lazygit_release_details_matches_a_pinned_digest_for_this_architecture() -> None:
+    command = 'source "$1"\nlazygit_release_details\n'
+    result = subprocess.run(
+        ["bash", "-c", command, "lazygit-release-test", str(BOOTSTRAP_SCRIPT)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    archive, digest = result.stdout.rstrip("\n").split("\t")
+    pinned = {
+        "lazygit_0.66.0_linux_x86_64.tar.gz": (
+            "5b45541155d20bd32bf2cc5ab5b7e3d91c2eebf0fb1242281350edc27d59d2b7"
+        ),
+        "lazygit_0.66.0_linux_arm64.tar.gz": (
+            "9a4fc4656897ac9f7877b835473ce1a75620cc267f554c57fc4ff266407f3257"
+        ),
+    }
+    assert pinned.get(archive) == digest
+
+
+def test_lazygit_install_preserves_a_matching_pinned_binary_without_network(
+    tmp_path: Path,
+) -> None:
+    """A matching pin is left alone, and its version is not confused with git's own.
+
+    `lazygit --version` reports a trailing "git version=..." field; reading that field as
+    the tool version would send every run back to the network for a redundant download.
+    """
+    binary = tmp_path / ".local" / "bin" / "lazygit"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'commit=deadbeef, build date=2026-10-05T17:12:24Z, "
+        "build source=binaryRelease, version=0.66.0, os=linux, arch=amd64, "
+        "git version=2.53.0\\n'\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+
+    result = _run_lazygit_install_step(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "lazygit 0.66.0 is already installed." in result.stdout
+    assert "Installing lazygit" not in result.stdout
+
+
+def test_lazygit_version_override_requires_the_matching_architecture_digest() -> None:
+    command = 'source "$1"\nvalidate_lazygit_version_override\n'
+    argv = ["bash", "-c", command, "lazygit-override-test", str(BOOTSTRAP_SCRIPT)]
+
+    missing_digest = subprocess.run(
+        argv,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "WAVCSE_INFRA_LAZYGIT_VERSION": "0.65.0"},
+    )
+    supplied_digest = subprocess.run(
+        argv,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "WAVCSE_INFRA_LAZYGIT_VERSION": "0.65.0",
+            "WAVCSE_INFRA_LAZYGIT_X86_64_SHA256": "0" * 64,
+            "WAVCSE_INFRA_LAZYGIT_AARCH64_SHA256": "0" * 64,
+        },
+    )
+
+    assert missing_digest.returncode != 0
+    assert "set WAVCSE_INFRA_LAZYGIT_" in missing_digest.stderr
+    assert "_SHA256 when overriding WAVCSE_INFRA_LAZYGIT_VERSION" in missing_digest.stderr
+    assert supplied_digest.returncode == 0, supplied_digest.stderr
+
+
+def test_controller_bootstrap_installs_the_review_ui_after_its_prerequisites() -> None:
+    bootstrap = BOOTSTRAP_SCRIPT.read_text(encoding="utf-8")
+
+    # install_lazygit downloads and extracts an archive, so it must follow the package
+    # step that provides curl; the locale it depends on is converged before it too.
+    assert (
+        bootstrap.index("install_os_packages\n")
+        < bootstrap.index("  configure_locale\n")
+        < bootstrap.index("  install_lazygit\n")
+        < bootstrap.index("  install_uv\n")
     )

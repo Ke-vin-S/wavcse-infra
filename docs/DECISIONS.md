@@ -1771,3 +1771,95 @@ maintenance cadence as OMP's — bump the default version and digests together a
 `--upgrade`. The `target` field is now part of the manifest contract, so a future entry
 may be scoped without further schema changes; a `target` value still requires an
 explicit mode column before it.
+
+## ADR-035: Review controller checkouts with a pinned terminal client, not a service on the controller
+
+- **Status:** Accepted
+- **Date:** 2026-10-11
+
+### Context
+
+Every recorded change is authored in the controller's `wavCSE` checkout (hard invariant 1),
+so reviewing what an agent did means reading a working tree and a commit graph that only
+exist there. The operator's desktop Git client cannot reach them, and the controller is a
+headless EC2 instance whose only inbound path is SSH.
+
+The alternatives that put a UI on the controller all break an invariant this project treats
+as non-negotiable. A web forge (Gitea/Forgejo) or `ungit` needs a daemon, a database or a
+Node runtime, and a listening port — a capability the controller deliberately does not
+expose. A GUI over `ssh -X` or VNC needs a display server on a headless box, and Electron
+over X11 forwarding is unusable for diff reading. A local `~/.vscode-server` gives the
+closest desktop experience but installs a background Node daemon on the authoritative
+environment, where it competes with the agents for memory and sits outside bootstrap's
+declarative control. None of these is worth a permanent service for a read-mostly task.
+
+### Decision
+
+The review surface is a terminal client rendered into the operator's existing SSH session.
+
+`controller/bootstrap.sh` gains `install_lazygit()`, pinned to `0.66.0`: the official
+`jesseduffield/lazygit` release archive for the detected architecture is downloaded to a
+temporary directory, accepted only if its SHA-256 matches the reviewed digest for that
+architecture, extracted, and installed into `~/.local/bin/lazygit` as the controller user —
+the same shape as the AGF and OpenCode installers (ADR-011, ADR-034). A
+`WAVCSE_INFRA_LAZYGIT_VERSION` override follows the established rule: overriding the pin
+requires the matching digest. Because this is operator tooling rather than agent tooling,
+it lives in `bootstrap.sh` and `--skip-agents` does not skip it, and it is absent from
+`install-agents.sh` and from every worker.
+
+`install_os_packages()` also installs `git-delta` (rendered, syntax-highlighted diffs) and
+`locales`. `apps/lazygit/config.yml` is added as a `controller`-scoped `apps/manifest`
+entry, mirroring settings into `~/.config/lazygit/config.yml` under ADR-031's
+never-overwrite-silently contract: `nerdFontsVersion: "3"`, `showFileIcons`,
+`colorScheme: dark`, `showNumstatInFilesView` for per-file change triage,
+`git.diffRenderers` = delta (default) then git's raw diff (one `|` press away),
+`update.method: never` so a pinned binary cannot update itself out of band, and
+`os.editPreset: vim` for the reword/edit paths that suspend the client.
+
+Two client-side prerequisites are made deterministic rather than documented as folklore.
+`configure_locale()` converges `/etc/default/locale` onto `en_US.UTF-8` when it is missing
+or not UTF-8, preserving any existing UTF-8 value, and `controller/cloud-init.yaml` sets the
+same value for new instances; a C/POSIX locale corrupts box drawing, icon code points, and
+diff output. `apps/tmux/tmux.conf` gains `default-terminal tmux-256color`, an RGB
+`terminal-features` entry, and a reduced `escape-time`, because tmux otherwise approximates
+colour for programs inside it. The Nerd Font itself stays a local-terminal requirement:
+lazygit emits code points, the client's font renders them, and `nerdFontsVersion: ""`
+disables the icons for a plain font.
+
+### Alternatives rejected
+
+- **A web UI on the controller** (Gitea/Forgejo, `ungit`, `git instaweb`): a daemon, a
+  database or Node runtime, and a listening port on the authoritative environment, in
+  exchange for a read-mostly view. `AGENTS.md` requires an explicit request for exactly
+  this class of addition, and nothing here needs it.
+- **A local editor server** (VS Code Remote-SSH, JetBrains Gateway): the best desktop
+  ergonomics, but it installs and maintains a background daemon on the controller, is not
+  provisioned by bootstrap, and consumes the controller's memory while agents run.
+- **GitKraken or another X11 GUI on the instance**: needs a display server plus a VNC or
+  X-forwarding session, and its license/login model is unrelated to this repository's
+  provenance rules.
+- **`tig` as the primary client**: already in apt and a better pure commit-graph browser,
+  but it lacks the staging, interactive-rebase, and per-hunk review affordances that make a
+  client worth having here. It remains available as a one-package addition if graph-first
+  reading turns out to matter.
+- **`gitui`**: not packaged for the target release, self-described beta, and fewer review
+  affordances than lazygit at a similar maintenance risk.
+- **Making the client's config machine-local and unversioned**: the settings that decide what
+  a reviewer sees (icons, colour scheme, diff renderer, self-update) would then silently
+  drift between controllers, which is the failure ADR-031 exists to prevent.
+- **Tying the tool to `install-agents.sh` and `--skip-agents`**: the review client serves the
+  human, not an agent, so it must survive an agents-skipped bootstrap.
+- **Requiring `lazygit` in `infra doctor`**: doctor reports control-plane capability, and the
+  review client is optional operator UX; a hard gate would fail controllers that never open
+  it.
+
+### Consequences
+
+A rebuilt controller offers a Git review client with no service, port, or credential to
+manage, and the settings that shape it are reviewed in the repository. The pin is the only
+supported version, so its maintenance mirrors OMP's: bump the version and both
+architecture digests together, then re-run bootstrap; the mirrored
+`apps/lazygit/config.yml` must be re-checked against that release's schema, because its
+keys do move between releases and an unknown key is ignored silently rather than reported.
+Colour fidelity still depends on the operator's own terminal (Nerd Font v3, and optionally
+forwarding `COLORTERM`), which is documented rather than enforced.

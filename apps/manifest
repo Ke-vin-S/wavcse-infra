@@ -6,3 +6,4 @@
 # receives the entry. A controller-only entry is never pushed to a worker.
 tmux	tmux.conf	.tmux.conf	0644
 opencode	opencode.jsonc	.config/opencode/opencode.jsonc	0644	controller
+lazygit	config.yml	.config/lazygit/config.yml	0644	controller

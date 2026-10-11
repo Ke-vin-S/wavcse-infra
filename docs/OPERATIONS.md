@@ -72,7 +72,7 @@ Supported environment variables:
 | `WAVCSE_INFRA_EXPECT_OPENCODE` | Whether doctor requires `opencode` (default false) |
 | `WAVCSE_INFRA_MLFLOW_URL` | Optional MLflow health endpoint |
 
-Agent-installer overrides are intentionally separate from runtime configuration:
+Controller tool-installer overrides are intentionally separate from runtime configuration:
 
 | Variable | Purpose |
 | --- | --- |
@@ -90,6 +90,9 @@ Agent-installer overrides are intentionally separate from runtime configuration:
 | `WAVCSE_INFRA_OPENCODE_X86_64_SHA256` | Required x86-64 digest when overriding the OpenCode pin |
 | `WAVCSE_INFRA_OPENCODE_X86_64_BASELINE_SHA256` | Digest for the no-AVX2 x86-64 fallback archive |
 | `WAVCSE_INFRA_OPENCODE_AARCH64_SHA256` | Required ARM64 digest when overriding the OpenCode pin |
+| `WAVCSE_INFRA_LAZYGIT_VERSION` | Controlled review-UI (lazygit) release override |
+| `WAVCSE_INFRA_LAZYGIT_X86_64_SHA256` | Required x86-64 digest when overriding the lazygit pin |
+| `WAVCSE_INFRA_LAZYGIT_AARCH64_SHA256` | Required ARM64 digest when overriding the lazygit pin |
 
 Empty values are treated as unset. CLI options override environment values. Validate the
 result without network calls:
@@ -248,7 +251,10 @@ worker-only app is an error, and the reverse is true on a worker. On a worker th
 rules apply through `infra worker apply-config <id> [--yes]`.
 
 OpenCode's `auth.json` credential file is deliberately never mirrored: the repository
-carries only the non-secret `opencode.jsonc` scaffold.
+carries only the non-secret `opencode.jsonc` scaffold. The review UI's settings are
+mirrored the same way (`apps/lazygit/config.yml`); see
+[Controller review UI](#controller-review-ui) for the parts of that session which cannot
+come from the repository.
 
 ## Controller agent installation
 
@@ -305,6 +311,71 @@ The installer downloads official release archives and installer scripts to tempo
 files before execution; it does not use an opaque `curl | sudo bash` pipeline. It never
 runs login, writes provider credentials, or changes existing OMP/Codex/OpenCode
 authentication stores.
+
+## Controller review UI
+
+Reading what an agent changed on the controller is a terminal session, not a service: the
+controller runs no review daemon, opens no port, and holds no credential for it. Bootstrap
+installs a pinned terminal Git client and a diff renderer:
+
+| Tool | Default | Installation mechanism | Installed command |
+| --- | --- | --- | --- |
+| lazygit | `0.66.0` | Official `jesseduffield/lazygit` GitHub release archive with pinned per-architecture SHA-256 | `~/.local/bin/lazygit` |
+| git-delta | Ubuntu `git-delta` | installed by `install_os_packages` | `delta` |
+
+Run it in the checkout you want to read:
+
+```bash
+cd ~/projects/wavCSE   # or this repository itself
+lazygit
+```
+
+A review session is as writable as any other session on the controller: staging, commit
+rewording, rebase, and push use the controller's Git identity (ADR-033) and eventually the
+controller's remote credential. Workers never receive this tool; both the binary and
+`apps/manifest`'s entry are controller-scoped.
+
+### What the controller cannot supply
+
+Three pieces live on your side of the SSH connection, and a missing one shows up as wrong
+colours or tofu boxes rather than as an error:
+
+- **Nerd Font.** `apps/lazygit/config.yml` sets `nerdFontsVersion: "3"`, so lazygit emits
+  icon code points and your local terminal renders them. Install a Nerd Font v3 and select
+  it in the terminal profile; installing a font on the controller does nothing. Use `""`
+  to drop icons, or `"2"` for an older font generation.
+- **UTF-8 locale.** Bootstrap converges `/etc/default/locale` onto a UTF-8 value
+  (`en_US.UTF-8` by default; an existing UTF-8 value is preserved) because a C/POSIX locale
+  corrupts box drawing and multi-byte diffs. New instances get it from
+  `controller/cloud-init.yaml`. An `LC_ALL=C` in your own shell still overrides it.
+- **Truecolor.** `apps/tmux/tmux.conf` declares the outer terminal RGB-capable and sets
+  `default-terminal tmux-256color`; without both, colour inside tmux is approximated.
+  Fidelity is highest when the client also forwards `COLORTERM` to the controller
+  (`SendEnv COLORTERM` locally, `AcceptEnv COLORTERM` in the controller's sshd) — that is a
+  deliberate operator change, not something bootstrap edits.
+
+### Settings and drift
+
+`apps/lazygit/config.yml` is the source of truth, mirrored to `~/.config/lazygit/config.yml`
+exactly like `~/.tmux.conf`, so it is applied the same way:
+
+```bash
+make app-config-check   # report drift without writing
+make app-config         # install an absent file; a differing file prompts and is backed up
+```
+
+The file is written against the schema of the *pinned* release, and lazygit's keys move
+between releases: the widely copied pre-0.44 `git.paging.pager` example no longer exists in
+`0.66.0` and is ignored silently. Check a settings change against the pin before committing:
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/jesseduffield/lazygit/v0.66.0/schema/config.json
+```
+
+Diffs are rendered by `delta` through `git.diffRenderers`, with git's own raw diff kept as
+the second entry — press `|` to cycle. `update.method: never` is deliberate: the pin is the
+only supported version, and an upgrade belongs in the repository (bump the pin and the
+digests together, then re-run bootstrap).
 
 ## Google Colab ephemeral execution
 
@@ -1518,6 +1589,14 @@ must invoke lifecycle commands explicitly.
 - `WAVCSE_INFRA_CONTROLLER_USER` explicitly selects the target account when needed.
 - `WAVCSE_INFRA_UV_VERSION` can override the documented pinned uv version for a
   controlled upgrade.
+- The review UI is installed from a pinned `jesseduffield/lazygit` release archive whose
+  SHA-256 must match the digest pinned for the detected architecture; a
+  `WAVCSE_INFRA_LAZYGIT_VERSION` override requires the matching digest variable. It is an
+  operator tool, so `--skip-agents` does not skip it, and its settings are mirrored from
+  `apps/lazygit/config.yml` rather than written by the installer.
+- The login locale is converged onto a UTF-8 value when it is missing or not UTF-8, and an
+  existing UTF-8 value is left alone; the interactive review UI, tmux, and the diff
+  renderer all depend on it.
 - uv is installed into the target user's `~/.local/bin` without modifying shell files.
 - Python 3.12 and the exact `uv.lock` environment are synchronized on every run.
 - Agent setup is delegated to `controller/install-agents.sh`; `--skip-agents` is the

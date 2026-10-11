@@ -3,6 +3,9 @@
 # This intentionally contains no credentials. Adjust the public repository URL and
 # default Ubuntu user only when constructing the EC2 launch template.
 package_update: true
+# Terminal UTF-8 for interactive sessions; a C/POSIX locale corrupts box drawing and the
+# review UI's icons. controller/bootstrap.sh converges an existing instance onto this.
+locale: en_US.UTF-8
 packages:
   - ca-certificates
   - git

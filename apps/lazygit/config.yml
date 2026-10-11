@@ -1,0 +1,44 @@
+# Mirrored settings for the controller's Git review UI (`apps/manifest`), applied to the
+# controller account's home directory by `controller/app-config.sh` (`make app-config`).
+#
+# The binary is pinned and installed by controller/bootstrap.sh; this file is the
+# repository's source of truth for how it behaves, so a settings change is a reviewed
+# commit. Keys are checked against the pinned release's schema before committing:
+#   curl -sSfL https://raw.githubusercontent.com/jesseduffield/lazygit/v<VERSION>/schema/config.json
+#
+# Settings this file cannot express are documented in docs/OPERATIONS.md: a Nerd Font
+# selected in the *local* terminal profile (icons are emitted here and rendered by the
+# client), a UTF-8 login locale, and RGB-capable tmux (apps/tmux/tmux.conf).
+
+gui:
+  # Nerd Font v3 code points. Use "" for a plain terminal font, or "2" for an older
+  # Nerd Font generation.
+  nerdFontsVersion: "3"
+  showFileIcons: true
+  # Background detection does not survive SSH plus tmux, and delta's --dark/--light
+  # follows this value. Set "light" for a light terminal.
+  colorScheme: dark
+  # Per-file added/removed counts in the Files view: the fastest way to triage which
+  # files a change touched and how heavily.
+  showNumstatInFilesView: true
+
+git:
+  diffRenderers:
+    # git-delta is installed from apt by controller/bootstrap.sh; lazygit pipes git's raw
+    # diff into it. Cycle renderers with the '|' key.
+    - name: delta
+      command: "delta --{{colorScheme}} --paging=never --line-numbers"
+    # Kept second so git's unadorned diff is one keypress away, and so the diff view still
+    # renders on a machine where delta is not installed.
+    - type: rawGit
+      name: git
+
+# A pinned tool must not update itself out of band: an upgrade is a reviewed change to the
+# pin in controller/bootstrap.sh, re-applied by bootstrap.
+update:
+  method: never
+
+os:
+  # Rewording a commit, or editing a file, suspends lazygit and returns here. The Ubuntu
+  # controller image ships vim.
+  editPreset: vim

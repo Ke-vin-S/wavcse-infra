@@ -904,7 +904,7 @@ def test_worker_apply_config_refuses_an_unknown_application(monkeypatch, tmp_pat
     )
 
     assert result.exit_code == 2
-    assert "mirrored apps are: opencode, tmux" in result.stderr
+    assert "mirrored apps are: lazygit, opencode, tmux" in result.stderr
 
 
 def test_worker_apply_config_refuses_a_controller_only_application(monkeypatch, tmp_path) -> None:

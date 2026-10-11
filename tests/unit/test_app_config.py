@@ -100,6 +100,21 @@ def test_manifest_uses_the_operator_tmux_settings() -> None:
     assert "set-option -g prefix C-a" in load_app_config_content(entry)
 
 
+def test_the_review_ui_settings_are_controller_only() -> None:
+    (entry,) = load_app_config_entries(app="lazygit", target="controller")
+
+    assert entry == AppConfigEntry(
+        app="lazygit",
+        source="apps/lazygit/config.yml",
+        destination=".config/lazygit/config.yml",
+        mode=0o644,
+        target="controller",
+    )
+    assert "lazygit" not in {
+        worker_entry.app for worker_entry in load_app_config_entries(target="worker")
+    }
+
+
 @pytest.mark.parametrize(
     ("manifest", "line", "reason"),
     [
@@ -134,7 +149,7 @@ def test_an_empty_manifest_is_refused_rather_than_silently_applied() -> None:
 
 def test_unknown_app_names_the_mirrored_apps() -> None:
     with pytest.raises(
-        ConfigurationError, match=r"unknown app 'nope'; mirrored apps are: opencode, tmux"
+        ConfigurationError, match=r"unknown app 'nope'; mirrored apps are: lazygit, opencode, tmux"
     ):
         load_app_config_entries(app="nope")
 

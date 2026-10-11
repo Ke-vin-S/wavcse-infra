@@ -178,6 +178,26 @@ on normal GPU training workers. The selected upstream mechanisms and version pol
 recorded in
 [ADR-011](docs/DECISIONS.md#adr-011-install-controller-agents-from-pinned-official-releases).
 
+## Controller review UI
+
+Bootstrap installs a pinned terminal Git client for reading agent changes on the
+controller, plus `git-delta` for rendered diffs. Nothing runs as a service: no daemon, no
+listening port, no credential of its own.
+
+```bash
+cd ~/projects/wavCSE   # or this repository
+lazygit
+```
+
+`~/.config/lazygit/config.yml` is mirrored from `apps/lazygit/config.yml`, and the tmux
+settings it renders correctly under come from `apps/tmux/tmux.conf`. Icons require a Nerd
+Font v3 selected in your *local* terminal profile; full-fidelity colour additionally needs
+a UTF-8 login locale and RGB-capable tmux, which bootstrap and cloud-init converge. See
+[Controller review UI](docs/OPERATIONS.md#controller-review-ui) for the client-side
+requirements, the settings-drift workflow, and
+[ADR-035](docs/DECISIONS.md#adr-035-review-controller-checkouts-with-a-pinned-terminal-client-not-a-service-on-the-controller)
+for why this is a terminal client rather than a web UI.
+
 ## Google Colab CLI
 
 Bootstrap also installs the pinned `google-colab-cli==0.7.4` with `uv tool install`, into
