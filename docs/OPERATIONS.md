@@ -79,6 +79,7 @@ Controller tool-installer overrides are intentionally separate from runtime conf
 | `WAVCSE_INFRA_CONTROLLER_USER` | Target account when root cannot infer the controller user |
 | `WAVCSE_INFRA_GIT_USER_NAME` | Controller Git commit name applied by bootstrap |
 | `WAVCSE_INFRA_GIT_USER_EMAIL` | Controller Git commit email applied by bootstrap |
+| `WAVCSE_INFRA_TOOL_LINK_DIR` | Directory the managed controller tools are published into (default `/usr/local/bin`) |
 | `WAVCSE_INFRA_OMP_VERSION` | Controlled OMP release-tag override |
 | `WAVCSE_INFRA_OMP_X86_64_SHA256` | Required x86-64 digest when overriding the OMP pin |
 | `WAVCSE_INFRA_OMP_AARCH64_SHA256` | Required ARM64 digest when overriding the OMP pin |
@@ -307,10 +308,59 @@ not duplicate PATH entries or overwrite existing shell configuration. Cargo and 
 paths preserve historical installations; the default installation does not require
 either runtime. Start a new login shell after the first run.
 
+That block is what a *login* shell reads, and nothing but a login shell reads it, so
+bootstrap also publishes these tools into a system-wide directory: an `ssh` command, an
+agent's shell tool, cron, and systemd resolve none of the login files. See
+[Controller tool visibility](#controller-tool-visibility).
+
 The installer downloads official release archives and installer scripts to temporary
 files before execution; it does not use an opaque `curl | sudo bash` pipeline. It never
 runs login, writes provider credentials, or changes existing OMP/Codex/OpenCode
 authentication stores.
+
+## Controller tool visibility
+
+Every managed tool is installed into the controller account's `~/.local/bin`, and the only
+PATH entry for that directory is the block above, which lives in the account's **login**
+profile. Bash reads exactly one of `~/.bash_profile`, `~/.bash_login`, or `~/.profile` — and
+only as a login shell; an interactive non-login shell reads `~/.bashrc` instead, and
+`bash -c` (what `ssh controller '<command>'`, an agent's shell tool, a cron job, and a
+systemd unit use) reads neither. A provisioned controller therefore resolves none of its
+tools in those contexts, which is indistinguishable from an unprovisioned one:
+
+```bash
+ssh controller 'command -v omp opencode lazygit'      # nothing, exit 1
+ssh controller 'bash -lc "command -v omp opencode lazygit"'   # all three
+```
+
+Bootstrap publishes the managed tools into a system-wide directory (default
+`/usr/local/bin`, override `WAVCSE_INFRA_TOOL_LINK_DIR`) so every one of those contexts
+resolves them without a second installation location: each entry is a symlink to the binary
+the installers manage, so a version bump or `--upgrade` is picked up automatically and
+`~/.local/bin` stays the single place tools are installed.
+
+| Managed tool | Installed by |
+| --- | --- |
+| `omp`, `codex`, `agf`, `opencode` | `controller/install-agents.sh` |
+| `colab`, `infra`, `uv` | `controller/bootstrap.sh` |
+| `lazygit` | `controller/bootstrap.sh` (see [Controller review UI](#controller-review-ui)) |
+
+Check or repair the links independently of a full bootstrap:
+
+```bash
+make tool-links-check   # report drift; exit 1 when an installed tool is not published
+make tool-links         # publish what is missing
+```
+
+Publishing is idempotent and never destructive on someone else's file: an entry that is
+already a symlink to this repository's binary — including a relative or differently spelled
+one — is left alone, a tool that is not installed is reported and skipped, and an entry this
+repository did not create (a regular file, a symlink into another installation) is reported
+and **never** replaced, which fails the run so the conflict is visible. A tool that was
+removed while its entry remains is reported as stale in `--check` so a dangling system-wide
+entry cannot masquerade as an uninstalled tool. Because the directory is system-wide, the
+tools are visible to every account on the controller; on a single-operator controller that
+is the intent.
 
 ## Controller review UI
 
@@ -1597,6 +1647,9 @@ must invoke lifecycle commands explicitly.
 - The login locale is converged onto a UTF-8 value when it is missing or not UTF-8, and an
   existing UTF-8 value is left alone; the interactive review UI, tmux, and the diff
   renderer all depend on it.
+- The managed tools are published into `/usr/local/bin` at the end of every run, including
+  `--skip-agents`, so a non-login shell resolves them; an entry the repository did not
+  create is reported and never replaced, and a tool that is not installed is skipped.
 - uv is installed into the target user's `~/.local/bin` without modifying shell files.
 - Python 3.12 and the exact `uv.lock` environment are synchronized on every run.
 - Agent setup is delegated to `controller/install-agents.sh`; `--skip-agents` is the

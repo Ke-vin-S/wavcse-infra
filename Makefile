@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 SHELL_FILES := $(shell find controller scripts worker -type f -name '*.sh' 2>/dev/null)
 
-.PHONY: agents-check agents-sync app-config app-config-check bootstrap-controller check cloud-init-check doctor format format-check install-agents lint omp-overlay omp-overlay-check test
+.PHONY: agents-check agents-sync app-config app-config-check bootstrap-controller check cloud-init-check doctor format format-check install-agents lint omp-overlay omp-overlay-check test tool-links tool-links-check
 
 agents-sync:
 	python3 scripts/agents/agent_assets.py sync
@@ -22,6 +22,14 @@ omp-overlay:
 
 omp-overlay-check:
 	./controller/omp-overlay.sh --check
+
+# Publish the controller's managed tools into a system-wide directory so a non-login shell
+# (`ssh controller '<command>'`, an agent's shell tool, cron, systemd) resolves them.
+tool-links:
+	./controller/tool-links.sh
+
+tool-links-check:
+	./controller/tool-links.sh --check
 
 # Apply the repository's mirrored application configuration (apps/manifest) to
 # this controller. A differing file is never replaced without confirmation.

@@ -49,7 +49,8 @@ agent tools by default, and install the pinned Google Colab CLI. No
 authentication or paid resource request is performed.
 
 The review UI (lazygit) and its diff renderer (git-delta) are operator tools:
---skip-agents does not skip them.
+--skip-agents does not skip them. The managed tools are also published into a
+system-wide directory so a non-login shell resolves them.
 EOF
 }
 
@@ -359,6 +360,16 @@ install_agent_tools() {
   env WAVCSE_INFRA_CONTROLLER_USER="${CONTROLLER_USER}" "${INSTALL_AGENTS_SCRIPT}"
 }
 
+# The managed tools live in the controller account's ~/.local/bin, which only a login shell
+# puts on PATH. Publishing them into a system-wide directory is what makes a non-login shell
+# — `ssh controller '<command>'`, an agent's shell tool, cron, systemd — resolve them, so it
+# is deliberately not part of the agent installer: it must run under --skip-agents too.
+publish_tool_links() {
+  local script="${REPOSITORY_ROOT}/controller/tool-links.sh"
+  [[ -x "${script}" ]] || fail "tool link script is missing or not executable: ${script}"
+  env WAVCSE_INFRA_CONTROLLER_USER="${CONTROLLER_USER}" "${script}"
+}
+
 install_omp_overlay() {
   local script="${REPOSITORY_ROOT}/controller/omp-overlay.sh"
   if [[ "${SKIP_AGENTS}" == true ]]; then
@@ -431,6 +442,7 @@ main() {
   install_colab_cli
   install_agent_tools
   install_omp_overlay
+  publish_tool_links
 
   printf 'Controller bootstrap complete.\n'
   printf 'Next: configure the controller and authenticate agent providers, then run infra doctor.\n'

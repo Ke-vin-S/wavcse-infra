@@ -163,6 +163,12 @@ controller login shell to find `~/.local/bin`, `~/.cargo/bin`, and `~/.bun/bin` 
 duplicate profile entries. The latter two preserve compatibility with historical
 installations; the default installer does not require Cargo or Bun.
 
+Bootstrap also publishes those tools into `/usr/local/bin`, because only a login shell
+reads the profile block above: `ssh controller '<command>'`, an agent's shell tool, cron,
+and systemd read no login file and would otherwise resolve none of them. See
+[Controller tool visibility](docs/OPERATIONS.md#controller-tool-visibility), and
+`make tool-links-check` to detect drift.
+
 Installation and authentication are separate. On a headless controller, authenticate
 after installation:
 

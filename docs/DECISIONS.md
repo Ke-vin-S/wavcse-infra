@@ -1863,3 +1863,77 @@ architecture digests together, then re-run bootstrap; the mirrored
 keys do move between releases and an unknown key is ignored silently rather than reported.
 Colour fidelity still depends on the operator's own terminal (Nerd Font v3, and optionally
 forwarding `COLORTERM`), which is documented rather than enforced.
+
+## ADR-036: Publish the controller's managed tools system-wide so every shell context resolves them
+
+- **Status:** Accepted
+- **Date:** 2026-10-11
+
+### Context
+
+Every managed tool is installed into the controller account's `~/.local/bin` (ADR-011,
+ADR-034, ADR-035), and the only PATH entry for that directory is the managed block
+`controller/install-agents.sh` writes into the account's *login* profile. Bash reads one of
+`~/.bash_profile`, `~/.bash_login`, or `~/.profile`, and only as a login shell: an
+interactive non-login shell reads `~/.bashrc` instead, and `bash -c` — the form used by
+`ssh controller '<command>'`, an agent's shell tool, a cron job, and a systemd unit — reads
+none of them.
+
+The result was a fully provisioned controller that reported none of its tools as installed.
+A check made that way (`ssh controller 'command -v omp opencode lazygit'`) returns nothing
+and exits 1 while all three binaries are present and executable, so a working controller is
+indistinguishable from an unprovisioned one and the operator reasonably concludes the
+machine was rebuilt. Reaching for the tools requires remembering to wrap the check in
+`bash -l`, which no agent, script, or cron job does.
+
+### Decision
+
+`controller/tool-links.sh` publishes the managed tools into a system-wide directory
+(default `/usr/local/bin`, override `WAVCSE_INFRA_TOOL_LINK_DIR`) as symlinks to
+`~/.local/bin/<tool>`, and `controller/bootstrap.sh` calls it on every run, after the agent
+installer and deliberately outside the `--skip-agents` gate so the operator tools
+(`colab`, `infra`, `uv`, `lazygit`) are published even when the agent tools are skipped.
+`make tool-links` and `make tool-links-check` expose the same operation and its drift
+report. `~/.local/bin` remains the single installation location; a link follows the name, so
+a version bump or `--upgrade` needs no link refresh.
+
+Four behaviours make the step safe to run repeatedly and safe on a machine it does not own.
+An entry that already resolves to this repository's binary is 'current' (resolved paths are
+compared, so a relative or differently spelled symlink is accepted) and is left alone. A
+tool that is not installed is reported and skipped, never created. An entry this repository
+did not create — a regular file, a symlink into another installation — is 'foreign': it is
+reported, never replaced, and the run fails so the conflict is visible to a human. A tool
+removed while its entry remains is 'orphaned' and reported as drift in `--check`, so a
+dangling system-wide entry cannot masquerade as an uninstalled tool. After creating a link
+the script proves it resolves in a shell that reads no login file, rather than trusting that
+creating it was enough.
+
+### Alternatives rejected
+
+- **Add the block to `~/.bashrc` as well**: fixes interactive non-login shells only. `bash
+  -c`, which is exactly the failing context, reads neither `.bashrc` nor `.profile`, so the
+  reported symptom would survive the fix.
+- **`/etc/environment`**: pam_env applies it to non-login sessions, but the file is plain
+  `KEY=value` and cannot expand `$HOME`, so it would hardcode one account's path
+  system-wide.
+- **`$BASH_ENV`**: covers non-interactive bash only, and the variable itself has to be
+  delivered by one of the mechanisms above.
+- **`/etc/profile.d`**: sourced by login shells, so it inherits the same gap.
+- **Install into `/usr/local/bin` directly**: puts the tools outside the account the
+  installers manage, so version checks, `--upgrade`, and the per-account mirrored
+  configuration would all have to learn a second location.
+- **Symlink everything in `~/.local/bin`**: that directory also holds unrelated user
+  installs (extra `uv` tools, editor helpers), which must not be published system-wide.
+- **Document absolute paths and keep tooling login-shell-only**: leaves the trap in place for
+  every future `ssh` one-liner and agent shell on the box, which is how this was found.
+
+### Consequences
+
+Every shell context — ssh command, agent shell tool, cron, systemd, `sudo`, any other
+account — now resolves the controller's tools, so `command -v` and `infra <command>` agree
+with what the repository claims to have installed, and the doctor/operator commands no longer
+depend on how the operator opened the shell. The links are system-wide on a single-operator
+controller, which is intended and must be reconsidered if the box ever hosts other users with
+different trust. `/usr/local/bin` becomes a second place a tool name can exist: a foreign
+entry is never overwritten and fails the run, and `make tool-links-check` is the drift gate
+that catches a missing, foreign, or orphaned entry.
