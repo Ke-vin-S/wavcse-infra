@@ -1945,11 +1945,18 @@ creating it was enough.
 
 ### Consequences
 
-Every shell context — ssh command, agent shell tool, cron, systemd, `sudo`, any other
-account — now resolves the controller's tools, so `command -v` and `infra <command>` agree
-with what the repository claims to have installed, and the doctor/operator commands no longer
-depend on how the operator opened the shell. The links are system-wide on a single-operator
-controller, which is intended and must be reconsidered if the box ever hosts other users with
-different trust. `/usr/local/bin` becomes a second place a tool name can exist: a foreign
-entry is never overwritten and fails the run, and `make tool-links-check` is the drift gate
-that catches a missing, foreign, or orphaned entry.
+Every context whose PATH carries `/usr/local/bin` — an ssh command, an agent's shell tool, a
+systemd unit, `sudo`, any interactive shell — now resolves the controller's tools, so
+`command -v` and `infra <command>` agree with what the repository claims to have installed,
+and the doctor/operator commands no longer depend on how the operator opened the shell. Cron
+is the exception worth knowing, and it is measured rather than assumed: a cron job reads no
+login file and keeps its own environment, which on Ubuntu is populated by `pam_env` from
+`/etc/environment` and so contains the system directories plus `/usr/local/bin`. A job
+therefore resolves a *published* tool (this is what makes the documented cron fallback for
+the reaper work, since `uv` is now published) and never resolves a tool that exists only in
+`~/.local/bin`; a crontab that needs such a tool sets `PATH` itself. A transient systemd unit
+was measured to have the same PATH, so it behaves like a cron job. The links are system-wide
+on a single-operator controller, which is intended and must be reconsidered if the box ever
+hosts other users with different trust. `/usr/local/bin` becomes a second place a tool name
+can exist: a foreign entry is never overwritten and fails the run, and `make tool-links-check`
+is the drift gate that catches a missing, foreign, or orphaned entry.

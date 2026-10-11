@@ -260,6 +260,12 @@ mirrored the same way (`apps/lazygit/config.yml`); see
 [Controller review UI](#controller-review-ui) for the parts of that session which cannot
 come from the repository.
 
+The manifest covers files only: an application's packages and its pinned release keep
+their line in a bootstrap or installer script, and nothing in `make check` yet compares
+those lines with the pin tables below or with `controller/tool-links.sh`. That gap, and a
+proposal to close it without a configuration-management framework, is recorded in
+[Application registry plan](PLAN-APP-REGISTRY.md) — a proposal, not implemented.
+
 ## Controller agent installation
 
 `controller/install-agents.sh` is controller-only. Normal GPU training workers must
@@ -367,6 +373,16 @@ removed while its entry remains is reported as stale in `--check` so a dangling 
 entry cannot masquerade as an uninstalled tool. Because the directory is system-wide, the
 tools are visible to every account on the controller; on a single-operator controller that
 is the intent.
+
+Two programmatic contexts deserve their own line, because their PATH comes from neither sshd
+nor a login file. On Ubuntu a **cron job** and a **systemd unit** both receive the PATH
+`pam_env` reads from `/etc/environment` — the system directories plus `/usr/local/bin` — so
+each resolves a *published* tool and neither resolves a tool that exists only in
+`~/.local/bin`. Measured on Ubuntu 24.04/26.04: `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:…`
+with `uv`, `omp`, and `herdr` unresolvable before they were published. A crontab that needs
+a tool which lives only in `~/.local/bin` must set `PATH` in the crontab (or call it by
+absolute path); the documented cron fallback for the reaper needs no such line on a
+bootstrapped controller, because `uv` is published.
 
 ## Controller review UI
 
