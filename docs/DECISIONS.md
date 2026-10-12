@@ -1960,3 +1960,187 @@ on a single-operator controller, which is intended and must be reconsidered if t
 hosts other users with different trust. `/usr/local/bin` becomes a second place a tool name
 can exist: a foreign entry is never overwritten and fails the run, and `make tool-links-check`
 is the drift gate that catches a missing, foreign, or orphaned entry.
+
+## ADR-037: Add a pinned terminal file explorer beside the review UI
+
+- **Status:** Accepted
+- **Date:** 2026-10-11
+
+### Context
+
+ADR-035 gives the operator a Git-shaped view of an agent's change. It does not give a file
+view: reading what is actually on the box — the layout of the `wavCSE` checkout, a network
+volume's contents, a job's downloaded artifacts, a directory an agent created — means
+`ls`, `tree`, `find`, and `du` by hand over SSH, with no preview of what a file is and no
+way to move through a tree without typing paths.
+
+The constraints are ADR-035's, unchanged: the controller is headless with SSH as its only
+inbound path, a GUI file manager needs a display server or a daemon, and a background
+service on the authoritative environment is excluded by `AGENTS.md`.
+
+### Decision
+
+`controller/bootstrap.sh` gains `install_yazi()`, pinned to `26.9.1`: the official
+`sxyazi/yazi` GitHub release archive for the detected architecture is downloaded to a
+temporary directory, accepted only if its SHA-256 matches the reviewed digest for that
+architecture, unzipped, and both of its binaries — `yazi` and the `ya` CLI — are installed
+into `~/.local/bin` as the controller user, the same shape as the lazygit and agent
+installers. A `WAVCSE_INFRA_YAZI_VERSION` override follows the established rule: overriding
+the pin requires the matching digest. It is operator tooling, so it lives in
+`bootstrap.sh`, `--skip-agents` does not skip it, and it is absent from
+`install-agents.sh` and from every worker.
+
+Yazi's assets are named by Rust target triple with no version in the name, so the GNU build
+is selected rather than the musl one (the controller is Ubuntu/glibc) and the digest, not
+the file name, is what identifies the release; GitHub's release API reports the same sha256
+for the asset.
+
+`install_os_packages()` gains `file` (yazi's MIME detection shells out to it) and `unzip`
+(the release archive is a zip). `apps/yazi/yazi.toml` is added as a `controller`-scoped
+`apps/manifest` entry under ADR-031's never-overwrite-silently contract, mirroring a
+deliberate subset of the pinned release's defaults: yazi merges a user file over the
+defaults, so the single entry is the open-with editor, whose fallback becomes `vim` to
+match the review UI's `os.editPreset`. Both binaries join `MANAGED_TOOLS` in
+`controller/tool-links.sh`, so ADR-036's system-wide publishing covers the pair.
+
+### Alternatives rejected
+
+- **Ubuntu's `yazi` package**: not packaged. A search of the Ubuntu archive across all
+  suites and sections finds no `yazi` package for any release (only the unrelated
+  `librust-yazi-dev` crate), so apt is not an available mechanism.
+- **Building from source** (`cargo install yazi-fm yazi-cli`): needs a Rust toolchain on the
+  controller that nothing else requires, and replaces a reviewed digest with a dependency
+  graph resolved at install time, for a program the project already publishes per
+  architecture.
+- **The release's `.deb` asset**: the same bytes installed into `/usr/bin`, outside the
+  account the installers manage, which ADR-036 rejected as a second installation location;
+  it also carries no published checksum, while GitHub reports the zip's digest.
+- **A GUI file manager over X11/VNC, or a browser file view**: ADR-035's rejection applies
+  unchanged — a display server, a daemon, or a listening port on the authoritative
+  environment for a read-mostly task.
+- **Installing yazi's optional preview and search tools** (`fd`, `rg`, `fzf`, `zoxide`,
+  `jq`, `poppler-utils`, `7zip`, `ffmpeg`, `imagemagick`, `chafa`, `resvg`): each is a
+  separate unreviewed pin and a separate upgrade path for a feature the operator may never
+  open. They are documented, and adding one stays an explicit operator change.
+- **Installing a plugin with `ya pkg` at bootstrap**: fetches Lua from a git remote into the
+  account's config directory outside the mirrored manifest, which is the drift ADR-031
+  exists to prevent. No plugin is required for browsing.
+- **Making the file explorer's settings machine-local and unversioned**: rejected for the
+  reason ADR-035 rejected it for the review UI — the settings that decide what the operator
+  sees would silently drift between controllers.
+- **Requiring `yazi` in `infra doctor`**: doctor reports control-plane capability (ADR-035's
+  reasoning); the file explorer is optional operator UX.
+
+### Consequences
+
+A rebuilt controller offers file browsing over SSH with no service, port, or credential, and
+the settings that shape it are reviewed in the repository. Maintenance mirrors the review
+UI's: bump the version and both architecture digests together, then re-run bootstrap, and
+re-check `apps/yazi/yazi.toml` against the new tag's defaults — yazi is strict, so a key
+that moved or changed type aborts startup with a TOML error rather than being ignored. `file`
+and `unzip` are now part of every controller bootstrap. Preview and search capability depends
+on optional packages the operator installs deliberately, which is documented rather than
+enforced, and `ya` becomes the second two-letter name this repository publishes into
+`/usr/local/bin` — a foreign entry there is reported and never replaced, per ADR-036.
+
+## ADR-038: Declare static SSH workers instead of provisioning them
+
+- **Status:** Accepted
+- **Date:** 2026-10-12
+
+### Context
+
+The operator has SSH access to a shared university server that is real capacity and costs
+nothing per hour. ADR-029 already reserved the shape: "future static university SSH workers
+do not provision or destroy but can share the existing SSH transport and exact-commit job
+semantics". The machine is not ours: the account has no root, no package-manager rights, and
+no system-wide write access, and it is shared with other work, so a mistake there is not
+recoverable by deleting a Pod.
+
+Every existing worker path assumed the opposite. `ProviderKind` had only `runpod` and
+`colab`; `worker/bootstrap.sh` exited unless it was root or had passwordless sudo and
+installed packages and `uv` system-wide; the job workspace and the reviewed runner defaulted
+to `/workspace/...` and `/root/...`; the bootstrap state directory was
+`${HOME}/.local/state/wavcse-worker`; and settings mirroring, though already home-relative
+and digest-verified, was reachable only through a registered Pod or Colab session.
+
+### Decision
+
+A new provider identity `static_ssh` reuses the existing `ssh` execution transport and adds
+no transport code. `[[static.workers]]` in the controller TOML is the registration: `name`,
+`host`, `port`, `username`, `gpu_type`, `gpu_count`, `root`, an optional per-host
+`private_key`, an optional `env`, and `max_concurrent_jobs`.
+
+- **The declaration is the provider state.** `StaticClient` reads the configuration and
+  synthesizes a `Worker` in state `RUNNING`; it makes no HTTP request and starts no
+  subprocess. `RUNNING` is unconditional by design, because the SSH waiter only probes an
+  endpoint once the provider reports `RUNNING` — a client that answered `UNKNOWN` until a
+  probe had succeeded could never be probed at all. Reachability is
+  `WorkerReadinessState`, which is what job placement gates on.
+- **`start`, `stop`, and `destroy` refuse a declared host** with a message naming the
+  declaration the operator would have to remove. The tool cannot stop or delete a machine it
+  does not own, so the capability is absent rather than guarded by a confirmation.
+- **The local state record is written by the declaration, not by a create.** `record_registered`
+  is idempotent and never weakens a proven readiness, and `reconcile` is never called for
+  `static_ssh`: it marks a tracked-but-unlisted worker `DESTROYED` with `provider_absent`,
+  which is correct for a paid resource and destructive for a declared host.
+- **Nothing is installed.** `bootstrap.sh` gains a `static` profile that skips the
+  apt/dpkg gate, the root/sudo gate, the package install, the `uv` install, and the
+  `/workspace` creation, requires `python3 >= 3.10`, `git`, `curl`, `tar`, and `gzip` to
+  already exist, and reports every missing one in a single list. Its state directory and
+  every write live under `<root>`, which must be an absolute directory other than `/`.
+  `uv` absence is a `WARN` on this profile, because `uv` is consumed only by a job
+  specification's own argv, never by the reviewed runner.
+- **The confined root holds the whole job surface**: `<root>/jobs/<job-id>`,
+  `<root>/job_runner.py`, and the cache root `<root>/cache`. The bootstrap marker moves to
+  `<root>/state/bootstrap-version`, and the reviewed runner learns that path from the
+  job descriptor's `state_directory`, defaulting to the documented location when absent.
+- **No price and no cost guard.** `hourly_cost` is `None`, `provider list` reports the
+  literal `-` for its cost model, and no USD/hour or CU unit is borrowed (invariant 7).
+  The guard that matters is `max_concurrent_jobs`, enforced before a job starts.
+- **A declared host is a persistent operator account, not a disposable worker**, so settings
+  mirroring gives it the `controller` set — operator tooling such as `opencode`, `lazygit`,
+  and `yazi` — not the minimized worker set. This needed no manifest schema change, only a
+  `target` argument the manifest parser already supported.
+- **The safety boundary is the account's own permissions**, plus the operator's approval at
+  each step that reaches the host. The host is never canonical storage and never the only
+  location holding a change (invariant 1 applies unchanged).
+
+Local verification is mandatory before the host is touched: `scripts/static-host/` builds a
+throwaway Ubuntu container with a non-root account, no `sudo`, no `uv`, key-only SSH, a
+fixture accelerator stub, and the same confined-root layout. `make static-host-up` and
+`make static-host-down` drive it and stay out of `make check`, which must remain runnable
+without Docker.
+
+### Alternatives considered
+
+- **Register commands (`infra worker register <host>`)**: a second state-holding layer for
+  what the configuration file already expresses, and a registration that can disagree with
+  the file it was derived from. The file is the single source of truth (ADR-021's shape).
+- **Report `UNKNOWN` until a probe succeeds**: cannot be probed at all, for the reason above.
+- **Report `STOPPED`/`DESTROYED` when the host is unreachable**: conflates reachability with
+  a lifecycle this tool never drives, and could invite a "restart" that does not exist.
+- **Reuse the `system` bootstrap profile with a `root` argument**: the profile's first acts
+  are `apt-get` and a root check, so a non-root host would fail at the wrong layer, and an
+  accidental elevation is exactly what this host must not have.
+- **Install `uv` under the account's home**: still an installation of unreviewed bytes into
+  a shared account, for a tool no reviewed runner invokes.
+- **Treat the declared `gpu_type` as capability without checking**: rejected; the same
+  `nvidia-smi` health check runs, so a declaration that does not match the machine never
+  reaches `READY`.
+- **Password authentication (or an askpass helper) to avoid key setup**: `ssh.py` passes
+  `-F /dev/null`, `BatchMode=yes`, and `PasswordAuthentication=no` by design, and a secret a
+  process can type is a secret in process state.
+
+### Consequences
+
+The control plane can now execute recorded exact-commit jobs on capacity the operator
+already has, with no provisioning, no price confirmation, and no lifecycle that could stop
+or delete the machine, while every existing guard still applies to the providers that are
+paid. The limits are explicit and documented rather than discovered: `command.argv` is
+executed directly, never through a shell, so `module load` and `conda activate` cannot carry
+between `setup.argv` and `command.argv`, and a spec must name absolute interpreter paths and
+declare its environment in `config.env` (the declaration's `env` is merged underneath, so a
+spec can still override it). Whether the host answers is readiness, not configuration, so
+`infra worker list --provider static_ssh` shows the local readiness beside the declared
+state. `docs/STATIC-SSH.md` carries the operator procedure.

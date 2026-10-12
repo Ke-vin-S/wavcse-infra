@@ -220,6 +220,17 @@ class JobExecutor:
 
         return {}
 
+    def bootstrap_state_directory(self) -> str:
+        """Return the worker-side directory holding this worker's bootstrap marker.
+
+        An empty string means the reviewed runner's own documented default, which is where
+        the disposable-worker profile writes it. A transport whose account keeps no state
+        in that default names the directory it does use, so the runner verifies the same
+        marker without this controller having to guess the remote account's home.
+        """
+
+        return ""
+
     def install_runner(self, worker_id: str) -> str:
         """Install the reviewed runner atomically; report `installed` or `unchanged`."""
 
@@ -263,6 +274,7 @@ class JobExecutor:
             "name": name,
             "source": {"repository": repository, "commit": commit},
             "expected_bootstrap_version": BOOTSTRAP_VERSION,
+            "state_directory": self.bootstrap_state_directory(),
             "input_destinations": list(input_destinations),
         }
         values = self._run_phase(worker_id, "prepare", descriptor, required={"executed_commit"})
@@ -431,6 +443,42 @@ class JobExecutor:
                 f"(missing {', '.join(sorted(missing))}); {_remote_diagnostics(result)}"
             )
         return values
+
+
+class StaticJobExecutor(JobExecutor):
+    """Run jobs on a declared static host with the environment its declaration names.
+
+    A shared operator account is not a fresh GPU image: the interpreter, the CUDA toolkit,
+    and any site-specific loader paths are whatever that machine already has, and they are
+    rarely on the default non-interactive `PATH`. The declaration's `env` is delivered
+    through the transport hook the reviewed runner already merges declared environment over,
+    so a job spec can still override any of it. The same declaration is also where this
+    account's bootstrap marker lives, inside its own confined root.
+    """
+
+    def __init__(
+        self,
+        waiter: WorkerSshWaiter,
+        executor: SshExecutor,
+        ssh_config: SshConfig,
+        jobs_config: JobsConfig,
+        *,
+        root: str,
+        environment: dict[str, str],
+    ) -> None:
+        super().__init__(waiter, executor, ssh_config, jobs_config)
+        self._root = root
+        self._environment = dict(environment)
+
+    def transport_environment(self) -> dict[str, str]:
+        """Return the declared host environment ahead of any spec-declared values."""
+
+        return dict(self._environment)
+
+    def bootstrap_state_directory(self) -> str:
+        """Return this account's own state directory, inside its confined root."""
+
+        return f"{self._root}/state"
 
 
 def _parse_runner_output(result: SshCommandResult, worker_id: str) -> dict[str, str]:

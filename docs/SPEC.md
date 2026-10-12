@@ -194,7 +194,8 @@ Any fix that matters must return to the controller repository and be committed b
 
 # 9. Provider architecture
 
-v1 implements RunPod only.
+v1 implements RunPod; a Colab execution slice and declared static SSH hosts were added
+later (ADR-029, ADR-030, ADR-038).
 
 Use a narrow provider interface so lifecycle logic does not directly depend on raw RunPod JSON.
 
@@ -206,6 +207,9 @@ Example conceptual interface:
     start_worker(id)
     stop_worker(id)
     destroy_worker(id)
+
+A declared static host has no create, start, stop, or destroy operation: the declaration in
+the controller configuration is its registration, and those commands refuse it by design.
 
 Do not build provider implementations for services that are not currently used.
 
@@ -949,7 +953,9 @@ session, real GPU/CUDA bootstrap and the shared exact-commit job/S3 contract.
 Its paid CU balance selects `PAID_CU` (budgeted) or, at zero, `FREE_TIER`
 (best-effort, `colab.allow_free_tier`); both remain the same Colab provider and
 transport. RunPod remains a separately priced, SSH-driven, resumable Pod
-provider. University static SSH is not implemented.
+provider. A university static SSH host is a third, declared provider: no
+create, start, stop, or destroy, no price, one confined root per host, and the
+same exact-commit job and S3 contract (`docs/STATIC-SSH.md`, ADR-038).
 
 # 31. v1 acceptance scenario
 

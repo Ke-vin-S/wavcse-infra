@@ -149,9 +149,36 @@ def test_an_empty_manifest_is_refused_rather_than_silently_applied() -> None:
 
 def test_unknown_app_names_the_mirrored_apps() -> None:
     with pytest.raises(
-        ConfigurationError, match=r"unknown app 'nope'; mirrored apps are: lazygit, opencode, tmux"
+        ConfigurationError,
+        match=r"unknown app 'nope'; mirrored apps are: lazygit, opencode, tmux, yazi",
     ):
         load_app_config_entries(app="nope")
+
+
+def test_a_declared_static_host_receives_the_operator_set_not_the_worker_set() -> None:
+    """A persistent operator account gets the controller set; a disposable Pod does not."""
+
+    controller = {entry.destination for entry in load_app_config_entries(target="controller")}
+    worker = {entry.destination for entry in load_app_config_entries(target="worker")}
+
+    assert worker == {".tmux.conf"}
+    assert controller == {
+        ".tmux.conf",
+        ".config/lazygit/config.yml",
+        ".config/opencode/opencode.jsonc",
+        ".config/yazi/yazi.toml",
+    }
+
+
+def test_apply_worker_app_config_honours_the_controller_target() -> None:
+    destinations = [entry.destination for entry in load_app_config_entries(target="controller")]
+    executor = Executor({destination: "absent" for destination in destinations})
+
+    outcomes = apply_worker_app_config(executor, _connection(), target="controller")
+
+    assert {outcome.destination for outcome in outcomes} == set(destinations)
+    assert all(outcome.state == "installed" for outcome in outcomes)
+    assert len(executor.calls) == 1 + len(destinations)
 
 
 def test_absent_file_is_installed_with_its_digest_mode_and_payload() -> None:

@@ -640,7 +640,7 @@ def test_volume_cache_stats_requires_a_recorded_volume_mount(monkeypatch, tmp_pa
     result = runner.invoke(app, ["volume", "cache", "stats", "--worker", POD_ID], env=_env())
 
     assert result.exit_code == 2
-    assert "no network volume mount recorded" in result.stderr
+    assert "has no rebuildable cache recorded" in result.stderr
 
 
 def test_volume_cache_stats_requires_a_running_worker(monkeypatch, tmp_path: Path) -> None:

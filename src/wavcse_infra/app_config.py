@@ -219,6 +219,7 @@ def apply_worker_app_config(
     connection: WorkerConnectionInfo,
     *,
     app: str | None = None,
+    target: Literal["controller", "worker"] = "worker",
     confirm: Callable[[AppConfigEntry], bool] | None = None,
     timeout_seconds: float = APP_CONFIG_TIMEOUT_SECONDS,
 ) -> tuple[AppConfigOutcome, ...]:
@@ -226,9 +227,13 @@ def apply_worker_app_config(
 
     An absent file is installed. A differing file is only replaced when `confirm`
     accepts it, and is backed up first; with no `confirm` it is preserved as-is.
+
+    `target` selects which mirrored set this account receives. It defaults to the
+    disposable-worker set, which deliberately excludes operator tooling; a persistent
+    operator-owned host asks for `controller` instead.
     """
 
-    entries = load_app_config_entries(app=app, target="worker")
+    entries = load_app_config_entries(app=app, target=target)
     if not entries:
         return ()
     contents = {entry.destination: load_app_config_content(entry) for entry in entries}

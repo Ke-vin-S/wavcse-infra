@@ -274,3 +274,76 @@ def test_urls_cannot_embed_credentials_or_query_secrets() -> None:
         load_settings(
             environ={"WAVCSE_INFRA_RUNPOD_API_URL": "https://example.test/v1?token=secret"}
         )
+
+
+def _static_config(tmp_path: Path, *, root: str) -> Path:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        f"""
+[[static.workers]]
+name = "university"
+host = "hpc.example.edu"
+port = 2222
+username = "operator"
+gpu_type = "NVIDIA A100-SXM4-80GB"
+gpu_count = 2
+root = "{root}"
+private_key = "~/.ssh/university"
+env = {{ CUDA_VISIBLE_DEVICES = "0" }}
+max_concurrent_jobs = 2
+""".strip(),
+        encoding="utf-8",
+    )
+    return config_file
+
+
+def test_a_declared_static_host_is_parsed_and_its_own_key_path_is_expanded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    settings = load_settings(
+        config_path=_static_config(tmp_path, root="/home/operator/wavcse"), environ={}
+    )
+
+    (worker,) = settings.static.workers
+    assert worker.name == "university"
+    assert (worker.host, worker.port, worker.username) == ("hpc.example.edu", 2222, "operator")
+    assert (worker.gpu_type, worker.gpu_count) == ("NVIDIA A100-SXM4-80GB", 2)
+    assert worker.root == "/home/operator/wavcse"
+    assert worker.private_key == Path("~/.ssh/university").expanduser()
+    assert worker.env == {"CUDA_VISIBLE_DEVICES": "0"}
+    assert worker.max_concurrent_jobs == 2
+
+
+@pytest.mark.parametrize("root", ["~/wavcse", "wavcse", "/", "/home/operator/../etc"])
+def test_a_static_confined_root_must_be_one_absolute_unambiguous_directory(
+    tmp_path: Path, root: str
+) -> None:
+    with pytest.raises(ConfigurationError, match=r"static\.workers\.0\.root"):
+        load_settings(config_path=_static_config(tmp_path, root=root), environ={})
+
+
+def test_a_static_worker_registry_refuses_two_identical_names(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[[static.workers]]
+name = "university"
+host = "hpc.example.edu"
+username = "operator"
+gpu_type = "NVIDIA A100-SXM4-80GB"
+root = "/home/operator/wavcse"
+
+[[static.workers]]
+name = "university"
+host = "other.example.edu"
+username = "operator"
+gpu_type = "NVIDIA A100-SXM4-80GB"
+root = "/home/operator/wavcse"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="static worker names must be distinct"):
+        load_settings(config_path=config_file, environ={})

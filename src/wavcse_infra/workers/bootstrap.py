@@ -6,6 +6,7 @@ import csv
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
+from typing import Literal
 
 from wavcse_infra.app_config import (
     APP_CONFIG_TIMEOUT_SECONDS,
@@ -22,6 +23,7 @@ from wavcse_infra.errors import (
 )
 from wavcse_infra.models import (
     HealthCheckStatus,
+    ProviderKind,
     Worker,
     WorkerGpuInfo,
     WorkerHealthCheck,
@@ -48,7 +50,13 @@ _DIAGNOSTIC_LIMIT = 500
 
 
 class WorkerBootstrapper:
-    """Turn a provider-running NVIDIA worker into a checked READY worker."""
+    """Turn a provider-running NVIDIA worker into a checked READY worker.
+
+    `static_root` selects the reviewed bootstrap profile. It is `None` for a provisioned
+    worker, which runs the `system` profile and installs packages and `uv` exactly as
+    before. For an operator-declared static host it names the one directory inside that
+    account that this tool confines every write to, and bootstrap installs nothing.
+    """
 
     def __init__(
         self,
@@ -56,11 +64,14 @@ class WorkerBootstrapper:
         executor: SshExecutor,
         state_store: WorkerStateStore,
         ssh_config: SshConfig,
+        *,
+        static_root: str | None = None,
     ) -> None:
         self._waiter = waiter
         self._executor = executor
         self._state = state_store
         self._config = ssh_config
+        self._static_root = static_root
 
     def bootstrap(
         self,
@@ -76,7 +87,7 @@ class WorkerBootstrapper:
         try:
             result = self._executor.run_checked(
                 ready.connection,
-                _script_command("bootstrap.sh", BOOTSTRAP_VERSION),
+                _script_command("bootstrap.sh", BOOTSTRAP_VERSION, *self._bootstrap_profile()),
                 input_text=load_worker_script("bootstrap.sh"),
                 timeout_seconds=(
                     self._config.bootstrap_timeout_seconds
@@ -86,17 +97,35 @@ class WorkerBootstrapper:
             )
         except SshCommandError as exc:
             raise WorkerBootstrapError(
-                f"Bootstrap failed on RunPod worker {worker_id}: {exc}"
+                f"Bootstrap failed on {_provider_label(ready.worker)} worker {worker_id}: {exc}"
             ) from exc
-        _require_bootstrap_completion(worker_id, result)
+        _require_bootstrap_completion(ready, result)
         self._state.mark_bootstrapped(worker_id, BOOTSTRAP_VERSION)
         return self._health(ready, command_timeout_seconds=command_timeout_seconds)
+
+    def _bootstrap_profile(self) -> tuple[str, str]:
+        """Return the profile and confined root `bootstrap.sh` receives as argv."""
+
+        if self._static_root is None:
+            return "system", ""
+        return "static", self._static_root
+
+    def _state_directory_argument(self) -> str:
+        """Return the worker-side state directory, or empty to accept the script default.
+
+        An empty argument is how the `system` profile keeps using
+        `${HOME}/.local/state/wavcse-worker` without this controller having to guess the
+        worker's home directory; the `static` profile owns a directory inside its root.
+        """
+
+        return "" if self._static_root is None else f"{self._static_root}/state"
 
     def install_app_config(
         self,
         worker_id: str,
         *,
         app: str | None = None,
+        target: Literal["controller", "worker"] = "worker",
         confirm: Callable[[AppConfigEntry], bool] | None = None,
         wait_timeout_seconds: float | None = None,
         command_timeout_seconds: float | None = None,
@@ -108,6 +137,7 @@ class WorkerBootstrapper:
             self._executor,
             ready.connection,
             app=app,
+            target=target,
             confirm=confirm,
             timeout_seconds=(
                 min(self._config.command_timeout_seconds, APP_CONFIG_TIMEOUT_SECONDS)
@@ -135,7 +165,7 @@ class WorkerBootstrapper:
         *,
         command_timeout_seconds: float | None,
     ) -> WorkerHealthReport:
-        disk_path, required_mount_path = _health_storage_paths(ready.worker)
+        disk_path, required_mount_path = self._health_storage_paths(ready.worker)
         try:
             result = self._executor.run_checked(
                 ready.connection,
@@ -144,6 +174,7 @@ class WorkerBootstrapper:
                     BOOTSTRAP_VERSION,
                     disk_path,
                     required_mount_path or "",
+                    self._state_directory_argument(),
                 ),
                 input_text=load_worker_script("health-check.sh"),
                 timeout_seconds=(
@@ -154,16 +185,36 @@ class WorkerBootstrapper:
             )
         except SshCommandError as exc:
             raise WorkerHealthError(
-                f"Health inspection failed on RunPod worker {ready.worker.id}: {exc}"
+                f"Health inspection failed on {_provider_label(ready.worker)} worker "
+                f"{ready.worker.id}: {exc}"
             ) from exc
         try:
-            report = parse_health_output(ready, result.stdout)
+            report = parse_health_output(
+                ready,
+                result.stdout,
+                uv_required=self._static_root is None,
+            )
         except WorkerHealthError as exc:
             raise WorkerHealthError(f"{exc}; {_remote_diagnostics(result)}") from exc
         if report.gpu is not None and report.gpu.count > 0:
             self._state.mark_gpu_healthy(ready.worker.id)
         self._state.record_health(report)
         return report
+
+    def _health_storage_paths(self, worker: Worker) -> tuple[str, str | None]:
+        """Select execution storage and any provider-requested mount independently."""
+
+        if self._static_root is not None:
+            # A declared host has no provider-attached volume, and its whole writable extent
+            # is the directory this tool confines itself to. Reporting `/` would describe a
+            # filesystem the recorded job cannot write freely, and inventing a mount would
+            # claim a mount that does not exist.
+            return self._static_root, None
+        volume_requested = (worker.volume_gb or 0) > 0 or worker.network_volume_id is not None
+        if not volume_requested:
+            return _EPHEMERAL_DISK_PATH, None
+        mount_path = worker.volume_mount_path or _DEFAULT_VOLUME_MOUNT_PATH
+        return mount_path, mount_path
 
 
 def load_worker_script(name: str) -> str:
@@ -184,17 +235,28 @@ def _script_command(name: str, *arguments: str) -> tuple[str, ...]:
     return ("bash", "-s", "--", *arguments)
 
 
-def _require_bootstrap_completion(worker_id: str, result: SshCommandResult) -> None:
+def _require_bootstrap_completion(ready: SshWaitResult, result: SshCommandResult) -> None:
     expected = f"{_BOOTSTRAP_COMPLETION_KEY}\t{BOOTSTRAP_VERSION}"
     if expected not in result.stdout.splitlines():
         raise WorkerBootstrapError(
-            f"Bootstrap command on RunPod worker {worker_id} exited successfully without "
-            f"completion marker version {BOOTSTRAP_VERSION}; {_remote_diagnostics(result)}"
+            f"Bootstrap command on {_provider_label(ready.worker)} worker {ready.worker.id} "
+            f"exited successfully without completion marker version {BOOTSTRAP_VERSION}; "
+            f"{_remote_diagnostics(result)}"
         )
 
 
-def parse_health_output(ready: SshWaitResult, output: str) -> WorkerHealthReport:
-    """Parse the small tab-separated worker protocol into normalized health data."""
+def parse_health_output(
+    ready: SshWaitResult,
+    output: str,
+    *,
+    uv_required: bool = True,
+) -> WorkerHealthReport:
+    """Parse the small tab-separated worker protocol into normalized health data.
+
+    `uv_required` is `False` on a declared static host, where this tool installs nothing:
+    `uv` is consumed only by a job specification's own argv, never by the reviewed runner,
+    so its absence there is a warning rather than a failure to become READY.
+    """
 
     lines = output.splitlines()
     schema_lines = [
@@ -235,7 +297,9 @@ def parse_health_output(ready: SshWaitResult, output: str) -> WorkerHealthReport
         WorkerHealthCheck(
             name="provider",
             status=HealthCheckStatus.PASS,
-            detail=f"RunPod state is {ready.worker.state.value}",
+            # The worker's own provider, not a hardcoded RunPod: a declared static host must
+            # never report a provider it does not belong to.
+            detail=f"{_provider_label(ready.worker)} state is {ready.worker.state.value}",
         ),
         WorkerHealthCheck(
             name="ssh",
@@ -272,6 +336,7 @@ def parse_health_output(ready: SshWaitResult, output: str) -> WorkerHealthReport
             bool(values.get("uv_version")),
             values.get("uv_version") or "uv is missing",
             "uv is missing",
+            warn_when_missing=not uv_required,
         ),
         _disk_check(disk_path, disk_available, disk_inspection_ok),
         _presence_check(
@@ -362,22 +427,28 @@ def _presence_check(
     successful: bool,
     success_detail: str,
     failure_detail: str,
+    *,
+    warn_when_missing: bool = False,
 ) -> WorkerHealthCheck:
+    """Report a tool's presence, or its absence as a warning where it is not required."""
+
+    if successful:
+        return WorkerHealthCheck(
+            name=name,
+            status=HealthCheckStatus.PASS,
+            detail=success_detail,
+        )
     return WorkerHealthCheck(
         name=name,
-        status=HealthCheckStatus.PASS if successful else HealthCheckStatus.FAIL,
-        detail=success_detail if successful else failure_detail,
+        status=HealthCheckStatus.WARN if warn_when_missing else HealthCheckStatus.FAIL,
+        detail=failure_detail,
     )
 
 
-def _health_storage_paths(worker: Worker) -> tuple[str, str | None]:
-    """Select execution storage and any provider-requested mount independently."""
+def _provider_label(worker: Worker) -> str:
+    """Name the worker's provider the way the operator configured it."""
 
-    volume_requested = (worker.volume_gb or 0) > 0 or worker.network_volume_id is not None
-    if not volume_requested:
-        return _EPHEMERAL_DISK_PATH, None
-    mount_path = worker.volume_mount_path or _DEFAULT_VOLUME_MOUNT_PATH
-    return mount_path, mount_path
+    return "RunPod" if worker.provider is ProviderKind.RUNPOD else worker.provider.value
 
 
 def _volume_mount_check(

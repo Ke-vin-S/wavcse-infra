@@ -505,3 +505,94 @@ def test_a_concurrent_ssh_probe_cannot_regress_a_health_result(tmp_path: Path) -
     # Neither writer's evidence was lost.
     assert final.health_status == "READY"
     assert final.last_ssh_ready_at == NOW
+
+
+def _static_connection() -> WorkerConnectionInfo:
+    return WorkerConnectionInfo(
+        provider_worker_id="hpc-static",
+        kind="direct",
+        host="hpc.example.edu",
+        port=22,
+        username="operator",
+    )
+
+
+def _static_worker(**overrides: object) -> Worker:
+    values: dict[str, object] = {
+        "provider": ProviderKind.STATIC_SSH,
+        "id": "hpc-static",
+        "name": "hpc-static",
+        "state": WorkerState.RUNNING,
+        "native_status": "registered",
+        "gpu_type": "NVIDIA A100-SXM4-80GB",
+        "gpu_count": 1,
+        "ssh_direct": _static_connection(),
+    }
+    values.update(overrides)
+    return Worker(**values)  # type: ignore[arg-type]
+
+
+def test_a_declared_static_host_is_registered_with_a_confined_cache_root(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+
+    record = store.record_registered(_static_worker(), cache_root="/home/operator/wavcse/cache")
+
+    assert record.provider is ProviderKind.STATIC_SSH
+    assert record.execution_transport is ExecutionTransport.SSH
+    assert record.provider_worker_id == record.infra_identity == "hpc-static"
+    assert record.requested_gpu_type == "NVIDIA A100-SXM4-80GB"
+    assert record.requested_gpu_count == 1
+    assert (record.ssh_host, record.ssh_port, record.ssh_username) == (
+        "hpc.example.edu",
+        22,
+        "operator",
+    )
+    assert record.ssh_kind == "direct"
+    assert record.cache_root == "/home/operator/wavcse/cache"
+    assert record.known_hourly_price is None
+    assert record.last_observed_state is WorkerState.RUNNING
+    assert record.readiness_state is WorkerReadinessState.NOT_READY
+    assert not record.create_pending
+    assert store.get("hpc-static") == record
+
+
+def test_re_registering_a_declared_host_never_weakens_proven_readiness(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+    store.record_registered(_static_worker(), cache_root="/home/operator/wavcse/cache")
+    store.mark_ssh_ready(_static_worker(), _static_connection())
+
+    store.record_registered(_static_worker(), cache_root="/home/operator/wavcse/cache")
+
+    record = store.get("hpc-static")
+    assert record is not None
+    assert record.readiness_state is WorkerReadinessState.SSH_READY
+    assert record.last_ssh_ready_at == NOW
+
+
+def test_a_declared_host_never_reuses_an_identity_tracked_under_another_provider(
+    tmp_path: Path,
+) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+    store.record_created(_plan(), _worker())
+
+    with pytest.raises(StateError, match="already tracked as a runpod record"):
+        store.record_registered(
+            _static_worker(
+                id="pod-123",
+                ssh_direct=WorkerConnectionInfo(
+                    provider_worker_id="pod-123",
+                    kind="direct",
+                    host="hpc.example.edu",
+                    port=22,
+                    username="operator",
+                ),
+            ),
+            cache_root="/home/operator/wavcse/cache",
+        )
+
+
+def test_registration_refuses_a_worker_that_is_not_a_declared_static_host(tmp_path: Path) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json", now=lambda: NOW)
+
+    with pytest.raises(StateError, match="is not a declared static host"):
+        store.record_registered(_worker(), cache_root="/workspace/cache")

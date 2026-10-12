@@ -1,0 +1,22 @@
+# Mirrored settings for the controller's file explorer (`apps/manifest`), applied to the
+# controller account's home directory by `controller/app-config.sh` (`make app-config`).
+#
+# The binaries are pinned and installed by controller/bootstrap.sh; this file is the
+# repository's source of truth for how they behave, so a settings change is a reviewed
+# commit. Yazi merges these values over the defaults shipped in the release, so only a
+# deliberate divergence belongs here; the defaults for the pinned version are checked
+# against the tag before committing:
+#   curl -sSfL https://raw.githubusercontent.com/sxyazi/yazi/v26.9.1/yazi-config/preset/yazi-default.toml
+#
+# Settings this file cannot express are documented in docs/OPERATIONS.md: a Nerd Font
+# selected in the *local* terminal profile, a UTF-8 login locale, and the optional
+# command-line tools that add previews, content search, and archive handling.
+
+[opener]
+# The shipped default opens the editor as "${EDITOR:-vi}". The review UI pins vim for its
+# own edit paths (`apps/lazygit/config.yml`: os.editPreset), and a text file opened from
+# the file manager is the same kind of reading, so the fallback matches it while an EDITOR
+# the operator set still wins. `block` suspends yazi until the editor exits.
+edit = [
+  { run = "${EDITOR:-vim} %s", desc = "$EDITOR", for = "unix", block = true },
+]

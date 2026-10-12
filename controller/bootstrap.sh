@@ -12,6 +12,18 @@ readonly DEFAULT_LAZYGIT_VERSION='0.66.0'
 readonly DEFAULT_LAZYGIT_X86_64_SHA256='5b45541155d20bd32bf2cc5ab5b7e3d91c2eebf0fb1242281350edc27d59d2b7'
 readonly DEFAULT_LAZYGIT_AARCH64_SHA256='9a4fc4656897ac9f7877b835473ce1a75620cc267f554c57fc4ff266407f3257'
 readonly LAZYGIT_VERSION="${WAVCSE_INFRA_LAZYGIT_VERSION:-${DEFAULT_LAZYGIT_VERSION}}"
+# Pinned file explorer for the operator: a terminal file manager for reading the shape of an
+# agent's change and the artifacts beside it without a GUI, a display server, or a mounted
+# share. Bootstrap installs the release's two binaries only; it never installs a plugin or
+# writes to a checkout. Yazi names its release assets by Rust target triple with no version
+# in the name, so the GNU build is selected (the controller is Ubuntu/glibc) and the SHA-256
+# pin is what ties the archive to this version: the archive is accepted only when its digest
+# matches the one pinned for the detected architecture. Its MIME detection shells out to
+# `file` and its release archive is a zip, so `install_os_packages` provides both.
+readonly DEFAULT_YAZI_VERSION='26.9.1'
+readonly DEFAULT_YAZI_X86_64_SHA256='a02fe91d3304294048c681f010f1100856872a4e98ecf6927328e888d40a6ad2'
+readonly DEFAULT_YAZI_AARCH64_SHA256='02807f08d6b589b65b7516a4e259d83f5995d7a23bb12b3a155141385b370b3a'
+readonly YAZI_VERSION="${WAVCSE_INFRA_YAZI_VERSION:-${DEFAULT_YAZI_VERSION}}"
 # Terminal locale for interactive controller sessions: box drawing, Nerd Font icons, and
 # rendered diffs are multi-byte, and a C/POSIX locale corrupts all three.
 readonly CONTROLLER_LOCALE='en_US.UTF-8'
@@ -48,9 +60,10 @@ Bootstrap the controller, install the pinned review UI and the controller-only
 agent tools by default, and install the pinned Google Colab CLI. No
 authentication or paid resource request is performed.
 
-The review UI (lazygit) and its diff renderer (git-delta) are operator tools:
---skip-agents does not skip them. The managed tools are also published into a
-system-wide directory so a non-login shell resolves them.
+The review UI (lazygit), the file explorer (yazi), and lazygit's diff renderer
+(git-delta) are operator tools: --skip-agents does not skip them. The managed
+tools are also published into a system-wide directory so a non-login shell
+resolves them.
 EOF
 }
 
@@ -107,15 +120,19 @@ install_os_packages() {
   fi
 
   "${elevate[@]}" apt-get update
+  # `file` (MIME detection) and `unzip` (extracting the zip release archive) are
+  # prerequisites of the pinned file explorer installed by install_yazi.
   "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
     ca-certificates \
     curl \
+    file \
     git \
     git-delta \
     locales \
     shellcheck \
     shfmt \
-    tmux
+    tmux \
+    unzip
 }
 
 # A UTF-8 locale is a correctness requirement for the interactive review UI, not a
@@ -283,6 +300,115 @@ install_lazygit() {
   printf 'Its settings are mirrored from apps/lazygit/config.yml; apply them with make app-config.\n'
 }
 
+# Emit "<release archive>\t<expected sha256>" for the detected architecture. Yazi's asset
+# name carries the Rust target triple and not the version, so the digest — not the file name
+# — is what identifies the pinned release; GitHub reports the same sha256 for the asset.
+yazi_release_details() {
+  local architecture
+  architecture="$(uname -m)"
+  case "${architecture}" in
+  x86_64 | amd64)
+    printf 'yazi-x86_64-unknown-linux-gnu.zip\t%s\n' \
+      "${WAVCSE_INFRA_YAZI_X86_64_SHA256:-${DEFAULT_YAZI_X86_64_SHA256}}"
+    ;;
+  aarch64 | arm64)
+    printf 'yazi-aarch64-unknown-linux-gnu.zip\t%s\n' \
+      "${WAVCSE_INFRA_YAZI_AARCH64_SHA256:-${DEFAULT_YAZI_AARCH64_SHA256}}"
+    ;;
+  *) fail "yazi has no configured release archive for architecture ${architecture}" ;;
+  esac
+}
+
+# An overridden version is only accepted with an explicit digest for this architecture:
+# a pin without a verified digest is not a pin.
+validate_yazi_version_override() {
+  [[ "${YAZI_VERSION}" == "${DEFAULT_YAZI_VERSION}" ]] && return 0
+  case "$(uname -m)" in
+  x86_64 | amd64)
+    [[ -n "${WAVCSE_INFRA_YAZI_X86_64_SHA256:-}" ]] ||
+      fail 'set WAVCSE_INFRA_YAZI_X86_64_SHA256 when overriding WAVCSE_INFRA_YAZI_VERSION'
+    ;;
+  aarch64 | arm64)
+    [[ -n "${WAVCSE_INFRA_YAZI_AARCH64_SHA256:-}" ]] ||
+      fail 'set WAVCSE_INFRA_YAZI_AARCH64_SHA256 when overriding WAVCSE_INFRA_YAZI_VERSION'
+    ;;
+  esac
+}
+
+# Both release binaries print the same multi-line block: a program header, then an indented
+# "    Version: 26.9.1 (8dd895c 2026-09-01)" line. Read the version field from that line, so
+# the header word ("Yazi"/"Ya") and the commit in parentheses are never mistaken for it.
+yazi_installed_version() {
+  local binary=$1 output=''
+  [[ -x "${binary}" ]] || return 0
+  output="$(run_as_controller env HOME="${CONTROLLER_HOME}" "${binary}" --version 2>/dev/null)" ||
+    output=''
+  printf '%s\n' "${output}" |
+    sed -n 's/^[[:space:]]*Version:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -n 1
+}
+
+install_yazi() {
+  local yazi_bin="${CONTROLLER_HOME}/.local/bin/yazi"
+  local ya_bin="${CONTROLLER_HOME}/.local/bin/ya"
+  local installed_version
+  installed_version="$(yazi_installed_version "${yazi_bin}")"
+  if [[ "${installed_version}" == "${YAZI_VERSION}" ]]; then
+    printf 'yazi %s is already installed.\n' "${YAZI_VERSION}"
+    return 0
+  fi
+  validate_yazi_version_override
+  command -v sha256sum >/dev/null 2>&1 || fail 'sha256sum is required to verify the yazi archive'
+  command -v unzip >/dev/null 2>&1 || fail 'unzip is required to extract the yazi archive'
+
+  local asset expected_sha256 archive actual_sha256 url temporary_directory stem member
+  IFS=$'\t' read -r asset expected_sha256 < <(yazi_release_details)
+  url="https://github.com/sxyazi/yazi/releases/download/v${YAZI_VERSION}/${asset}"
+  stem="${asset%.zip}"
+  printf 'Installing yazi %s from sxyazi/yazi.\n' "${YAZI_VERSION}"
+  temporary_directory="$(run_as_controller env HOME="${CONTROLLER_HOME}" mktemp -d)"
+  archive="${temporary_directory}/${asset}"
+
+  if ! run_as_controller env HOME="${CONTROLLER_HOME}" curl --fail --location \
+    --proto '=https' --tlsv1.2 --silent --show-error "${url}" --output "${archive}"; then
+    run_as_controller rm -rf -- "${temporary_directory}"
+    fail "could not download the official yazi archive from ${url}"
+  fi
+  actual_sha256="$(
+    run_as_controller env HOME="${CONTROLLER_HOME}" sha256sum "${archive}" | awk '{print $1}'
+  )"
+  if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
+    run_as_controller rm -rf -- "${temporary_directory}"
+    fail "yazi archive checksum mismatch (expected ${expected_sha256}, got ${actual_sha256})"
+  fi
+  # The archive holds both binaries inside one <asset-stem> directory, so the members are
+  # named explicitly rather than unpacking the directory tree into the account's home.
+  if ! run_as_controller env HOME="${CONTROLLER_HOME}" unzip -q -- "${archive}" \
+    "${stem}/yazi" "${stem}/ya" -d "${temporary_directory}"; then
+    run_as_controller rm -rf -- "${temporary_directory}"
+    fail 'yazi archive did not contain an extractable yazi and ya pair'
+  fi
+  for member in yazi ya; do
+    if [[ ! -x "${temporary_directory}/${stem}/${member}" ]]; then
+      run_as_controller rm -rf -- "${temporary_directory}"
+      fail "could not install ${member}: the yazi archive is missing the expected binary"
+    fi
+    run_as_controller env HOME="${CONTROLLER_HOME}" install -D -m 0755 -- \
+      "${temporary_directory}/${stem}/${member}" "${CONTROLLER_HOME}/.local/bin/${member}"
+  done
+  run_as_controller rm -rf -- "${temporary_directory}"
+
+  installed_version="$(yazi_installed_version "${yazi_bin}")"
+  [[ "${installed_version}" == "${YAZI_VERSION}" ]] ||
+    fail "expected yazi ${YAZI_VERSION}, observed ${installed_version:-unknown}"
+  local ya_version
+  ya_version="$(yazi_installed_version "${ya_bin}")"
+  [[ "${ya_version}" == "${YAZI_VERSION}" ]] ||
+    fail "expected ya ${YAZI_VERSION}, observed ${ya_version:-unknown}"
+  printf 'File explorer installed for %s: %s and %s\n' \
+    "${CONTROLLER_USER}" "${yazi_bin}" "${ya_bin}"
+  printf 'Its settings are mirrored from apps/yazi/yazi.toml; apply them with make app-config.\n'
+}
+
 install_uv() {
   local uv_bin="${CONTROLLER_HOME}/.local/bin/uv"
   local installed_version=''
@@ -437,6 +563,7 @@ main() {
   configure_locale
   configure_git
   install_lazygit
+  install_yazi
   install_uv
   sync_project
   install_colab_cli

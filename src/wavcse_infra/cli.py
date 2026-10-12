@@ -12,7 +12,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Annotated, Never
+from typing import Annotated, Literal, Never
 from uuid import uuid4
 
 import typer
@@ -20,7 +20,13 @@ from pydantic import ValidationError
 
 from wavcse_infra import __version__
 from wavcse_infra.app_config import AppConfigEntry, load_app_config_entries
-from wavcse_infra.config import Settings, load_settings, resolved_config_path
+from wavcse_infra.config import (
+    Settings,
+    SshConfig,
+    StaticWorkerConfig,
+    load_settings,
+    resolved_config_path,
+)
 from wavcse_infra.doctor import CheckStatus, DoctorReport, run_doctor
 from wavcse_infra.errors import (
     ConfigurationError,
@@ -41,7 +47,7 @@ from wavcse_infra.errors import (
 from wavcse_infra.jobs.colab_transport import ColabExecutor, ColabJobExecutor, ColabWaiter
 from wavcse_infra.jobs.collect import resolve_output_source
 from wavcse_infra.jobs.context import JobContext
-from wavcse_infra.jobs.execution import JobExecutor
+from wavcse_infra.jobs.execution import JobExecutor, StaticJobExecutor
 from wavcse_infra.jobs.models import (
     JobRecord,
     JobSpec,
@@ -71,6 +77,7 @@ from wavcse_infra.models import (
 )
 from wavcse_infra.providers.colab import ColabClient
 from wavcse_infra.providers.runpod import RunPodClient, network_volume_create_payload
+from wavcse_infra.providers.static import StaticClient
 from wavcse_infra.redaction import redact
 from wavcse_infra.state import (
     VolumeLifecycleState,
@@ -211,7 +218,14 @@ def list_providers(context: typer.Context) -> None:
     settings = _load_cli_settings(_context(context))
     typer.echo("PROVIDER\tSTATUS\tEXECUTION\tCOST MODEL\tPREFERRED")
     preferred_found = False
-    for kind in settings.placement.preferred_providers:
+    declared_static = bool(settings.static.workers)
+    ordered = list(settings.placement.preferred_providers)
+    if declared_static and ProviderKind.STATIC_SSH not in ordered:
+        # A declared host that placement never lists can never be selected, which is worth
+        # reporting rather than hiding behind the preference list it is absent from.
+        ordered.append(ProviderKind.STATIC_SSH)
+    for kind in ordered:
+        in_placement = kind in settings.placement.preferred_providers
         if kind is ProviderKind.COLAB:
             status = "DISABLED"
             if settings.colab.enabled:
@@ -223,9 +237,16 @@ def list_providers(context: typer.Context) -> None:
                 except ProviderError:
                     status = "UNAVAILABLE"
             transport, cost = "COLAB_EXEC", CostUnit.COMPUTE_UNITS.value
+        elif kind is ProviderKind.STATIC_SSH:
+            # A declared host is usable as soon as it is declared; whether it answers is
+            # readiness, not configuration. Its cost column is the literal `-`: it has no
+            # USD/hour and no compute-unit rate, and borrowing either unit would invent a
+            # price for a machine this tool does not pay for (invariant 7).
+            status = "CONFIGURED" if declared_static else "UNAVAILABLE"
+            transport, cost = "SSH", "-"
         else:
             status, transport, cost = "CONFIGURED", "SSH", CostUnit.USD_PER_HOUR.value
-        preferred = not preferred_found and status in {"READY", "CONFIGURED"}
+        preferred = in_placement and not preferred_found and status in {"READY", "CONFIGURED"}
         preferred_found |= preferred
         typer.echo(
             f"{kind.value}\t{status}\t{transport}\t{cost}\t"
@@ -268,8 +289,10 @@ def list_workers(
     settings = _load_cli_settings(_context(context))
     workers: list[Worker] = []
     active_provider = "Colab" if provider is ProviderKind.COLAB else "RunPod"
+    declared_static = bool(settings.static.workers)
+    include_static = provider is ProviderKind.STATIC_SSH or (provider is None and declared_static)
     try:
-        if provider is not ProviderKind.COLAB:
+        if provider is not ProviderKind.COLAB and provider is not ProviderKind.STATIC_SSH:
             with RunPodClient.from_settings(settings) as client:
                 runpod_workers = client.list_workers()
             workers.extend(runpod_workers)
@@ -282,6 +305,12 @@ def list_workers(
             workers.extend(colab_workers)
             if not read_only:
                 _reconcile_colab_state(colab_workers)
+        if include_static:
+            # A declared host is never reconciled. `reconcile` marks a tracked worker the
+            # provider did not list as DESTROYED, which is right for a resource this tool
+            # created and destructive for a machine the operator owns, so the declaration is
+            # listed instead and only the local readiness record is read.
+            workers.extend(StaticClient(settings.static).list_workers())
     except ConfigurationError as exc:
         _configuration_failure(exc)
     except ProviderError as exc:
@@ -290,26 +319,29 @@ def list_workers(
         _print_json([worker.model_dump(mode="json") for worker in workers])
         return
     if not workers:
-        typer.echo("No workers found." if settings.colab.enabled else "No RunPod workers found.")
+        if provider is ProviderKind.STATIC_SSH:
+            typer.echo("No static hosts are declared under [[static.workers]].")
+        elif settings.colab.enabled:
+            typer.echo("No workers found.")
+        else:
+            typer.echo("No RunPod workers found.")
         return
 
-    if settings.colab.enabled:
-        typer.echo("PROVIDER\tID\tSTATE\tGPU\tCOUNT\tCLOUD\tCOST/HR\tNAME")
-    else:
-        typer.echo("ID\tSTATE\tGPU\tCOUNT\tCLOUD\tCOST/HR\tNAME")
+    show_provider = settings.colab.enabled or declared_static
+    header = ("PROVIDER\t" if show_provider else "") + "ID\tSTATE\tGPU\tCOUNT\tCLOUD\tCOST/HR\tNAME"
+    typer.echo(header)
+    readiness = _static_readiness_by_id()
     for worker in workers:
         values = (
             worker.id,
-            worker.state.value,
+            _listed_state(worker, readiness),
             worker.gpu_type or "-",
             str(worker.gpu_count) if worker.gpu_count is not None else "-",
             worker.cloud_type.value if worker.cloud_type is not None else "-",
-            _money(worker.hourly_cost),
+            _listed_cost(worker),
             worker.name or "-",
         )
-        typer.echo(
-            "\t".join((worker.provider.value, *values) if settings.colab.enabled else values)
-        )
+        typer.echo("\t".join((worker.provider.value, *values) if show_provider else values))
 
 
 @worker_app.command("show")
@@ -327,21 +359,35 @@ def show_worker(
 
     settings = _load_cli_settings(_context(context))
     record = _state_record(worker_id)
+    try:
+        config = _require_static_declaration(settings, worker_id)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
     active_provider = (
-        "Colab" if record is not None and record.provider is ProviderKind.COLAB else "RunPod"
+        "static_ssh"
+        if config is not None
+        else "Colab"
+        if record is not None and record.provider is ProviderKind.COLAB
+        else "RunPod"
     )
     try:
-        if record is not None and record.provider is ProviderKind.COLAB:
+        if config is not None:
+            # Reporting a declared host reads no provider: the declaration *is* the provider
+            # state, so there is nothing new to observe and nothing to mark destroyed.
+            worker = StaticClient(settings.static).get_worker(worker_id)
+        elif record is not None and record.provider is ProviderKind.COLAB:
             worker = _colab_client(settings).get_worker(worker_id)
+            if not read_only:
+                _observe_state(worker)
         else:
             with RunPodClient.from_settings(settings) as client:
                 worker = client.get_worker(worker_id)
-        if not read_only:
-            _observe_state(worker)
+            if not read_only:
+                _observe_state(worker)
     except ConfigurationError as exc:
         _configuration_failure(exc)
     except ProviderNotFoundError as exc:
-        if not read_only:
+        if not read_only and config is None:
             _mark_state_destroyed(worker_id)
         _provider_failure(exc, provider=active_provider)
     except ProviderError as exc:
@@ -351,6 +397,7 @@ def show_worker(
     else:
         _print_worker(worker)
         _print_colab_billing(record)
+        _print_static_readiness(record, root=config.root if config is not None else None)
 
 
 @worker_app.command("gpu-types")
@@ -660,9 +707,8 @@ def wait_for_worker_ssh(
 
     settings = _load_cli_settings(_context(context))
     try:
-        _require_runpod_transport(worker_id, "wait for SSH")
-        with RunPodClient.from_settings(settings) as client:
-            _, waiter = _worker_access(client, settings)
+        _require_ssh_transport(worker_id, "wait for SSH")
+        with _worker_access_for(worker_id, settings) as (_, waiter):
             result = waiter.wait(worker_id, timeout_seconds=wait_timeout)
     except ConfigurationError as exc:
         _configuration_failure(exc)
@@ -673,7 +719,7 @@ def wait_for_worker_ssh(
     if json_output:
         _print_json(result.connection.model_dump(mode="json"))
         return
-    typer.echo(f"RunPod worker {worker_id} is SSH READY.")
+    typer.echo(f"{_provider_name(result.worker.provider)} worker {worker_id} is SSH READY.")
     typer.echo(f"Connection: {result.connection.kind}")
     typer.echo(f"Host: {result.connection.host}")
     typer.echo(f"Port: {result.connection.port}")
@@ -689,9 +735,17 @@ def ssh_worker(
 
     settings = _load_cli_settings(_context(context))
     try:
-        _require_runpod_transport(worker_id, "open an SSH session")
-        with RunPodClient.from_settings(settings) as client:
-            worker = client.get_worker(worker_id)
+        _require_ssh_transport(worker_id, "open an SSH session")
+        config = _require_static_declaration(settings, worker_id)
+        if config is not None:
+            _register_static_host(settings, config)
+            static_client = StaticClient(settings.static)
+            worker = static_client.get_worker(worker_id)
+            ssh_config = static_client.ssh_config(config, settings.ssh)
+        else:
+            ssh_config = settings.ssh
+            with RunPodClient.from_settings(settings) as client:
+                worker = client.get_worker(worker_id)
         _observe_state(worker)
         if worker.state is not WorkerState.RUNNING:
             raise SshEndpointUnavailableError(
@@ -703,7 +757,7 @@ def ssh_worker(
             raise SshEndpointUnavailableError(
                 f"RunPod worker {worker_id} has no published SSH endpoint"
             )
-        exit_code = SshExecutor(settings.ssh).run_interactive(connection)
+        exit_code = SshExecutor(ssh_config).run_interactive(connection)
     except ConfigurationError as exc:
         _configuration_failure(exc)
     except ProviderError as exc:
@@ -737,9 +791,8 @@ def exec_worker(
         raise typer.BadParameter("a remote command is required after `--`")
     settings = _load_cli_settings(_context(context))
     try:
-        _require_runpod_transport(worker_id, "run an arbitrary SSH command")
-        with RunPodClient.from_settings(settings) as client:
-            executor, waiter = _ssh_access(client, settings)
+        _require_ssh_transport(worker_id, "run an arbitrary SSH command")
+        with _ssh_access_for(worker_id, settings) as (executor, waiter):
             ready = waiter.wait(worker_id, timeout_seconds=wait_timeout)
             result = executor.run(
                 ready.connection,
@@ -794,9 +847,9 @@ def bootstrap_worker(
         typer.echo(f"Colab worker {worker_id} READY; observed physical GPU: {model}")
         return
     try:
-        _require_runpod_transport(worker_id, "run the RunPod bootstrap")
-        with RunPodClient.from_settings(settings) as client:
-            bootstrapper, _ = _worker_access(client, settings)
+        _require_ssh_transport(worker_id, "run the RunPod bootstrap")
+        target = _app_config_target(settings, worker_id)
+        with _worker_access_for(worker_id, settings) as (bootstrapper, _):
             report = bootstrapper.bootstrap(
                 worker_id,
                 wait_timeout_seconds=wait_timeout,
@@ -804,6 +857,7 @@ def bootstrap_worker(
             )
             outcomes = bootstrapper.install_app_config(
                 worker_id,
+                target=target,
                 wait_timeout_seconds=wait_timeout,
                 command_timeout_seconds=command_timeout,
             )
@@ -855,14 +909,15 @@ def apply_worker_config(
     """Apply the repository's mirrored application configuration to one worker."""
 
     settings = _load_cli_settings(_context(context))
+    target = _app_config_target(settings, worker_id)
     try:
-        load_app_config_entries(app=app, target="worker")
-        _require_runpod_transport(worker_id, "apply the worker application configuration")
-        with RunPodClient.from_settings(settings) as client:
-            bootstrapper, _ = _worker_access(client, settings)
+        load_app_config_entries(app=app, target=target)
+        _require_ssh_transport(worker_id, "apply the worker application configuration")
+        with _worker_access_for(worker_id, settings) as (bootstrapper, _):
             outcomes = bootstrapper.install_app_config(
                 worker_id,
                 app=app,
+                target=target,
                 confirm=(lambda entry: True) if yes else _app_config_confirmation(worker_id),
                 wait_timeout_seconds=wait_timeout,
                 command_timeout_seconds=command_timeout,
@@ -994,9 +1049,8 @@ def health_worker(
         typer.echo(f"Colab worker {worker_id} READY; observed physical GPU: {model}")
         return
     try:
-        _require_runpod_transport(worker_id, "run RunPod health checks")
-        with RunPodClient.from_settings(settings) as client:
-            bootstrapper, _ = _worker_access(client, settings)
+        _require_ssh_transport(worker_id, "run RunPod health checks")
+        with _worker_access_for(worker_id, settings) as (bootstrapper, _):
             report = bootstrapper.health(
                 worker_id,
                 wait_timeout_seconds=wait_timeout,
@@ -1026,7 +1080,8 @@ def start_worker(
 
     settings = _load_cli_settings(_context(context))
     try:
-        _require_runpod_transport(worker_id, "start a stopped Pod")
+        _require_not_static(settings, worker_id, "start")
+        _require_ssh_transport(worker_id, "start a stopped Pod")
         with RunPodClient.from_settings(settings) as client:
             worker = _lifecycle(client, settings).start(
                 worker_id,
@@ -1055,7 +1110,8 @@ def stop_worker(
 
     settings = _load_cli_settings(_context(context))
     try:
-        _require_runpod_transport(worker_id, "stop resumable compute")
+        _require_not_static(settings, worker_id, "stop")
+        _require_ssh_transport(worker_id, "stop resumable compute")
         with RunPodClient.from_settings(settings) as client:
             worker = _lifecycle(client, settings).stop(
                 worker_id,
@@ -1134,6 +1190,7 @@ def destroy_worker(
         except ProviderError as exc:
             _provider_failure(exc, provider="Colab")
     try:
+        _require_not_static(settings, worker_id, "destroy")
         with RunPodClient.from_settings(settings) as client:
             lifecycle = _lifecycle(client, settings)
             try:
@@ -1516,30 +1573,31 @@ def cache_stats_command(
 
     settings = _load_cli_settings(_context(context))
     try:
-        with RunPodClient.from_settings(settings) as client:
-            worker_record = _state_record(worker)
-            cache_root = None if worker_record is None else worker_record.network_volume_mount_path
-            if cache_root is None:
-                raise ConfigurationError(
-                    f"Worker {worker} has no network volume mount recorded, so it has no "
-                    "rebuildable cache to inspect; create the Pod with --network-volume-id and "
-                    "bootstrap it first"
-                )
-            worker_view = client.get_worker(worker)
+        worker_record = _state_record(worker)
+        config = _require_static_declaration(settings, worker)
+        cache_root = None if worker_record is None else worker_record.resolved_cache_root()
+        if cache_root is None and config is not None:
+            # A declared host that has not been bootstrapped yet has no record, but its
+            # declaration already fixes where its cache lives.
+            cache_root = f"{config.root}/cache"
+        if cache_root is None:
+            raise ConfigurationError(
+                f"Worker {worker} has no rebuildable cache recorded, so there is nothing to "
+                "inspect; bootstrap a declared static host, or create the Pod with "
+                "--network-volume-id and bootstrap it first"
+            )
+        with _job_context_for(worker, settings) as job_context:
+            worker_view = job_context.provider.get_worker(worker)
             if worker_view.state is not WorkerState.RUNNING:
                 raise ConfigurationError(
-                    f"RunPod worker {worker} is {worker_view.state.value}; cache inspection "
-                    "requires provider state RUNNING"
+                    f"Worker {worker} is {worker_view.state.value}; cache inspection requires "
+                    "provider state RUNNING"
                 )
-            executor, waiter = _ssh_access(client, settings)
-            transfer = WorkerArtifactTransfer(waiter, executor, settings.ssh)
-            cache = WorkerArtifactCache(
-                waiter,
-                executor,
-                settings.ssh,
-                transfer,
-                warn=_print_warning,
-            )
+            cache = job_context.cache
+            if cache is None:
+                # Only the Colab context has no cache, and a Colab session records no cache
+                # root, so the check above already refused it; this keeps the type honest.
+                raise ConfigurationError(f"Worker {worker} has no rebuildable cache to inspect")
             stats = cache.stats(
                 worker,
                 cache_root=cache_root,
@@ -2041,6 +2099,9 @@ def submit_job(
                 raise ConfigurationError(f"Worker {selected} does not belong to {provider.value}")
             if tracked is not None and tracked.provider is ProviderKind.COLAB:
                 _require_colab_job_budget(settings, spec, tracked)
+            static_config = _require_static_declaration(settings, selected)
+            if static_config is not None:
+                _require_static_job_slot(static_config)
             with _job_context_for(selected, settings) as job_context:
                 record = JobSubmitter(job_context).submit(spec, worker_id=selected)
         if wait:
@@ -2343,8 +2404,59 @@ def _colab_job_context(settings: Settings) -> JobContext:
     )
 
 
+def _static_job_context(settings: Settings, config: StaticWorkerConfig) -> JobContext:
+    """Assemble the shared job collaborators for one declared static host.
+
+    Everything this host runs lives under its confined root: the job workspace, the
+    reviewed runner, and the rebuildable cache. The host's own SSH identity and declared
+    environment come from the same declaration, so a recorded job spec carries nothing
+    machine-specific.
+    """
+
+    client = StaticClient(settings.static)
+    ssh_config = client.ssh_config(config, settings.ssh)
+    state = _state_store()
+    executor = SshExecutor(ssh_config)
+    waiter = WorkerSshWaiter(client, executor, state, ssh_config)
+    transfer = WorkerArtifactTransfer(waiter, executor, ssh_config)
+    jobs = settings.jobs.model_copy(
+        update={
+            "worker_root": f"{config.root}/jobs",
+            "runner_path": f"{config.root}/job_runner.py",
+        }
+    )
+    return JobContext(
+        provider=client,
+        worker_state=state,
+        job_store=_job_store(),
+        executor=StaticJobExecutor(
+            waiter,
+            executor,
+            ssh_config,
+            jobs,
+            root=config.root,
+            environment=config.env,
+        ),
+        transfer=transfer,
+        storage=_optional_storage(settings),
+        jobs_config=jobs,
+        environ=os.environ,
+        cache=WorkerArtifactCache(
+            waiter,
+            executor,
+            ssh_config,
+            transfer,
+            warn=_print_warning,
+        ),
+    )
+
+
 @contextmanager
 def _job_context_for(worker_id: str, settings: Settings) -> Iterator[JobContext]:
+    config = _require_static_declaration(settings, worker_id)
+    if config is not None:
+        yield _static_job_context(settings, config)
+        return
     record = _state_record(worker_id)
     if record is not None and record.provider is ProviderKind.COLAB:
         yield _colab_job_context(settings)
@@ -2355,12 +2467,36 @@ def _job_context_for(worker_id: str, settings: Settings) -> Iterator[JobContext]
 
 @contextmanager
 def _artifact_transfer_for(worker_id: str, settings: Settings) -> Iterator[WorkerArtifactTransfer]:
+    config = _require_static_declaration(settings, worker_id)
+    if config is not None:
+        yield _static_job_context(settings, config).transfer
+        return
     record = _state_record(worker_id)
     if record is not None and record.provider is ProviderKind.COLAB:
         yield _colab_job_context(settings).transfer
     else:
         with RunPodClient.from_settings(settings) as client:
             yield _worker_transfer(client, settings)
+
+
+def _require_static_job_slot(config: StaticWorkerConfig) -> None:
+    """Refuse a submission that would exceed this host's declared concurrency.
+
+    Nothing is provisioned here, so no price guard applies; the guard that matters on a
+    shared machine is how many recorded jobs it is being asked to run at once.
+    """
+
+    active = [
+        record
+        for record in _job_store().list_records()
+        if record.worker_id == config.name and not record.terminal
+    ]
+    if len(active) >= config.max_concurrent_jobs:
+        raise ConfigurationError(
+            f"Static host {config.name} already has {len(active)} active recorded job(s) "
+            f"and its declaration allows {config.max_concurrent_jobs}: "
+            f"{', '.join(record.job_id for record in active)}"
+        )
 
 
 def _require_colab_job_budget(settings: Settings, spec: JobSpec, record: WorkerRecord) -> None:
@@ -2425,6 +2561,8 @@ def _select_job_worker(settings: Settings, spec: JobSpec, provider: ProviderKind
     for kind in ordered:
         if kind is ProviderKind.COLAB and not settings.colab.enabled:
             continue
+        if kind is ProviderKind.STATIC_SSH and not settings.static.workers:
+            continue
         for record in records:
             if (
                 record.provider is not kind
@@ -2437,6 +2575,19 @@ def _select_job_worker(settings: Settings, spec: JobSpec, provider: ProviderKind
                 try:
                     _require_colab_job_budget(settings, spec, record)
                 except (CostGuardError, ConfigurationError, ProviderError) as exc:
+                    failure = exc
+                    continue
+            elif kind is ProviderKind.STATIC_SSH:
+                try:
+                    config = _require_static_declaration(settings, record.provider_worker_id)
+                except ConfigurationError as exc:
+                    failure = exc
+                    continue
+                if config is None:
+                    continue
+                try:
+                    _require_static_job_slot(config)
+                except (ConfigurationError, ProviderError) as exc:
                     failure = exc
                     continue
             try:
@@ -2715,6 +2866,173 @@ def _ssh_access(
     return executor, waiter
 
 
+def _static_readiness_by_id() -> dict[str, str]:
+    """Read the readiness this controller proved for each declared static host."""
+
+    return {
+        record.provider_worker_id: record.readiness_state.value
+        for record in _state_records()
+        if record.provider is ProviderKind.STATIC_SSH
+    }
+
+
+def _listed_state(worker: Worker, readiness: dict[str, str]) -> str:
+    """Render provider state, plus the locally proven readiness of a declared host.
+
+    A declared host always reports RUNNING, because declaring it is what makes it exist, so
+    the provider state alone would tell an operator nothing about whether a job can run
+    there. The readiness this controller actually probed is the part that decides it.
+    """
+
+    if worker.provider is not ProviderKind.STATIC_SSH:
+        return worker.state.value
+    observed = readiness.get(worker.id)
+    return worker.state.value if observed is None else f"{worker.state.value} ({observed})"
+
+
+def _listed_cost(worker: Worker) -> str:
+    """Render current cost, or `-` when the provider has no price to report.
+
+    A declared static host has no USD/hour: the operator already pays for that machine by
+    other means, and reporting `unknown` there would read as a failed price lookup.
+    """
+
+    if worker.provider is ProviderKind.STATIC_SSH:
+        return "-"
+    return _money(worker.hourly_cost)
+
+
+def _provider_name(provider: ProviderKind) -> str:
+    """Name a provider in one operator-facing line without inventing a brand for it."""
+
+    return "RunPod" if provider is ProviderKind.RUNPOD else provider.value
+
+
+def _app_config_target(settings: Settings, worker_id: str) -> Literal["controller", "worker"]:
+    """Select which mirrored application set this worker account receives.
+
+    `opencode`, `lazygit`, and `yazi` are controller-scoped because a *disposable* GPU worker
+    must not receive operator tooling. A declared static host is a persistent operator
+    account like the controller, so it receives the same set.
+    """
+
+    return "controller" if _static_config_for(settings, worker_id) is not None else "worker"
+
+
+def _static_config_for(settings: Settings, worker_id: str) -> StaticWorkerConfig | None:
+    """Return one declared static host's configuration, or `None` for any other worker.
+
+    Every provider branch resolves this before consulting the local state record, because a
+    declared host has no record at all until the first command observes it.
+    """
+
+    for worker in settings.static.workers:
+        if worker.name == worker_id:
+            return worker
+    return None
+
+
+def _require_static_declaration(settings: Settings, worker_id: str) -> StaticWorkerConfig | None:
+    """Return the declaration for this worker, refusing a record that outlived its entry.
+
+    A local record can survive the `[[static.workers]]` entry that created it. Falling back
+    to a provisioned provider there would report a credential or not-found error for a host
+    that is simply no longer declared, so the missing declaration is named instead.
+    """
+
+    config = _static_config_for(settings, worker_id)
+    if config is not None:
+        return config
+    record = _state_record(worker_id)
+    if record is not None and record.provider is ProviderKind.STATIC_SSH:
+        raise ConfigurationError(
+            f"Worker {worker_id} is recorded as a declared static host, but no "
+            "[[static.workers]] entry declares it; restore that entry, or remove the stale "
+            "record from the controller state"
+        )
+    return None
+
+
+def _register_static_host(settings: Settings, config: StaticWorkerConfig) -> Worker:
+    """Record one declared static host before any command drives its SSH endpoint.
+
+    The declaration is the registration, so this writes only local bookkeeping: it contacts
+    nothing and the record it writes is what makes the host visible to readiness and job
+    placement. It is idempotent and never weakens a record this controller already proved.
+    """
+
+    client = StaticClient(settings.static)
+    worker = client.get_worker(config.name)
+    try:
+        _state_store().record_registered(worker, cache_root=f"{config.root}/cache")
+    except StateError as exc:
+        typer.echo(f"State warning: {redact(exc)}", err=True)
+    return worker
+
+
+def _static_ssh_access(
+    settings: Settings,
+    config: StaticWorkerConfig,
+) -> tuple[SshExecutor, WorkerSshWaiter, SshConfig]:
+    """Build the SSH collaborators for a declared host from its own declaration.
+
+    The host's own key, when it declares one, is used through `ssh_config`; the waiter is
+    given the `StaticClient` as its provider read surface, which is how the shared readiness
+    polling works unchanged on a host that has no provider API to poll.
+    """
+
+    client = StaticClient(settings.static)
+    ssh_config = client.ssh_config(config, settings.ssh)
+    state_store = _state_store()
+    executor = SshExecutor(ssh_config)
+    waiter = WorkerSshWaiter(client, executor, state_store, ssh_config)
+    return executor, waiter, ssh_config
+
+
+@contextmanager
+def _ssh_access_for(
+    worker_id: str,
+    settings: Settings,
+) -> Iterator[tuple[SshExecutor, WorkerSshWaiter]]:
+    """Yield SSH collaborators for whichever provider owns this exact worker."""
+
+    config = _require_static_declaration(settings, worker_id)
+    if config is not None:
+        _register_static_host(settings, config)
+        executor, waiter, _ = _static_ssh_access(settings, config)
+        yield executor, waiter
+        return
+    with RunPodClient.from_settings(settings) as client:
+        yield _ssh_access(client, settings)
+
+
+@contextmanager
+def _worker_access_for(
+    worker_id: str,
+    settings: Settings,
+) -> Iterator[tuple[WorkerBootstrapper, WorkerSshWaiter]]:
+    """Yield bootstrap and readiness collaborators for this exact worker's provider."""
+
+    config = _require_static_declaration(settings, worker_id)
+    if config is not None:
+        _register_static_host(settings, config)
+        state_store = _state_store()
+        executor, waiter, ssh_config = _static_ssh_access(settings, config)
+        yield (
+            WorkerBootstrapper(
+                waiter,
+                executor,
+                state_store,
+                ssh_config,
+                static_root=config.root,
+            ),
+            waiter,
+        )
+        return
+    with RunPodClient.from_settings(settings) as client:
+        yield _worker_access(client, settings)
+
+
 def _worker_transfer(
     client: RunPodClient,
     settings: Settings,
@@ -2733,7 +3051,25 @@ def _load_manifest_file(path: Path | None) -> ArtifactManifest | None:
     return load_manifest_json(text)
 
 
-def _require_runpod_transport(worker_id: str, operation: str) -> None:
+def _require_not_static(settings: Settings, worker_id: str, operation: str) -> None:
+    """Refuse a lifecycle command against an operator-declared host.
+
+    A static host has no provider lifecycle to drive: this tool did not create it and must
+    never start, stop, or destroy it. The refusal names the declaration the operator would
+    have to remove, because that entry is the only thing that makes this tool aware of the
+    host at all.
+    """
+
+    if _static_config_for(settings, worker_id) is None:
+        return
+    raise ConfigurationError(
+        f"Static host {worker_id!r} cannot {operation}: it is declared under "
+        "[[static.workers]] and is never provisioned or destroyed; remove that entry to "
+        "stop using it"
+    )
+
+
+def _require_ssh_transport(worker_id: str, operation: str) -> None:
     record = _state_record(worker_id)
     if record is not None and record.provider is ProviderKind.COLAB:
         raise ConfigurationError(
@@ -2855,7 +3191,7 @@ def _print_worker(worker: Worker) -> None:
         ("GPU", worker.gpu_type),
         ("GPU count", worker.gpu_count),
         ("Cloud", worker.cloud_type.value if worker.cloud_type is not None else None),
-        ("Current compute cost/hour", _money(worker.hourly_cost)),
+        ("Current compute cost/hour", _listed_cost(worker)),
         ("Image", worker.image),
         ("Template", worker.template_id),
         ("Container disk (GB)", worker.container_disk_gb),
@@ -2888,6 +3224,23 @@ def _print_colab_billing(record: WorkerRecord | None) -> None:
     )
     for label, value in fields:
         typer.echo(f"{label}: {value if value is not None else '-'}")
+
+
+def _print_static_readiness(record: WorkerRecord | None, *, root: str | None) -> None:
+    """Render the readiness a declared static host was last proven to have.
+
+    This is local evidence, not provider state, which is why it is printed beside the
+    provider view rather than inside it: the provider state of a declared host is the
+    operator's own declaration.
+    """
+
+    if record is None or record.provider is not ProviderKind.STATIC_SSH:
+        return
+    typer.echo(f"Readiness: {record.readiness_state.value}")
+    typer.echo(f"Confined root: {root if root is not None else '-'}")
+    typer.echo(
+        f"Bootstrap version: {record.bootstrap_version if record.bootstrap_version else '-'}"
+    )
 
 
 def _format_connection(connection: WorkerConnectionInfo | None) -> str | None:

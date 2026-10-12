@@ -94,6 +94,9 @@ Controller tool-installer overrides are intentionally separate from runtime conf
 | `WAVCSE_INFRA_LAZYGIT_VERSION` | Controlled review-UI (lazygit) release override |
 | `WAVCSE_INFRA_LAZYGIT_X86_64_SHA256` | Required x86-64 digest when overriding the lazygit pin |
 | `WAVCSE_INFRA_LAZYGIT_AARCH64_SHA256` | Required ARM64 digest when overriding the lazygit pin |
+| `WAVCSE_INFRA_YAZI_VERSION` | Controlled file-explorer (yazi) release override |
+| `WAVCSE_INFRA_YAZI_X86_64_SHA256` | Required x86-64 digest when overriding the yazi pin |
+| `WAVCSE_INFRA_YAZI_AARCH64_SHA256` | Required ARM64 digest when overriding the yazi pin |
 
 Empty values are treated as unset. CLI options override environment values. Validate the
 result without network calls:
@@ -256,7 +259,8 @@ rules apply through `infra worker apply-config <id> [--yes]`.
 
 OpenCode's `auth.json` credential file is deliberately never mirrored: the repository
 carries only the non-secret `opencode.jsonc` scaffold. The review UI's settings are
-mirrored the same way (`apps/lazygit/config.yml`); see
+mirrored the same way (`apps/lazygit/config.yml`), as are the file explorer's
+(`apps/yazi/yazi.toml`); see
 [Controller review UI](#controller-review-ui) for the parts of that session which cannot
 come from the repository.
 
@@ -338,8 +342,8 @@ systemd unit use) reads neither. A provisioned controller therefore resolves non
 tools in those contexts, which is indistinguishable from an unprovisioned one:
 
 ```bash
-ssh controller 'command -v omp opencode lazygit'      # nothing, exit 1
-ssh controller 'bash -lc "command -v omp opencode lazygit"'   # all three
+ssh controller 'command -v omp opencode lazygit yazi'      # nothing, exit 1
+ssh controller 'bash -lc "command -v omp opencode lazygit yazi"'   # all of them
 ```
 
 Bootstrap publishes the managed tools into a system-wide directory (default
@@ -353,6 +357,7 @@ the installers manage, so a version bump or `--upgrade` is picked up automatical
 | `omp`, `codex`, `agf`, `opencode` | `controller/install-agents.sh` |
 | `colab`, `infra`, `uv` | `controller/bootstrap.sh` |
 | `lazygit` | `controller/bootstrap.sh` (see [Controller review UI](#controller-review-ui)) |
+| `yazi`, `ya` | `controller/bootstrap.sh` (see [Controller file explorer](#controller-file-explorer)) |
 
 Check or repair the links independently of a full bootstrap:
 
@@ -448,6 +453,77 @@ Diffs are rendered by `delta` through `git.diffRenderers`, with git's own raw di
 the second entry — press `|` to cycle. `update.method: never` is deliberate: the pin is the
 only supported version, and an upgrade belongs in the repository (bump the pin and the
 digests together, then re-run bootstrap).
+
+## Controller file explorer
+
+Reading the shape of a checkout, a volume, or a job's artifacts over SSH is a terminal
+browsing session, not a service: bootstrap installs a pinned Rust terminal file manager
+beside the review UI, and it opens no port and holds no credential.
+
+| Tool | Default | Installation mechanism | Installed command |
+| --- | --- | --- | --- |
+| yazi | `26.9.1` | Official `sxyazi/yazi` GitHub release archive (GNU/glibc build) with pinned per-architecture SHA-256 | `~/.local/bin/yazi` |
+| ya | `26.9.1` | the same release archive | `~/.local/bin/ya` |
+
+Yazi's release assets carry the Rust target triple and no version, so the pinned SHA-256 is
+what identifies the release; both members of the archive are installed and both are
+published into `/usr/local/bin` like every other managed tool. `ya` is that release's CLI
+(`ya pkg`, `ya emit`, `ya pub`, `ya env`) rather than a second program.
+
+```bash
+cd ~/projects/wavCSE   # or this repository
+yazi
+```
+
+Start it in the directory you want to read. Yazi keeps only its own cache and history under
+`~/.local/state/yazi` and `~/.cache/yazi`; nothing else about the controller's state is
+persistent because of it.
+
+### Prerequisites and optional tools
+
+Two packages are not optional. Yazi shells out to `file` for MIME detection and its release
+archive is a zip, so `install_os_packages` provides `file` and `unzip`; a controller without
+`unzip` fails the install with that reason rather than an unpack error.
+
+Everything else upstream lists is optional and deliberately not installed: `fd`, `rg`, and
+`fzf` add content search and subtree jumping, `zoxide` adds directory history, `jq` JSON
+previews, `poppler-utils` PDF previews, `7zip` archive preview and extraction, `ffmpeg`
+video thumbnails, and `imagemagick`/`chafa`/`resvg` more image formats. None of them is
+pinned, reviewed, or published by this repository, so adding one is a deliberate operator
+change to the controller:
+
+```bash
+sudo apt-get install --no-install-recommends ripgrep jq poppler-utils 7zip
+```
+
+The terminal-side requirements are the same as the review UI's
+([what the controller cannot supply](#what-the-controller-cannot-supply)): a Nerd Font
+selected in your local terminal profile, a UTF-8 login locale, and RGB-capable tmux, all of
+which bootstrap and cloud-init converge. Image previews then use whichever protocol your
+client terminal offers; the built-in ones need nothing installed on the controller.
+
+### Settings and drift
+
+`apps/yazi/yazi.toml` is the source of truth, mirrored to `~/.config/yazi/yazi.toml` exactly
+like the review UI's settings, and applied the same way:
+
+```bash
+make app-config-check   # report drift without writing
+make app-config         # install an absent file; a differing file prompts and is backed up
+```
+
+The file is a deliberate subset of the pinned release's defaults — yazi merges it over them,
+so a setting that is not a divergence does not belong in the repository. Its one divergence
+is the editor the open-with path uses: `vim` as the fallback, matching the review UI's
+`os.editPreset`. Check a change against the pin before committing:
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/sxyazi/yazi/v26.9.1/yazi-config/preset/yazi-default.toml
+```
+
+Unlike lazygit, yazi is strict about what it reads: a malformed value, an unknown key, or an
+unknown section aborts startup with a TOML error naming the file, so a stale key after a pin
+bump is visible on the next launch instead of being ignored.
 
 ## Google Colab ephemeral execution
 
@@ -1666,6 +1742,11 @@ must invoke lifecycle commands explicitly.
   `WAVCSE_INFRA_LAZYGIT_VERSION` override requires the matching digest variable. It is an
   operator tool, so `--skip-agents` does not skip it, and its settings are mirrored from
   `apps/lazygit/config.yml` rather than written by the installer.
+- The file explorer (`yazi` and its `ya` CLI) is installed the same way from the pinned
+  `sxyazi/yazi` GNU release archive, with the same per-architecture digest rule and a
+  `WAVCSE_INFRA_YAZI_VERSION` override, and its settings are mirrored from
+  `apps/yazi/yazi.toml`. Its prerequisites `file` and `unzip` come from
+  `install_os_packages`; its optional preview and search tools are not installed.
 - The login locale is converged onto a UTF-8 value when it is missing or not UTF-8, and an
   existing UTF-8 value is left alone; the interactive review UI, tmux, and the diff
   renderer all depend on it.

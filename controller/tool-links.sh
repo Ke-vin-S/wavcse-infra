@@ -18,8 +18,10 @@ set -Eeuo pipefail
 # repository did not create is never replaced. --check reports drift and writes nothing.
 
 # The tools this repository installs into the controller account's ~/.local/bin. A tool
-# absent from that directory is reported, not created.
-readonly -a MANAGED_TOOLS=(omp codex agf opencode colab infra lazygit uv)
+# absent from that directory is reported, not created. yazi's release ships two binaries —
+# the file manager and its `ya` CLI (packages, emit, pub, env) — and both are published so
+# the pair resolves in the same contexts.
+readonly -a MANAGED_TOOLS=(omp codex agf opencode colab infra lazygit uv yazi ya)
 readonly DEFAULT_LINK_DIRECTORY='/usr/local/bin'
 # The PATH a shell gets when it reads no login file, used to prove visibility.
 readonly SYSTEM_PATH_DIRECTORIES='/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin'

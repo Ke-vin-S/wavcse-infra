@@ -81,3 +81,21 @@ transfer_timeout_seconds = 3600.0
 readiness_timeout_seconds = 180.0
 poll_interval_seconds = 2.0
 max_poll_interval_seconds = 10.0
+
+# A machine this controller drives but never provisions: a declared static SSH host. The
+# declaration is its registration, so there is no `worker create`, and `worker start`,
+# `stop`, and `destroy` refuse it. Everything this tool writes there lives under `root`,
+# which must be absolute. Install nothing on the host yourself except the prerequisites
+# bootstrap reports (python3 >= 3.10, git, curl, tar, gzip); see docs/STATIC-SSH.md.
+#
+# [[static.workers]]
+# name = "university"
+# host = "hpc.example.edu"
+# port = 22
+# username = "operator"
+# gpu_type = "NVIDIA A100-SXM4-80GB"
+# gpu_count = 1
+# root = "/home/operator/wavcse"
+# private_key = "~/.ssh/university"
+# env = { CUDA_VISIBLE_DEVICES = "0" }
+# max_concurrent_jobs = 1

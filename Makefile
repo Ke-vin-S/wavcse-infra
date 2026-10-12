@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 SHELL_FILES := $(shell find controller scripts worker -type f -name '*.sh' 2>/dev/null)
 
-.PHONY: agents-check agents-sync app-config app-config-check bootstrap-controller check cloud-init-check doctor format format-check install-agents lint omp-overlay omp-overlay-check test tool-links tool-links-check
+.PHONY: agents-check agents-sync app-config app-config-check bootstrap-controller check cloud-init-check doctor format format-check install-agents lint omp-overlay omp-overlay-check static-host-down static-host-up test tool-links tool-links-check
 
 agents-sync:
 	python3 scripts/agents/agent_assets.py sync
@@ -60,6 +60,14 @@ test:
 
 cloud-init-check:
 	cloud-init schema --config-file controller/cloud-init.yaml
+
+# Local static-host fixture for verifying the static SSH worker path without
+# touching any real host. Opt-in; `make check` must stay runnable without Docker.
+static-host-up:
+	./scripts/static-host/local-host.sh up
+
+static-host-down:
+	./scripts/static-host/local-host.sh down
 
 check:
 	uv lock --check

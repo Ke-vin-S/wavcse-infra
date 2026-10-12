@@ -24,6 +24,7 @@ from wavcse_infra.models import (
     WorkerState,
 )
 from wavcse_infra.providers import runpod as runpod_provider
+from wavcse_infra.providers.static import StaticClient
 from wavcse_infra.state import WorkerStateStore
 from wavcse_infra.workers.bootstrap import WorkerBootstrapper
 from wavcse_infra.workers.ssh import SshCommandResult, SshWaitResult
@@ -792,7 +793,11 @@ def test_bootstrap_command_reports_ready_health(monkeypatch, tmp_path: Path) -> 
 
         def install_app_config(self, worker_id: str, **kwargs: object) -> tuple[object, ...]:
             assert worker_id == "pod-123"
-            assert kwargs == {"wait_timeout_seconds": None, "command_timeout_seconds": None}
+            assert kwargs == {
+                "target": "worker",
+                "wait_timeout_seconds": None,
+                "command_timeout_seconds": None,
+            }
             return ()
 
     monkeypatch.setattr(cli, "_worker_access", lambda client, settings: (Bootstrapper(), object()))
@@ -904,7 +909,7 @@ def test_worker_apply_config_refuses_an_unknown_application(monkeypatch, tmp_pat
     )
 
     assert result.exit_code == 2
-    assert "mirrored apps are: lazygit, opencode, tmux" in result.stderr
+    assert "mirrored apps are: lazygit, opencode, tmux, yazi" in result.stderr
 
 
 def test_worker_apply_config_refuses_a_controller_only_application(monkeypatch, tmp_path) -> None:
@@ -938,3 +943,177 @@ def test_health_command_exits_nonzero_without_ready_transition(monkeypatch, tmp_
     assert result.exit_code == 1
     assert '"readiness_state": "FAILED"' in result.stdout
     assert '"ready": false' in result.stdout
+
+
+def _static_config_file(tmp_path: Path) -> Path:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[[static.workers]]
+name = "university"
+host = "hpc.example.edu"
+port = 2222
+username = "operator"
+gpu_type = "NVIDIA A100-SXM4-80GB"
+gpu_count = 2
+root = "/home/operator/wavcse"
+""".strip(),
+        encoding="utf-8",
+    )
+    return config_file
+
+
+def _refuse_runpod_lookup(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli.RunPodClient,
+        "from_settings",
+        lambda settings: (_ for _ in ()).throw(
+            AssertionError("a declared static host must not resolve RunPod credentials")
+        ),
+    )
+
+
+def test_a_declared_static_host_is_listed_from_its_declaration(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(cli, "_state_store", lambda: WorkerStateStore(tmp_path / "workers.json"))
+    _refuse_runpod_lookup(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(_static_config_file(tmp_path)),
+            "worker",
+            "list",
+            "--provider",
+            "static_ssh",
+        ],
+        env={},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "static_ssh\tuniversity\tRUNNING\tNVIDIA A100-SXM4-80GB\t2\t-\t-\tuniversity"
+        in result.stdout
+    )
+
+
+def test_listing_a_declared_host_never_marks_it_destroyed_or_absent(
+    monkeypatch, tmp_path: Path
+) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json")
+    monkeypatch.setattr(cli, "_state_store", lambda: store)
+    _refuse_runpod_lookup(monkeypatch)
+    settings = cli.load_settings(config_path=_static_config_file(tmp_path), environ={})
+    declaration = settings.static.workers[0]
+    store.record_registered(
+        StaticClient(settings.static).get_worker("university"),
+        cache_root="/home/operator/wavcse/cache",
+    )
+    store.mark_ssh_ready(
+        StaticClient(settings.static).get_worker("university"),
+        StaticClient.connection(declaration),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(_static_config_file(tmp_path)),
+            "worker",
+            "list",
+            "--provider",
+            "static_ssh",
+        ],
+        env={},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "RUNNING (SSH_READY)" in result.stdout
+    record = store.get("university")
+    assert record is not None
+    assert not record.provider_absent
+    assert record.last_observed_state is WorkerState.RUNNING
+    assert record.readiness_state is WorkerReadinessState.SSH_READY
+
+
+def test_show_reports_the_declared_endpoint_and_local_readiness(
+    monkeypatch, tmp_path: Path
+) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json")
+    monkeypatch.setattr(cli, "_state_store", lambda: store)
+    _refuse_runpod_lookup(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["--config", str(_static_config_file(tmp_path)), "worker", "show", "university"],
+        env={},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Provider: static_ssh" in result.stdout
+    assert "operator@hpc.example.edu:2222" in result.stdout
+    assert "Current compute cost/hour: -" in result.stdout
+    assert store.get("university") is None
+
+
+def test_lifecycle_commands_refuse_a_declared_static_host(monkeypatch, tmp_path: Path) -> None:
+    _install_fakes(monkeypatch, tmp_path, FakeClient())
+    config = str(_static_config_file(tmp_path))
+
+    for operation in ("start", "stop", "destroy"):
+        result = runner.invoke(app, ["--config", config, "worker", operation, "university"], env={})
+        assert result.exit_code == 2, result.output
+        assert f"Static host 'university' cannot {operation}" in result.stderr
+        assert "[[static.workers]]" in result.stderr
+        assert "never provisioned or destroyed" in result.stderr
+
+
+def test_provider_list_reports_a_declared_host_without_inventing_a_price(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _refuse_runpod_lookup(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["--config", str(_static_config_file(tmp_path)), "provider", "list"],
+        env={},
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = result.stdout.splitlines()
+    assert rows[0] == "PROVIDER\tSTATUS\tEXECUTION\tCOST MODEL\tPREFERRED"
+    assert "static_ssh\tCONFIGURED\tSSH\t-\tfallback" in rows
+
+
+def test_provider_list_omits_a_static_row_when_nothing_is_declared(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli.RunPodClient,
+        "from_settings",
+        lambda settings: (_ for _ in ()).throw(AssertionError("no provider was read")),
+    )
+
+    result = runner.invoke(app, ["provider", "list"], env={})
+
+    assert result.exit_code == 0, result.output
+    assert "static_ssh" not in result.stdout
+
+
+def test_a_record_whose_declaration_was_removed_is_named_not_treated_as_runpod(
+    monkeypatch, tmp_path: Path
+) -> None:
+    store = WorkerStateStore(tmp_path / "workers.json")
+    monkeypatch.setattr(cli, "_state_store", lambda: store)
+    _refuse_runpod_lookup(monkeypatch)
+    declaring = cli.load_settings(config_path=_static_config_file(tmp_path), environ={})
+    store.record_registered(
+        StaticClient(declaring.static).get_worker("university"),
+        cache_root="/home/operator/wavcse/cache",
+    )
+    plain = tmp_path / "plain.toml"
+    plain.write_text('[placement]\npreferred_providers = ["static_ssh"]\n', encoding="utf-8")
+
+    result = runner.invoke(app, ["--config", str(plain), "worker", "health", "university"], env={})
+
+    assert result.exit_code == 2, result.output
+    assert "recorded as a declared static host" in result.stderr
+    assert "[[static.workers]]" in result.stderr

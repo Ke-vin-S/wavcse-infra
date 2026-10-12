@@ -105,6 +105,20 @@ deletes a network volume. Humans use `infra worker ssh <worker-id>` (PTY, may fa
 RunPod proxy); automation uses `infra worker exec <worker-id> -- <command> [args...]`, which
 requires the mapped direct endpoint and disables PTY allocation.
 
+## Declared static SSH hosts
+
+`provider kind static_ssh` is a machine the operator owns or already has access to. It is
+**declared**, never provisioned: `[[static.workers]]` in the controller TOML is its registration
+(name, host, port, username, gpu_type, gpu_count, absolute `root`, optional `private_key`, optional
+`env`, `max_concurrent_jobs`). `infra worker start`, `stop`, and `destroy` refuse it — this tool did
+not create it and cannot delete or stop it — and bootstrap installs nothing there, confines every
+write to `root`, and reports any missing prerequisite as a list for the operator to install. `uv`
+absent is a warning, not a failure. `infra provider list` reports no price for it, and the guard
+that applies is `max_concurrent_jobs` against this controller's active jobs. Specs for this provider
+must use absolute interpreter paths and declare their environment in `runtime.environment`: `argv`
+runs directly, never through a shell, so `module load` and `conda activate` cannot carry between
+`setup.argv` and `command.argv`. See `docs/STATIC-SSH.md`.
+
 ## Exact-commit jobs
 
 One versioned job specification drives one attempt on one existing `READY`
@@ -120,7 +134,7 @@ the verified checkout); optional `setup.argv`; `runtime.timeout_seconds`, non-se
 and bearer values are rejected before any worker is contacted.
 
 ```
-infra job submit <job-spec.json> [--worker <exact-worker-id>] [--provider runpod|colab] [--wait]
+infra job submit <job-spec.json> [--worker <exact-worker-id>] [--provider runpod|colab|static_ssh] [--wait]
 infra job status <job-id> [--json]
 infra job logs <job-id> [--tail-bytes <n>] [--local]
 infra job cancel <job-id>

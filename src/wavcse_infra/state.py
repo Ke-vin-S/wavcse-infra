@@ -136,6 +136,10 @@ class WorkerRecord(BaseModel):
     # creation and is the cache root the worker derives its rebuildable artifact cache from;
     # it is `None` for Pods with no network volume, which is what disables cache use.
     network_volume_mount_path: str | None = None
+    # The cache root of a declared static host, which has no provider reported mount at all:
+    # it is a directory inside the confined root this tool created. It is `None` for every
+    # provisioned provider, whose cache root stays the network-volume mount path.
+    cache_root: str | None = None
     creation_timestamp: datetime
     last_observed_state: WorkerState
     last_observed_at: datetime
@@ -158,6 +162,18 @@ class WorkerRecord(BaseModel):
     provider_absent: bool = False
     # Written before Colab allocation, so a lost response cannot invite another allocation.
     create_pending: bool = False
+
+    def resolved_cache_root(self) -> str | None:
+        """Return this worker's rebuildable cache root, or `None` when it has none.
+
+        One rule, in one place: a provisioned worker uses the mount path the provider
+        reported for its network volume, and a declared static host uses the directory
+        recorded beside its declaration. Every cache consumer reads it here, so the job
+        workspace and the cache-inspection command can never disagree about which directory
+        is the cache.
+        """
+
+        return self.cache_root or self.network_volume_mount_path
 
 
 class _StateDocument(BaseModel):
@@ -433,6 +449,75 @@ class WorkerStateStore(_AtomicJsonDocumentStore):
         )
         self._upsert(record)
         return record
+
+    @_serialized
+    def record_registered(self, worker: Worker, *, cache_root: str) -> WorkerRecord:
+        """Record one operator-declared static host, which this tool never creates.
+
+        The declaration is the registration, so this is idempotent in the strong sense: an
+        existing record keeps its proven readiness, bootstrap history, and health evidence,
+        and only the fields the declaration itself owns are refreshed. Re-registering a
+        READY host must never reset it to NOT_READY, or a shared machine would appear to
+        lose its readiness every time a read-only command touched it.
+        """
+
+        if worker.provider is not ProviderKind.STATIC_SSH:
+            raise StateError(f"Worker {worker.id} is not a declared static host")
+        connection = worker.ssh_direct or worker.ssh_proxy
+        if connection is None:
+            raise StateError(
+                f"Declared static host {worker.id} carries no SSH endpoint; "
+                "its declaration is incomplete"
+            )
+        now = self._now()
+        document = self._load()
+        existing = document.workers.get(worker.id)
+        if existing is not None and existing.provider is not worker.provider:
+            raise StateError(
+                f"Worker identity {worker.id} is already tracked as a "
+                f"{existing.provider.value} record; rename the declared static host"
+            )
+        if existing is None:
+            record = WorkerRecord(
+                provider=worker.provider,
+                execution_transport=worker.execution_transport,
+                provider_worker_id=worker.id,
+                infra_identity=worker.id,
+                name=worker.name,
+                requested_gpu_type=worker.gpu_type or "unknown",
+                actual_gpu_type=worker.gpu_type,
+                requested_gpu_count=worker.gpu_count or 1,
+                actual_gpu_count=worker.gpu_count,
+                cache_root=cache_root,
+                creation_timestamp=now,
+                last_observed_state=worker.state,
+                last_observed_at=now,
+                ssh_host=connection.host,
+                ssh_port=connection.port,
+                ssh_username=connection.username,
+                ssh_kind=connection.kind,
+                readiness_state=WorkerReadinessState.NOT_READY,
+            )
+            self._upsert(record)
+            return record
+        updated = existing.model_copy(
+            update={
+                "name": worker.name,
+                "requested_gpu_type": worker.gpu_type or existing.requested_gpu_type,
+                "actual_gpu_type": worker.gpu_type,
+                "requested_gpu_count": worker.gpu_count or existing.requested_gpu_count,
+                "actual_gpu_count": worker.gpu_count,
+                "cache_root": cache_root,
+                "last_observed_state": worker.state,
+                "last_observed_at": now,
+                "ssh_host": connection.host,
+                "ssh_port": connection.port,
+                "ssh_username": connection.username,
+                "ssh_kind": connection.kind,
+            }
+        )
+        self._upsert(updated)
+        return updated
 
     @_serialized
     def observe(self, worker: Worker) -> WorkerRecord | None:

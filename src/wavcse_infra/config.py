@@ -257,6 +257,54 @@ class PlacementConfig(FrozenModel):
         return value
 
 
+class StaticWorkerConfig(FrozenModel):
+    """One operator-owned SSH host: declared, never provisioned.
+
+    The declaration is the registration. There is no create, start, stop, or destroy call
+    to make on this provider, no price to confirm, and nothing for this tool to track
+    beyond what the operator wrote here. `root` is the single directory this tool writes
+    beneath inside that account's home; everything it installs there lives under it.
+    """
+
+    name: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]*$", min_length=1, max_length=64)
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(default=22, ge=1, le=65535)
+    username: str = Field(min_length=1, max_length=64)
+    gpu_type: str = Field(min_length=1, max_length=128)
+    gpu_count: int = Field(default=1, ge=1)
+    root: str = Field(min_length=1, max_length=1024)
+    # A per-host identity is the rule here, not the exception: the global `ssh.private_key`
+    # belongs to disposable Pods, and a shared operator host has its own account and key.
+    private_key: Path | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    max_concurrent_jobs: int = Field(default=1, ge=1, le=16)
+
+    @field_validator("root")
+    @classmethod
+    def absolute_root(cls, value: str) -> str:
+        """Require the confined root to be one unambiguous absolute directory."""
+
+        normalized = _absolute_worker_path(value)
+        if normalized == "/":
+            raise ValueError("static worker root must not be the filesystem root")
+        return normalized
+
+
+class StaticConfig(FrozenModel):
+    """Operator-declared SSH hosts that this tool drives but never provisions."""
+
+    workers: tuple[StaticWorkerConfig, ...] = ()
+
+    @field_validator("workers")
+    @classmethod
+    def unique_names(cls, value: tuple[StaticWorkerConfig, ...]) -> tuple[StaticWorkerConfig, ...]:
+        """Reject an ambiguous registry rather than driving the wrong host."""
+
+        if len({worker.name for worker in value}) != len(value):
+            raise ValueError("static worker names must be distinct")
+        return value
+
+
 class Settings(FrozenModel):
     """Complete non-secret and runtime-secret application configuration."""
 
@@ -267,8 +315,9 @@ class Settings(FrozenModel):
     paths: PathsConfig = PathsConfig()
     placement: PlacementConfig = PlacementConfig()
     runpod: RunPodConfig = RunPodConfig()
-    storage: StorageConfig = StorageConfig()
     ssh: SshConfig = SshConfig()
+    static: StaticConfig = StaticConfig()
+    storage: StorageConfig = StorageConfig()
     volumes: VolumesConfig = VolumesConfig()
 
 
@@ -453,6 +502,25 @@ def _expand_paths(settings: Settings) -> Settings:
                         else None
                     ),
                     "known_hosts_file": settings.ssh.known_hosts_file.expanduser(),
+                }
+            ),
+            # A declared host's own identity is expanded exactly like the global one, so
+            # `~` is safe in `[[static.workers]]` and the SSH argv never carries a literal
+            # tilde for the remote account to resolve.
+            "static": settings.static.model_copy(
+                update={
+                    "workers": tuple(
+                        worker.model_copy(
+                            update={
+                                "private_key": (
+                                    worker.private_key.expanduser()
+                                    if worker.private_key is not None
+                                    else None
+                                )
+                            }
+                        )
+                        for worker in settings.static.workers
+                    )
                 }
             ),
         }

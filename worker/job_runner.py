@@ -465,11 +465,30 @@ def materialize_source(repository: str, commit: str, source_directory: str) -> s
     return head
 
 
+def _bootstrap_marker(descriptor: dict[str, Any]) -> str:
+    """Return the marker path the controller says this worker's bootstrap wrote.
+
+    An absent or empty `state_directory` means the documented default location, which is
+    where the disposable-worker bootstrap profile writes it. A declared static host owns a
+    confined state directory instead and names it here, so the same runner verifies the
+    same marker on a machine whose account home this controller never assumes.
+    """
+
+    state_directory = descriptor.get("state_directory")
+    if state_directory is None or state_directory == "":
+        return os.path.expanduser(BOOTSTRAP_MARKER)
+    if not isinstance(state_directory, str):
+        raise RunnerInputError("descriptor state_directory must be a string")
+    if not os.path.isabs(state_directory) or os.pardir in state_directory.split(os.sep):
+        raise RunnerInputError("descriptor state_directory must be an absolute path")
+    return os.path.join(state_directory, "bootstrap-version")
+
+
 def _verify_bootstrap(descriptor: dict[str, Any]) -> str:
     expected = descriptor.get("expected_bootstrap_version")
     if not isinstance(expected, str) or not expected:
         raise RunnerInputError("descriptor expected_bootstrap_version is required")
-    marker = os.path.expanduser(BOOTSTRAP_MARKER)
+    marker = _bootstrap_marker(descriptor)
     observed = None
     try:
         with open(marker, encoding="utf-8") as handle:
@@ -478,8 +497,8 @@ def _verify_bootstrap(descriptor: dict[str, Any]) -> str:
         observed = None
     if observed != expected:
         raise RunnerError(
-            f"worker bootstrap marker is {observed or 'missing'}, but version {expected} is "
-            "required; run `infra worker bootstrap <worker-id>` and retry"
+            f"worker bootstrap marker is {observed or 'missing'} at {marker}, but version "
+            f"{expected} is required; run `infra worker bootstrap <worker-id>` and retry"
         )
     return expected
 

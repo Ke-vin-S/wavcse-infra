@@ -36,7 +36,9 @@ Allocation measures aggregate CU/hour and assignment count before and after
 one owned create; a failed post-allocation guard releases the exact owned
 session. Colab bootstraps via the CLI kernel and observes physical CUDA hardware.
 Both transports feed the same reviewed job and artifact runners and independent
-S3 output verification. A static university SSH provider is not implemented.
+S3 output verification. A declared static university SSH provider shares the same transport
+and job semantics without provisioning or destroying anything (ADR-038); see
+[Static SSH host](STATIC-SSH.md).
 
 ## Control and data flow
 

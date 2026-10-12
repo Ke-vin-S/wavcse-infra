@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Fixture, not a driver: this stub exists only to exercise the static-worker
+# bootstrap and health plumbing, which requires a supported accelerator and
+# parses nvidia-smi. Its output is never evidence of real GPU capability.
+set -Eeuo pipefail
+
+print_banner() {
+	printf '%s\n' \
+		'+-----------------------------------------------------------------------------+' \
+		'| NVIDIA-SMI 550.54.15   Driver Version: 550.54.15   CUDA Version: 12.4 |' \
+		'|-------------------------------+----------------------+----------------------+' \
+		'| GPU  Name        Persistence-M| Bus-Id        Disp.A | Volatile Uncorr. ECC |' \
+		'|===============================+======================+======================|' \
+		'|   0  NVIDIA A100-SXM4-80GB  Off | 00000000:00:00.0 Off |                    0 |' \
+		'+-------------------------------+----------------------+----------------------+'
+}
+
+for argument in "$@"; do
+	case "${argument}" in
+	--query-gpu*)
+		printf '%s\n' 'NVIDIA A100-SXM4-80GB, 81920, 550.54.15'
+		exit 0
+		;;
+	-L)
+		printf '%s\n' 'GPU 0: NVIDIA A100-SXM4-80GB (UUID: GPU-00000000-0000-0000-0000-000000000000)'
+		exit 0
+		;;
+	esac
+done
+
+print_banner

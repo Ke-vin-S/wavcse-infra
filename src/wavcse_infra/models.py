@@ -15,6 +15,10 @@ class ProviderKind(StrEnum):
 
     RUNPOD = "runpod"
     COLAB = "colab"
+    # An operator-owned SSH host that this tool declares and never provisions: the
+    # declaration in the controller TOML *is* the registration, and the provider has no
+    # create or destroy operation to call. It reuses the `ssh` execution transport.
+    STATIC_SSH = "static_ssh"
 
 
 class CostUnit(StrEnum):

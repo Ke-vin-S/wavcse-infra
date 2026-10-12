@@ -4,7 +4,10 @@ set -Eeuo pipefail
 readonly EXPECTED_BOOTSTRAP_VERSION="${1:?expected bootstrap version argument is required}"
 readonly DISK_PATH="${2:-/}"
 readonly REQUIRED_MOUNT_PATH="${3:-}"
-readonly VERSION_FILE="${HOME}/.local/state/wavcse-worker/bootstrap-version"
+# The state directory bootstrap wrote its version marker into. An empty argument keeps the
+# disposable-worker default; a declared static host passes its own confined directory.
+readonly STATE_DIR="${4:-${HOME}/.local/state/wavcse-worker}"
+readonly VERSION_FILE="${STATE_DIR}/bootstrap-version"
 
 emit() {
   local key="$1"

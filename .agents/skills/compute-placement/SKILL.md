@@ -7,10 +7,13 @@ description: Choose an existing READY execution provider for exact-commit jobs u
 
 Use `infra provider list`, `infra doctor`, `infra worker list`, and the user TOML
 `[placement] preferred_providers` rather than remembered prices or sessions.
-An explicit `--worker` pins the worker; `--provider runpod` or `--provider colab`
-restricts selection. Unspecified jobs consider READY infra-owned Colab first,
-then READY RunPod. This is a placement preference, not a research assumption.
-Future static university compute may precede Colab, but it is not implemented.
+An explicit `--worker` pins the worker; `--provider runpod`, `--provider colab`, or
+`--provider static_ssh` restricts selection. Unspecified jobs consider READY infra-owned
+Colab first, then READY RunPod. This is a placement preference, not a research assumption.
+A declared static university host (`static_ssh`) is real, free capacity: it is selected only
+when `preferred_providers` lists it, it is never provisioned or destroyed, it reports no
+USD/hour and no CU rate, and its `max_concurrent_jobs` is checked before a job starts. See
+`docs/STATIC-SSH.md`.
 
 Placement does not implicitly provision paid capacity. If no compatible READY worker
 exists, create one explicitly under its own guard and then submit. Do not claim

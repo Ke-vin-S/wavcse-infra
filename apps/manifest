@@ -7,3 +7,4 @@
 tmux	tmux.conf	.tmux.conf	0644
 opencode	opencode.jsonc	.config/opencode/opencode.jsonc	0644	controller
 lazygit	config.yml	.config/lazygit/config.yml	0644	controller
+yazi	yazi.toml	.config/yazi/yazi.toml	0644	controller

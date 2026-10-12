@@ -31,6 +31,9 @@ slice:
   modes and bounded authenticated direct-SSH readiness;
 - idempotent stdin-streamed worker bootstrap plus version, tool, disk, and NVIDIA GPU
   health;
+- declared static SSH hosts: an operator-owned machine driven over the same transport and
+  job contract, registered by configuration, never provisioned, started, stopped, or
+  destroyed, with no price and every write confined to one directory (`docs/STATIC-SSH.md`);
 - repository-mirrored application configuration (`apps/`) installed on the controller at
   bootstrap and on workers at bootstrap, updated only by an explicit, permission-gated
   command that never overwrites a differing remote file without confirmation and a backup;
@@ -83,6 +86,12 @@ verification are used through uploaded, short-lived envelopes; no presigned
 URL is embedded in normal `colab exec` source. Jobs without `--worker` select
 an existing READY Colab worker first, then RunPod; paid resources are never
 implicitly provisioned by job submission. See [Colab execution](docs/COLAB.md).
+
+A machine the operator already has SSH access to can be declared as a static
+host (`[[static.workers]]` in the controller TOML) and used for the same
+recorded jobs. It is never provisioned, started, stopped, or destroyed, reports
+no price, and confines every write to one directory in that account. See
+[Static SSH host](docs/STATIC-SSH.md).
 
 ## Architecture
 
@@ -203,6 +212,25 @@ a UTF-8 login locale and RGB-capable tmux, which bootstrap and cloud-init conver
 requirements, the settings-drift workflow, and
 [ADR-035](docs/DECISIONS.md#adr-035-review-controller-checkouts-with-a-pinned-terminal-client-not-a-service-on-the-controller)
 for why this is a terminal client rather than a web UI.
+
+## Controller file explorer
+
+Bootstrap also installs the pinned Rust terminal file manager `yazi`, together with the `ya`
+CLI that ships in the same release, for reading the layout of a checkout, a volume, or a
+job's artifacts over SSH. Like the review UI it is an operator tool with no service, port,
+or credential of its own:
+
+```bash
+cd ~/projects/wavCSE   # or this repository
+yazi
+```
+
+`~/.config/yazi/yazi.toml` is mirrored from `apps/yazi/yazi.toml`, and bootstrap provides
+`yazi`'s required `file` and `unzip`; the preview and search tools it can use are optional
+and deliberately not installed. The same Nerd Font, UTF-8 locale, and RGB tmux requirements
+as the review UI apply. See
+[Controller file explorer](docs/OPERATIONS.md#controller-file-explorer) and
+[ADR-037](docs/DECISIONS.md#adr-037-add-a-pinned-terminal-file-explorer-beside-the-review-ui).
 
 ## Google Colab CLI
 

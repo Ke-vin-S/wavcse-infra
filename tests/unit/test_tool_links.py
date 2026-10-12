@@ -90,7 +90,7 @@ def test_publishes_installed_tools_and_skips_absent_ones(tmp_path: Path) -> None
     assert not (link_directory / "codex").exists()
     assert (
         f"Controller tools published in {link_directory} "
-        f"({len(INSTALLED_TOOLS)} linked, 0 already current, 5 not installed)."
+        f"({len(INSTALLED_TOOLS)} linked, 0 already current, 7 not installed)."
     ) in result.stdout
 
 

@@ -47,16 +47,18 @@ class JobContext:
     def cache_root(self, worker_id: str) -> str | None:
         """Return the worker's rebuildable cache root, or `None` when it has no volume.
 
-        The root is the mount path the provider reported for the Pod's network volume: it is
-        provider state, not a path this tool invents. A worker without a network volume has
-        no cache root at all, which is what keeps a Pod without persistent storage on exactly
-        the canonical download path it used before.
+        For a provisioned worker the root is the mount path the provider reported for the
+        Pod's network volume: it is provider state, not a path this tool invents, and a
+        worker without a network volume has no cache root at all, which is what keeps a Pod
+        with no persistent storage on exactly the canonical download path it used before.
+        A declared static host has no provider-reported mount, so it uses the `cache`
+        directory inside its own confined root, recorded beside its declaration.
         """
 
         if self.cache is None:
             return None
         record = self.worker_state.get(worker_id)
-        return None if record is None else record.network_volume_mount_path
+        return None if record is None else record.resolved_cache_root()
 
 
 def require_storage(context: JobContext) -> S3Storage:

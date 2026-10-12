@@ -12,6 +12,7 @@ from wavcse_infra.errors import (
 )
 from wavcse_infra.models import (
     HealthCheckStatus,
+    ProviderKind,
     Worker,
     WorkerConnectionInfo,
     WorkerReadinessState,
@@ -93,7 +94,11 @@ def _worker(
 
 class Waiter:
     def __init__(self, worker: Worker | None = None) -> None:
-        self.result = SshWaitResult(worker=worker or _worker(), connection=_connection())
+        selected = worker or _worker()
+        self.result = SshWaitResult(
+            worker=selected,
+            connection=selected.ssh_direct or _connection(),
+        )
         self.calls: list[tuple[str, float | None]] = []
 
     def wait(self, worker_id: str, *, timeout_seconds: float | None = None) -> SshWaitResult:
@@ -122,10 +127,12 @@ class Executor:
         *,
         health_stderr: str = "",
         config_state: str = "absent",
+        worker_id: str = "pod-123",
     ) -> None:
         self.health_output = health_output
         self.health_stderr = health_stderr
         self.config_state = config_state
+        self.worker_id = worker_id
         self.calls: list[tuple[tuple[str, ...], str | None, float | None]] = []
 
     def run_checked(
@@ -136,7 +143,7 @@ class Executor:
         input_text: str | None = None,
         timeout_seconds: float | None = None,
     ) -> SshCommandResult:
-        assert connection.provider_worker_id == "pod-123"
+        assert connection.provider_worker_id == self.worker_id
         self.calls.append((remote_argv, input_text, timeout_seconds))
         if remote_argv[:1] == ("python3",):
             mode, *rest = remote_argv[3:]
@@ -189,7 +196,7 @@ def test_bootstrap_runs_versioned_script_then_health_and_reaches_ready(tmp_path:
     assert report.gpu.cuda_version == "12.8"
     assert report.disk_available_bytes == 53687091200
     assert waiter.calls == [("pod-123", 20)]
-    assert executor.calls[0][0] == ("bash", "-s", "--", BOOTSTRAP_VERSION)
+    assert executor.calls[0][0] == ("bash", "-s", "--", BOOTSTRAP_VERSION, "system", "")
     assert executor.calls[0][1] is not None
     assert "set -Eeuo pipefail" in executor.calls[0][1]
     assert "wavcse_bootstrap_complete" in executor.calls[0][1]
@@ -200,6 +207,7 @@ def test_bootstrap_runs_versioned_script_then_health_and_reaches_ready(tmp_path:
         "--",
         BOOTSTRAP_VERSION,
         "/",
+        "",
         "",
     )
     assert executor.calls[1][1] is not None
@@ -377,6 +385,7 @@ def test_zero_volume_uses_healthy_ephemeral_disk_and_reaches_ready(tmp_path: Pat
         BOOTSTRAP_VERSION,
         "/",
         "",
+        "",
     )
 
 
@@ -390,7 +399,7 @@ def test_zero_volume_does_not_require_configured_workspace_mount(tmp_path: Path)
 
     assert report.ready
     assert all(check.name != "volume" for check in report.checks)
-    assert executor.calls[0][0][-2:] == ("/", "")
+    assert executor.calls[0][0][-3:] == ("/", "", "")
 
 
 def test_requested_persistent_volume_missing_mount_fails_readiness() -> None:
@@ -429,7 +438,7 @@ def test_requested_persistent_volume_present_mount_passes(tmp_path: Path) -> Non
     volume_check = next(check for check in report.checks if check.name == "volume")
     assert volume_check.status is HealthCheckStatus.PASS
     assert report.ready
-    assert executor.calls[0][0][-2:] == ("/workspace", "/workspace")
+    assert executor.calls[0][0][-3:] == ("/workspace", "/workspace", "")
 
 
 def test_requested_network_volume_requires_its_mount() -> None:
@@ -601,3 +610,69 @@ def test_worker_scripts_are_strict_idempotent_and_contain_no_controller_secrets(
     for controller_tool in ("codex", "omp", "agf"):
         assert re.search(rf"\b{controller_tool}\b", bootstrap, re.IGNORECASE) is None
         assert re.search(rf"\b{controller_tool}\b", health, re.IGNORECASE) is None
+
+
+def _static_worker() -> Worker:
+    return Worker(
+        provider=ProviderKind.STATIC_SSH,
+        id="hpc-static",
+        name="hpc-static",
+        state=WorkerState.RUNNING,
+        native_status="registered",
+        gpu_type="NVIDIA A100-SXM4-80GB",
+        gpu_count=1,
+        ssh_direct=WorkerConnectionInfo(
+            provider_worker_id="hpc-static",
+            kind="direct",
+            host="198.51.100.7",
+            port=22,
+            username="hpc",
+        ),
+    )
+
+
+def test_static_profile_confines_its_state_and_warns_instead_of_failing_without_uv(
+    tmp_path: Path,
+) -> None:
+    output = _health_output(disk_path="/home/hpc/wavcse").replace(
+        "uv_version\tuv 0.10.9", "uv_version\t"
+    )
+    executor = Executor(output, worker_id="hpc-static")
+    bootstrapper = WorkerBootstrapper(
+        Waiter(_static_worker()),
+        executor,
+        StateRecorder(),
+        _config(tmp_path),
+        static_root="/home/hpc/wavcse",
+    )
+
+    report = bootstrapper.bootstrap("hpc-static")
+
+    assert executor.calls[0][0] == (
+        "bash",
+        "-s",
+        "--",
+        BOOTSTRAP_VERSION,
+        "static",
+        "/home/hpc/wavcse",
+    )
+    assert executor.calls[1][0][-3:] == ("/home/hpc/wavcse", "", "/home/hpc/wavcse/state")
+    assert report.disk_path == "/home/hpc/wavcse"
+    assert report.ready
+    assert report.readiness_state is WorkerReadinessState.READY
+    uv_check = next(check for check in report.checks if check.name == "uv")
+    assert uv_check.status is HealthCheckStatus.WARN
+    provider_check = next(check for check in report.checks if check.name == "provider")
+    assert provider_check.detail == "static_ssh state is RUNNING"
+
+
+def test_provisioned_worker_still_requires_uv(tmp_path: Path) -> None:
+    output = _health_output().replace("uv_version\tuv 0.10.9", "uv_version\t")
+
+    report = WorkerBootstrapper(
+        Waiter(), Executor(output), StateRecorder(), _config(tmp_path)
+    ).health("pod-123")
+
+    uv_check = next(check for check in report.checks if check.name == "uv")
+    assert uv_check.status is HealthCheckStatus.FAIL
+    assert not report.ready

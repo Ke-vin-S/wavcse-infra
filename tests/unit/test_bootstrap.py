@@ -13,6 +13,7 @@ APP_CONFIG_SCRIPT = REPOSITORY_ROOT / "controller" / "app-config.sh"
 TMUX_SOURCE = REPOSITORY_ROOT / "apps" / "tmux" / "tmux.conf"
 OPENCODE_SOURCE = REPOSITORY_ROOT / "apps" / "opencode" / "opencode.jsonc"
 LAZYGIT_SOURCE = REPOSITORY_ROOT / "apps" / "lazygit" / "config.yml"
+YAZI_SOURCE = REPOSITORY_ROOT / "apps" / "yazi" / "yazi.toml"
 
 
 def _run_user_config_step(controller_home: Path) -> subprocess.CompletedProcess[str]:
@@ -344,6 +345,7 @@ def test_controller_app_config_installs_then_reports_unchanged(tmp_path: Path) -
     target = tmp_path / ".tmux.conf"
     opencode_target = tmp_path / ".config" / "opencode" / "opencode.jsonc"
     lazygit_target = tmp_path / ".config" / "lazygit" / "config.yml"
+    yazi_target = tmp_path / ".config" / "yazi" / "yazi.toml"
 
     installed = _run_app_config(tmp_path)
     rerun = _run_app_config(tmp_path)
@@ -354,6 +356,7 @@ def test_controller_app_config_installs_then_reports_unchanged(tmp_path: Path) -
         "tmux: installed ~/.tmux.conf\n"
         "opencode: installed ~/.config/opencode/opencode.jsonc\n"
         "lazygit: installed ~/.config/lazygit/config.yml\n"
+        "yazi: installed ~/.config/yazi/yazi.toml\n"
     )
     assert target.read_bytes() == TMUX_SOURCE.read_bytes()
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
@@ -363,16 +366,21 @@ def test_controller_app_config_installs_then_reports_unchanged(tmp_path: Path) -
     assert lazygit_target.read_bytes() == LAZYGIT_SOURCE.read_bytes()
     assert stat.S_IMODE(lazygit_target.stat().st_mode) == 0o644
     assert stat.S_IMODE(lazygit_target.parent.stat().st_mode) == 0o700
+    assert yazi_target.read_bytes() == YAZI_SOURCE.read_bytes()
+    assert stat.S_IMODE(yazi_target.stat().st_mode) == 0o644
+    assert stat.S_IMODE(yazi_target.parent.stat().st_mode) == 0o700
     assert rerun.stdout == (
         "tmux: unchanged ~/.tmux.conf\n"
         "opencode: unchanged ~/.config/opencode/opencode.jsonc\n"
         "lazygit: unchanged ~/.config/lazygit/config.yml\n"
+        "yazi: unchanged ~/.config/yazi/yazi.toml\n"
     )
     assert checked.returncode == 0, checked.stderr
     assert checked.stdout == (
         "tmux: current ~/.tmux.conf\n"
         "opencode: current ~/.config/opencode/opencode.jsonc\n"
         "lazygit: current ~/.config/lazygit/config.yml\n"
+        "yazi: current ~/.config/yazi/yazi.toml\n"
     )
 
 
@@ -390,6 +398,7 @@ def test_controller_app_config_preserves_a_drifted_file_without_confirmation(
         "tmux: drifted ~/.tmux.conf\n"
         "opencode: absent ~/.config/opencode/opencode.jsonc\n"
         "lazygit: absent ~/.config/lazygit/config.yml\n"
+        "yazi: absent ~/.config/yazi/yazi.toml\n"
     )
     assert applied.returncode == 0, applied.stderr
     assert (
@@ -455,7 +464,7 @@ def test_controller_app_config_reports_an_unknown_application(tmp_path: Path) ->
     result = _run_app_config(tmp_path, "--app", "nope")
 
     assert result.returncode != 0
-    assert "unknown app 'nope'; mirrored apps are: lazygit, opencode, tmux" in result.stderr
+    assert "unknown app 'nope'; mirrored apps are: lazygit, opencode, tmux, yazi" in result.stderr
 
 
 def test_controller_app_config_skips_worker_only_entries(tmp_path: Path) -> None:
@@ -731,5 +740,117 @@ def test_controller_bootstrap_installs_the_review_ui_after_its_prerequisites() -
         bootstrap.index("install_os_packages\n")
         < bootstrap.index("  configure_locale\n")
         < bootstrap.index("  install_lazygit\n")
+        < bootstrap.index("  install_uv\n")
+    )
+
+
+def _run_yazi_install_step(
+    controller_home: Path, environment: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    command = 'source "$1"\nCONTROLLER_USER="$(id -un)"\nCONTROLLER_HOME="$2"\ninstall_yazi\n'
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            command,
+            "yazi-install-test",
+            str(BOOTSTRAP_SCRIPT),
+            str(controller_home),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **(environment or {})},
+    )
+
+
+def test_yazi_release_details_matches_a_pinned_digest_for_this_architecture() -> None:
+    command = 'source "$1"\nyazi_release_details\n'
+    result = subprocess.run(
+        ["bash", "-c", command, "yazi-release-test", str(BOOTSTRAP_SCRIPT)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    archive, digest = result.stdout.rstrip("\n").split("\t")
+    # Yazi's asset names carry no version, so the digest is the whole pin.
+    pinned = {
+        "yazi-x86_64-unknown-linux-gnu.zip": (
+            "a02fe91d3304294048c681f010f1100856872a4e98ecf6927328e888d40a6ad2"
+        ),
+        "yazi-aarch64-unknown-linux-gnu.zip": (
+            "02807f08d6b589b65b7516a4e259d83f5995d7a23bb12b3a155141385b370b3a"
+        ),
+    }
+    assert pinned.get(archive) == digest
+
+
+def test_yazi_install_preserves_a_matching_pinned_binary_without_network(
+    tmp_path: Path,
+) -> None:
+    """A matching pin is left alone, and its version is read from the right line.
+
+    `yazi --version` prints a program header and several labelled fields before the
+    version; reading the header would send every run back to the network for a redundant
+    download.
+    """
+    binary = tmp_path / ".local" / "bin" / "yazi"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'Yazi\\n    Version: 26.9.1 (8dd895c 2026-09-01)\\n"
+        "    Debug  : false\\n    Triple : x86_64-unknown-linux-gnu (linux-x86_64)\\n'\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+
+    result = _run_yazi_install_step(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "yazi 26.9.1 is already installed." in result.stdout
+    assert "Installing yazi" not in result.stdout
+
+
+def test_yazi_version_override_requires_the_matching_architecture_digest() -> None:
+    command = 'source "$1"\nvalidate_yazi_version_override\n'
+    argv = ["bash", "-c", command, "yazi-override-test", str(BOOTSTRAP_SCRIPT)]
+
+    missing_digest = subprocess.run(
+        argv,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "WAVCSE_INFRA_YAZI_VERSION": "26.8.15"},
+    )
+    supplied_digest = subprocess.run(
+        argv,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "WAVCSE_INFRA_YAZI_VERSION": "26.8.15",
+            "WAVCSE_INFRA_YAZI_X86_64_SHA256": "0" * 64,
+            "WAVCSE_INFRA_YAZI_AARCH64_SHA256": "0" * 64,
+        },
+    )
+
+    assert missing_digest.returncode != 0
+    assert "set WAVCSE_INFRA_YAZI_" in missing_digest.stderr
+    assert "_SHA256 when overriding WAVCSE_INFRA_YAZI_VERSION" in missing_digest.stderr
+    assert supplied_digest.returncode == 0, supplied_digest.stderr
+
+
+def test_controller_bootstrap_installs_the_file_explorer_after_its_prerequisites() -> None:
+    bootstrap = BOOTSTRAP_SCRIPT.read_text(encoding="utf-8")
+
+    # install_yazi downloads and unzips an archive, so it must follow the package step that
+    # provides curl and unzip, and the locale it renders under is converged before it.
+    assert (
+        bootstrap.index("install_os_packages\n")
+        < bootstrap.index("  configure_locale\n")
+        < bootstrap.index("  install_yazi\n")
         < bootstrap.index("  install_uv\n")
     )
