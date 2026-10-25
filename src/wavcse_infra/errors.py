@@ -142,6 +142,10 @@ class SshError(InfraError):
     """Base class for sanitized worker SSH failures."""
 
 
+class SshTransferError(SshError):
+    """A bounded rsync failed or its outcome is unknown."""
+
+
 class SshConfigurationError(SshError):
     """Raised when controller SSH configuration cannot be used safely."""
 

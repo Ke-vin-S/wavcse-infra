@@ -109,6 +109,13 @@ from wavcse_infra.volumes.lifecycle import (
 from wavcse_infra.workers.bootstrap import WorkerBootstrapper
 from wavcse_infra.workers.colab import INTENT_ABANDON_AFTER_HOURS, ColabLifecycle
 from wavcse_infra.workers.lifecycle import WorkerLifecycle
+from wavcse_infra.workers.remote_ops import (
+    WorkerSync,
+    detached_command,
+    require_resolved_within_root,
+    require_within_root,
+    write_file_command,
+)
 from wavcse_infra.workers.ssh import SshExecutor, WorkerSshWaiter, select_worker_connection
 
 app = typer.Typer(
@@ -811,6 +818,124 @@ def exec_worker(
         typer.echo(result.stderr, err=True, nl=False)
     if result.exit_code != 0:
         raise typer.Exit(code=result.exit_code)
+
+
+@worker_app.command("sync")
+def sync_worker(
+    context: typer.Context,
+    worker_id: Annotated[str, typer.Argument(help="Exact declared worker ID.")],
+    direction: Annotated[str, typer.Option("--direction", help="push or pull")],
+    source: Annotated[str, typer.Option("--source", help="Absolute source directory or file.")],
+    destination: Annotated[str, typer.Option("--destination", help="Absolute destination.")],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    timeout: Annotated[float | None, typer.Option("--timeout", min=0.1)] = None,
+) -> None:
+    """Sync bytes over the worker's pinned SSH endpoint; never delete files."""
+    settings = _load_cli_settings(_context(context))
+    try:
+        static = _require_static_declaration(settings, worker_id)
+        if static is not None:
+            require_within_root(destination if direction == "push" else source, static.root)
+        _require_ssh_transport(worker_id, "sync worker files")
+        with _ssh_access_for(worker_id, settings) as (executor, waiter):
+            ready = waiter.wait(worker_id)
+            WorkerSync(executor).transfer(
+                ready.connection,
+                direction=direction,
+                source=source,
+                destination=destination,
+                timeout_seconds=timeout or settings.ssh.transfer_timeout_seconds,
+                static_root=static.root if static is not None else None,
+            )
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    payload = {
+        "worker_id": worker_id,
+        "direction": direction,
+        "source": source,
+        "destination": destination,
+    }
+    if json_output:
+        _print_json(payload)
+    else:
+        typer.echo(f"Worker {worker_id} sync {direction} completed.")
+
+
+@worker_app.command(
+    "start-detached",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def start_detached_worker(
+    context: typer.Context,
+    worker_id: Annotated[str, typer.Argument(help="Exact declared worker ID.")],
+    checkout: Annotated[str, typer.Option("--checkout", help="Worker checkout path.")],
+    log_path: Annotated[str, typer.Option("--log-path", help="Worker log path.")],
+    env_file: Annotated[
+        str | None, typer.Option("--env-file", help="Worker-local env file path.")
+    ] = None,
+) -> None:
+    """Start a detached command only on a declared, non-billable static host."""
+    command = tuple(context.args)
+    settings = _load_cli_settings(_context(context))
+    try:
+        script = detached_command(checkout, command, log_path, env_file)
+        static = _require_static_declaration(settings, worker_id)
+        if static is None:
+            raise ConfigurationError(
+                "worker start-detached requires a declared static_ssh host; "
+                "paid RunPod work must use an authorized exact-commit job"
+            )
+        require_within_root(checkout, static.root)
+        require_within_root(log_path, static.root)
+        _require_ssh_transport(worker_id, "start detached worker command")
+        with _ssh_access_for(worker_id, settings) as (executor, waiter):
+            ready = waiter.wait(worker_id)
+            require_resolved_within_root(executor, ready.connection, checkout, static.root)
+            require_resolved_within_root(executor, ready.connection, log_path, static.root)
+            result = executor.run_checked(ready.connection, ("sh", "-c", script))
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    if result.stdout:
+        typer.echo(result.stdout, nl=False)
+
+
+@worker_app.command("write-file")
+def write_worker_file(
+    context: typer.Context,
+    worker_id: Annotated[str, typer.Argument(help="Exact declared worker ID.")],
+    path: Annotated[str, typer.Option("--path", help="Absolute worker path.")],
+) -> None:
+    """Write at most 4096 UTF-8 characters using SSH stdin, not shell interpolation."""
+    payload = sys.stdin.read(4097)
+    if len(payload) > 4096:
+        raise typer.BadParameter("worker write-file stdin exceeds 4096 characters")
+    settings = _load_cli_settings(_context(context))
+    try:
+        argv = write_file_command(path)
+        static = _require_static_declaration(settings, worker_id)
+        if static is not None:
+            require_within_root(path, static.root)
+        _require_ssh_transport(worker_id, "write worker file")
+        with _ssh_access_for(worker_id, settings) as (executor, waiter):
+            ready = waiter.wait(worker_id)
+            if static is not None:
+                require_resolved_within_root(executor, ready.connection, path, static.root)
+            executor.run_checked(ready.connection, argv, input_text=payload)
+    except ConfigurationError as exc:
+        _configuration_failure(exc)
+    except ProviderError as exc:
+        _provider_failure(exc)
+    except InfraError as exc:
+        _operation_failure(exc)
+    typer.echo(f"Worker {worker_id} wrote {path}.")
 
 
 @worker_app.command("bootstrap")

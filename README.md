@@ -335,6 +335,10 @@ infra worker create --gpu <exact-type-id> --cloud COMMUNITY --image <image> --st
 infra worker wait-ssh <exact-worker-id>
 infra worker ssh <exact-worker-id>
 infra worker exec <exact-worker-id> -- <command> [args...]
+infra worker sync <worker-id> --direction push --source <absolute-local-path> --destination <absolute-worker-path> [--json]
+infra worker sync <worker-id> --direction pull --source <absolute-worker-path> --destination <absolute-local-path> [--json]
+infra worker start-detached <worker-id> --checkout <worker-checkout> --log-path <worker-log> [--env-file <worker-file>] -- <argv...>
+infra worker write-file <worker-id> --path <absolute-worker-path> < <local-input-file>
 infra worker bootstrap <exact-worker-id>
 infra worker health <exact-worker-id>
 infra worker stop <exact-worker-id>
@@ -359,6 +363,14 @@ infra job status <job-id> [--json]
 infra job logs <job-id> [--tail-bytes <n>] [--local]
 infra job cancel <job-id> [--json]
 ```
+
+`worker sync` and `write-file` address a named SSH-capable worker (RunPod
+direct endpoint or declared static host), not an arbitrary SSH alias.
+`start-detached` is restricted to a declared non-billable static host; paid
+RunPod training must use an authorized exact-commit job. The controller's
+pinned key and known-hosts policy is reused; Colab's non-SSH transport is
+refused. Sync never deletes destination files. Static-host write paths remain
+under the declared root. These transport commands confer no research grant.
 
 Global `--config`, `--runpod-api-url`, `--runpod-timeout`, and `--verbose` options must
 appear before the command name.

@@ -78,6 +78,10 @@ Bootstrap reports **every** missing prerequisite in one list and exits non-zero 
 installing any of them. `uv` is *not* in the list: it is a `WARN` when absent, because only a
 job specification's own argv ever invokes it, never the reviewed runner.
 
+The optional `worker sync` transport additionally requires `rsync` on both
+controller and declared host; it is not installed by bootstrap. A detached
+sweep whose argv starts with `uv` also needs `uv` on that host.
+
 ## The confined root
 
 ```
@@ -101,6 +105,10 @@ infra worker list --provider static_ssh    # declared hosts, with the readiness 
 infra worker show <name>                   # endpoint, state, and this controller's readiness
 infra worker wait-ssh <name>               # prove the endpoint answers
 infra worker exec <name> -- id -un         # one argv over direct, non-interactive SSH
+infra worker sync <name> --direction push --source <absolute-local-path> --destination <root>/sweep/
+infra worker sync <name> --direction pull --source <root>/sweep/ --destination <absolute-local-path>
+infra worker start-detached <name> --checkout <root>/source --log-path <root>/state/sweep.log -- <argv...>
+infra worker write-file <name> --path <root>/state/DRAIN < <local-marker>
 infra worker bootstrap <name>              # confined bootstrap, then require READY health
 infra worker health <name>                 # re-inspect without changing anything
 infra worker apply-config <name>           # mirror the operator set; --yes to override drift
@@ -112,6 +120,12 @@ infra job status <job-id> / logs / cancel
 `infra worker start`, `stop`, and `destroy` **refuse** a declared host: this tool did not
 create it and cannot delete or stop it. The refusal names the `[[static.workers]]` entry
 whose removal is the way to stop using the host.
+
+For these file and detached-command verbs, a lexical check rejects paths
+outside the declared `<root>` before SSH. On the worker a resolved-path check
+also rejects an existing symlink ancestor that escapes `<root>` before writing.
+The source checkout and log destination must be beneath it; pulls read only
+from it. These verbs do not authorize a paid scientific run.
 
 `infra worker list --provider static_ssh` shows `RUNNING` for every declared host — the
 declaration *is* its existence — with the readiness this controller actually proved in
