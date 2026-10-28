@@ -3,10 +3,11 @@
 ## What this repository is
 
 `wavcse-infra` is the infrastructure control plane for reproducible wavCSE research
-workloads. Its EC2 controller operates disposable RunPod Pods and ephemeral Colab
-sessions through `infra`; both execute recorded exact-commit jobs with S3-canonical
-artifacts. Provider cost and lifecycle differ; see `docs/COLAB.md`. Bootstrap,
-diagnostics, and orchestration are its responsibilities.
+workloads. Its EC2 controller operates disposable RunPod Pods, ephemeral Colab
+sessions, and operator-declared static SSH hosts through `infra`; all execute recorded
+exact-commit jobs with S3-canonical artifacts. Provider cost and lifecycle differ; see
+`docs/COLAB.md` and `docs/STATIC-SSH.md`. Bootstrap, diagnostics, and orchestration
+are its responsibilities.
 
 It is not the wavCSE research repository: research code, models, experiment definitions,
 tests, study documentation, and MLflow/DagsHub reporting stay in the separate `wavCSE`
@@ -17,7 +18,8 @@ checkout. Never move research logic into this repository.
 - Research logic, experiment definitions, and research state: the `wavCSE` repository.
 - Detailed behaviour, configuration, and recovery narrative: `README.md`, `docs/SPEC.md`,
   `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/OPERATIONS.md`, `docs/RUNPOD.md`,
-  `docs/COLAB.md`, `docs/DECISIONS.md`. Point at them; do not restate them here.
+  `docs/COLAB.md`, `docs/STATIC-SSH.md`, `docs/DECISIONS.md`. Point at them; do not
+  restate them here.
 - Procedure a skill already covers: reference the skill (see below); do not duplicate it.
 - Large artifacts, checkpoints, and embeddings: S3, never Git.
 - Do not add without an explicit request: Kubernetes, Slurm, Ray, Celery, Airflow, Ansible,
@@ -35,8 +37,10 @@ Non-negotiable. A skill mentioning one of these does not relax it.
    checkout, then fetched by a worker at an exact pushed commit. A worker MUST NOT be the
    only location holding a change, MUST NOT hold a push credential, and a normal worker
    MUST NOT run OMP. A Google Colab session is likewise ephemeral scratch, never canonical
-   storage, and is subject to the same rule. An explicitly requested development/debug
-   worker may carry extra tooling, but recorded runs still execute committed code.
+   storage, and is subject to the same rule. A declared static SSH host is operator-owned,
+   not disposable, but its job directory is not canonical storage either. An explicitly
+   requested development/debug worker may carry extra tooling, but recorded runs still
+   execute committed code.
 2. **Every recorded experiment executes an explicit immutable commit SHA.** Never infer a
    commit from the checked-out branch or from an unspecified working tree. Prefer full SHAs
    over branch names. Detached checkout, `HEAD` verified equal to the requested object on
@@ -71,10 +75,13 @@ Non-negotiable. A skill mentioning one of these does not relax it.
    aggregate rate before and after a single owned allocation, enforce a configured
    incremental CU/hour ceiling, and immediately release a rejected owned lease. The
    post-allocation guard can consume a small amount of CU; never invent USD conversion.
+   A declared static SSH host has no reported price or provisioning lifecycle; never
+   invent a cost or try to start, stop, or destroy a host this tool does not own.
 8. **Provider state is authoritative; local state is convenience.** Reconcile against the
    provider before acting, and never let a lost response become a duplicate paid resource:
    an ambiguous create is reconciled by exact generated identity and the paid request is
-   never blindly retried.
+   never blindly retried. For static SSH, the configuration declaration is provider state;
+   reachability and readiness are observed separately.
 9. **Infrastructure actions go through the `infra` CLI.** Raw provider HTTP calls, ad-hoc
    `aws` invocations, and manual `ssh` mutation discard the cost guards, identity
    safeguards, bounded retries, and provenance the CLI provides, and are defects.
@@ -88,9 +95,11 @@ Non-negotiable. A skill mentioning one of these does not relax it.
 ## Validation
 
 `make check` is the required gate for any change; run the narrower target while iterating.
+The project requires Python >=3.12 and locked `uv` dependencies (install with
+`uv sync --locked --all-groups`); `make check` also needs ShellCheck, shfmt, and cloud-init.
 
 ```bash
-make check     # uv lock check + format check + lint + tests + cloud-init schema
+make check     # uv lock check + format check + lint + tests + cloud-init schema + agent assets
 make test      # pytest
 make format    # ruff fix/format, shfmt -w
 make lint      # ruff check, shellcheck
@@ -123,7 +132,10 @@ could create paid resources are opt-in, explicitly flagged, self-cleaning, and n
 
 Load the operator skill before any CLI-driven change; add the GPU or artifact skill when the
 work touches capacity economics or artifact bytes, and the Colab skill when the work targets
-a Google Colab session.
+a Google Colab session. Static SSH hosts are declared under `[[static.workers]]`;
+bootstrap checks prerequisites without installing packages and confines writes to the
+host's declared root. See `docs/STATIC-SSH.md` for configuration and the opt-in local
+Docker fixture (`make static-host-up` / `make static-host-down`, outside `make check`).
 
 ## Current state — reconcile, never assume
 
@@ -138,8 +150,9 @@ infra volume list       # also warns about unresolved create intents
 infra job status <job-id>   # may drive an interrupted job forward from worker evidence
 ```
 
-Authority order: the selected provider API (RunPod, or the Colab CLI for a Colab session),
-then AWS/S3, then the controller-local non-secret state records (`workers.json`,
+Authority order: the selected provider API (RunPod, or the Colab CLI for a Colab session;
+`[[static.workers]]` configuration for a static host), then AWS/S3, then the
+controller-local non-secret state records (`workers.json`,
 `volumes.json`, `jobs/`) written atomically by the CLI beneath the CLI state directory.
 Local state is supplemental, never the sole source of truth, and is not hand-edited. Before
 acting on a disagreement, read `README.md` and the "Local state and reconciliation" section
